@@ -1,0 +1,13 @@
+[package]
+name = "cnt-ibus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IBus D-Bus 协议辅助：可序列化对象构造与私有总线地址发现"
+
+[dependencies]
+zbus.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "cnt-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "配置：TOML 文件加载（当前仅候选词数一项）"
+
+[dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true

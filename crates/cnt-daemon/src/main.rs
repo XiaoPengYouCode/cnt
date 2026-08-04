@@ -1,0 +1,243 @@
+//! cnt —— 一个用 Rust 写的简单简体中文拼音输入法（IBus 引擎）主程序。
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use fastrace::collector::{Config, ConsoleReporter};
+use zbus::connection::Builder;
+
+use cnt_config::Config as AppConfig;
+use cnt_decode::Decoder;
+use cnt_dict::{PinyinModel, DEFAULT_DICT_FILE, DEFAULT_USER_FILE};
+use cnt_engine::Factory;
+use cnt_lm::CntLm;
+use cnt_store::StoreError;
+
+const ENGINE_NAME: &str = "cnt";
+const ENGINE_LONGNAME: &str = "Cnt 拼音 (Rust)";
+const ENGINE_DESCRIPTION: &str = "一个简单的简体中文拼音输入法（Rust 实现）";
+const COMPONENT_NAME: &str = "org.freedesktop.IBus.Cnt";
+/// 默认语言模型文件名（用户数据目录下）。
+const DEFAULT_LM_FILE: &str = "lm.cntl";
+
+/// 主程序错误（显式，thiserror）。
+#[derive(Debug, thiserror::Error)]
+enum DaemonError {
+    #[error("ibus: {0}")]
+    Ibus(#[from] cnt_ibus::IbusError),
+    #[error("zbus: {0}")]
+    Zbus(#[from] zbus::Error),
+    #[error("zbus fdo: {0}")]
+    Fdo(#[from] zbus::fdo::Error),
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// 初始化可观测性：fastrace reporter + logforth（stderr 日志 + 日志挂进 span）。
+fn init_observability() {
+    fastrace::set_reporter(ConsoleReporter, Config::default());
+
+    logforth::starter_log::builder()
+        .dispatch(|d| {
+            d.diagnostic(logforth::diagnostic::FastraceDiagnostic::default())
+                .append(
+                    logforth::append::Stderr::default()
+                        .with_layout(logforth::layout::TextLayout::default()),
+                )
+        })
+        .dispatch(|d| d.append(logforth::append::FastraceEvent::default()))
+        .apply();
+
+    log::info!("observability: log + fastrace + logforth");
+}
+
+/// 用户数据目录：`$XDG_DATA_HOME/cnt`（默认 `~/.local/share/cnt`）。
+fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("cnt");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/share/cnt");
+    }
+    PathBuf::from(".")
+}
+
+/// 词库路径：`CNT_DICT` 环境变量优先，否则默认用户数据目录。
+fn dict_path() -> PathBuf {
+    std::env::var_os("CNT_DICT").map_or_else(
+        || data_dir().join(DEFAULT_DICT_FILE),
+        PathBuf::from,
+    )
+}
+
+/// 用户数据路径：`CNT_USER_DB` 环境变量优先，否则默认用户数据目录。
+fn user_path() -> PathBuf {
+    std::env::var_os("CNT_USER_DB").map_or_else(
+        || data_dir().join(DEFAULT_USER_FILE),
+        PathBuf::from,
+    )
+}
+
+/// 语言模型路径：`CNT_LM` 环境变量优先，否则默认用户数据目录。
+fn lm_path() -> PathBuf {
+    std::env::var_os("CNT_LM").map_or_else(
+        || data_dir().join(DEFAULT_LM_FILE),
+        PathBuf::from,
+    )
+}
+
+/// 加载词库、用户数据与语言模型，构造解码器。
+///
+/// 词库是硬依赖（缺失即退出）；语言模型缺失时降级为单字/词候选。
+fn load_decoder() -> Arc<Decoder> {
+    // 词库 + 用户数据（mmap 二进制词库）
+    let dict_path = dict_path();
+    let user_path = user_path();
+    let model = match PinyinModel::open(&dict_path, &user_path) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("cannot open dictionary at {}: {e}", dict_path.display());
+            log::error!(
+                "build it first:\n  cargo run -p cnt-dict-tools -- build data/wordlist.tsv {}",
+                dict_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let model = Arc::new(model);
+    log::info!("dictionary: {}", dict_path.display());
+    log::info!("user data : {}", user_path.display());
+
+    // 语言模型（可选：缺失时降级为单字/词候选，无整句）
+    let lm_path = lm_path();
+    let lm = match CntLm::open(&lm_path) {
+        Ok(lm) => {
+            log::info!(
+                "lm: {} ({} words, {} bigrams)",
+                lm_path.display(),
+                lm.word_count(),
+                lm.bigram_count()
+            );
+            Some(Arc::new(lm))
+        }
+        Err(e) => {
+            log::warn!(
+                "cannot open lm at {}: {e} (sentence candidates disabled; build it with: \n  cargo run -p cnt-dict-tools -- build-lm <lm.arpa> {})",
+                lm_path.display(),
+                lm_path.display()
+            );
+            None
+        }
+    };
+    Arc::new(Decoder::new(model, lm, true))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), DaemonError> {
+    init_observability();
+
+    let decoder = load_decoder();
+
+    // 加载配置（TOML，仅候选词数一项）
+    let config_path = std::env::var_os("CNT_CONFIG").map_or_else(AppConfig::default_path, PathBuf::from);
+    let config = match AppConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("cannot parse config at {}: {e}", config_path.display());
+            AppConfig::default()
+        }
+    };
+    log::info!("config: {} (page_size={})", config_path.display(), config.page_size);
+
+    // 1. 找到 IBus 私有总线地址并连接
+    let addr = cnt_ibus::find_address()?;
+    log::info!("connecting to IBus: {addr}");
+
+    let conn = Builder::address(addr.as_str())?.build().await?;
+    log::info!("connected (unique name: {:?})", conn.unique_name());
+
+    // 2. 提供 Factory 服务（路径固定为 /org/freedesktop/IBus/Engine/Factory）
+    conn.object_server()
+        .at(
+            cnt_engine::FACTORY_OBJ_PATH,
+            Factory::new(conn.clone(), decoder.clone(), config.page_size),
+        )
+        .await?;
+    log::info!("factory served at {}", cnt_engine::FACTORY_OBJ_PATH);
+
+    // 3. 注册组件（含引擎描述）
+    let exec_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let engines = vec![cnt_ibus::engine_desc(
+        ENGINE_NAME,
+        ENGINE_LONGNAME,
+        ENGINE_DESCRIPTION,
+        "zh_CN", // language
+        "MIT",   // license
+        "cnt",   // author
+        "",      // icon
+        "us",    // layout
+        50,      // rank
+        "",      // hotkeys
+        "",      // symbol
+        "",      // setup
+        "",      // layout_variant
+        "",      // layout_option
+        "0.1.0", // version
+        "",      // textdomain
+        "",      // icon_prop_key
+    )];
+    let component = cnt_ibus::component(
+        COMPONENT_NAME,
+        "Cnt Pinyin Component",
+        "0.1.0",
+        "MIT",
+        "cnt",
+        "",             // homepage
+        &exec_path,    // exec：本程序路径，ibus 需要时可重新拉起
+        "",             // textdomain
+        vec![],         // observed_paths
+        engines,
+    );
+
+    conn.call_method(
+        Some("org.freedesktop.IBus"),
+        "/org/freedesktop/IBus",
+        Some("org.freedesktop.IBus"),
+        "RegisterComponent",
+        &(component,),
+    )
+    .await?;
+    log::info!("component registered: {ENGINE_NAME}");
+
+    // 4. 用户学习数据 write-behind：
+    //    - focus_out/disable 时立即 flush（见 cnt-engine）
+    //    - 这里 30s 周期兑底（长时间不切走输入框的连续输入）
+    //    - 优雅退出时 flush（见下方 ctrl_c）
+    //    注意：fastrace 有自己的后台上报线程（默认 1s），无需在这里 flush。
+    log::info!("running (Ctrl-C to quit)");
+    let flush_decoder = decoder.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        tick.tick().await; // 第一次立即 tick，跳过
+        loop {
+            tick.tick().await;
+            if let Err(e) = flush_decoder.flush_user() {
+                log::error!("flush user data failed: {e}");
+            }
+        }
+    });
+
+    // 5. 优雅退出：Ctrl-C 时写盘用户数据 + 排空 fastrace
+    tokio::signal::ctrl_c().await?;
+    log::info!("received Ctrl-C, flushing user data");
+    decoder.flush_user()?;
+    fastrace::flush();
+    Ok(())
+}

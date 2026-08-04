@@ -1,0 +1,15 @@
+[package]
+name = "cnt-dict"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "拼音词库：mmap 支撑的二进制词表（.cntd）+ 用户调频/用户词库"
+
+[dependencies]
+memmap2.workspace = true
+thiserror.workspace = true
+jiff.workspace = true
+cnt-store.workspace = true
+
+[lints]
+workspace = true

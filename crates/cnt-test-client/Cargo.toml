@@ -1,0 +1,15 @@
+[package]
+name = "cnt-test-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "开发用测试客户端：模拟应用程序走 IBus 链路"
+
+[dependencies]
+zbus.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+cnt-ibus.workspace = true
+
+[lints]
+workspace = true

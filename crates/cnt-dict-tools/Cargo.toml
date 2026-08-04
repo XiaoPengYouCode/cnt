@@ -1,0 +1,15 @@
+[package]
+name = "cnt-dict-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "词库工具 CLI：编译词表为 .cntd 二进制、检查、查询"
+
+[dependencies]
+cnt-dict.workspace = true
+cnt-lm.workspace = true
+cnt-decode.workspace = true
+cnt-input.workspace = true
+
+[lints]
+workspace = true

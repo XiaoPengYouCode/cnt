@@ -1,0 +1,69 @@
+# cnt —— 一个用 Rust 写的简易简体中文拼音输入法（IBus 引擎）
+# 工作区根：所有 crate 依赖在此统一定义，各 crate 通过 `workspace = true` 引用。
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/cnt-ibus",
+    "crates/cnt-dict",
+    "crates/cnt-dict-tools",
+    "crates/cnt-lm",
+    "crates/cnt-store",
+    "crates/cnt-config",
+    "crates/cnt-decode",
+    "crates/cnt-input",
+    "crates/cnt-engine",
+    "crates/cnt-daemon",
+    "crates/cnt-test-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "cnt: a simple Simplified Chinese pinyin input method (IBus engine) in Rust"
+rust-version = "1.91"
+readme = "README.md"
+keywords = ["input-method", "ibus", "pinyin", "ime", "mmap"]
+categories = ["text-editors"]
+
+# 严格 clippy：pedantic + nursery + cargo 全部 deny（工作区统一生效）
+# 组用 priority=-1 先应用，下面单条 allow 以默认 priority=0 覆盖组内成员
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# 本地私有项目，尚未发布到 crates.io 也无远端仓库，跳过发布元数据检查
+cargo_common_metadata = "allow"
+# zbus 宏依赖树同时引入 syn 2.x 与 3.x（传递依赖，非我们能控制）
+multiple_crate_versions = "allow"
+
+[workspace.dependencies]
+# 第三方依赖：精确锁定到 crates.io 最新 stable（2026-08）
+zbus = { version = "=5.18.0", default-features = false, features = ["tokio"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+futures-util = "=0.3.33"
+memmap2 = "=0.9.11"
+
+# 可观测性：log（日志宏）+ fastrace（span）+ logforth（日志分发/与 fastrace 关联）
+log = "=0.4.33"
+fastrace = { version = "=0.7.19", features = ["enable"] }
+logforth = { version = "=0.30.1", features = ["starter-log", "append-fastrace", "diagnostic-fastrace"] }
+
+# 错误类型（显式，不用 anyhow）
+thiserror = "=2.0.19"
+
+# 时间库（约定用 jiff，不用 chrono）
+jiff = "=0.2.35"
+# 配置文件解析（TOML）
+toml = "=1.1.4"
+
+# 内部 crate（纯路径依赖，无需版本）
+cnt-ibus = { path = "crates/cnt-ibus" }
+cnt-dict = { path = "crates/cnt-dict" }
+cnt-lm = { path = "crates/cnt-lm" }
+cnt-store = { path = "crates/cnt-store" }
+cnt-config = { path = "crates/cnt-config" }
+cnt-decode = { path = "crates/cnt-decode" }
+cnt-input = { path = "crates/cnt-input" }
+cnt-engine = { path = "crates/cnt-engine" }

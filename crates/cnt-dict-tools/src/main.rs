@@ -1,0 +1,530 @@
+//! 词库工具 CLI。
+//!
+//! ```text
+//! cnt-dict-tools build <in.tsv> <out.cntd>                编译词表为二进制
+//! cnt-dict-tools import-rime-table <table.txt> <out.tsv>  Rime 词表 → 标准词表
+//! cnt-dict-tools import-libime <dict.txt> <out.tsv>      libime 词表 → 标准词表
+//! cnt-dict-tools build-lm <lm.arpa> <out.cntl>           ARPA 语言模型 → 二进制
+//! cnt-dict-tools decode <dict.cntd> <lm.cntl> <pinyin>.. 整句解码（开发调试）
+//! cnt-dict-tools info  <dict.cntd>                       打印词库统计
+//! cnt-dict-tools query <dict.cntd> <pinyin>..            查询候选
+//! ```
+//!
+//! 标准词表格式（tsv，`#` 开头为注释，频率可省略默认 1000）：
+//! ```text
+//! nihao<TAB>你好<TAB>1000
+//! ```
+
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
+
+use cnt_dict::{writer, MmapDict};
+
+/// 各子命令的统一返回（CLI 错误聚合）。
+type CliResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// `f64` → `u32` 频率：四舍五入并夹紧到 `[1, u32::MAX]`。
+/// 转换器专用：权重/对数概率转整数频率，截断与符号丢失在此是预期语义。
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn freq_u32(v: f64) -> u32 {
+    let v = v.clamp(1.0, f64::from(u32::MAX));
+    v.round() as u32
+}
+
+/// libime 顶层词标记：dict 权重精确为 0（文本里就是写的 `0`，用精确比较是正确语义）。
+#[allow(clippy::float_cmp)]
+fn is_libime_top_tier(w: f64) -> bool {
+    w == 0.0
+}
+
+/// 有 LM 路径的频率换算常量（log10 概率 → 频率的缩放）。
+const LM_SCALE: f64 = 10_000.0;
+/// 无 LM 路径（dict 权重）的频率换算常量。
+const WEIGHT_SCALE: f64 = 100_000.0;
+/// 「次读音」判定阈值：libime 主读音权重 ≈ 0（-0.0001 ~ 0），
+/// 次读音显著更负（-2.7 ~ -5.3）。次读音用按读音权重，避免多音字串频
+/// （的(de) vs 的(di)、和(he) vs 和(hu)）。
+const SECONDARY_READING_THRESHOLD: f64 = -0.1;
+/// LM 地板词的“常用词带”高度（0.5 个 log10 单位）。
+const FLOOR_BOOST: u32 = 5_000;
+
+/// 有 LM 时：词在 unigram 里 → 对数概率换算频率；否则长尾 `freq = 1`。
+/// libime 顶层词（dict 权重 == 0）若是 LM 地板词（如 你好，LM 按 你+好
+/// 二元组建模所以 unigram 概率在地板），抬到“常用词带”，避免排到生僻词后。
+fn lm_freq(map: &std::collections::HashMap<String, f64>, p_min: f64, word: &str, dict_weight: Option<&str>) -> u32 {
+    map.get(word).map_or(1, |p| {
+        let raw = freq_u32((p - p_min) * LM_SCALE);
+        let top_tier = dict_weight
+            .and_then(|w| w.trim().parse::<f64>().ok())
+            .is_some_and(is_libime_top_tier);
+        if top_tier && raw < FLOOR_BOOST {
+            FLOOR_BOOST
+        } else {
+            raw
+        }
+    })
+}
+
+/// 混合频率（读音感知）：
+/// - **次读音**（权重 < `SECONDARY_READING_THRESHOLD`，如 的di=-3.5、和hu=-2.8）
+///   用 libime 按读音权重 —— 多音字的次读音频率显著低于主读音，不再串频；
+/// - **主读音**（权重 ≈ 0，如 的de、是/时/事）用 LM unigram —— 保留细粒度排序
+///   （是 与 时 不并列）。
+fn blend_freq(
+    map: &std::collections::HashMap<String, f64>,
+    p_min: f64,
+    word: &str,
+    dict_weight: Option<&str>,
+    _min_w: f64,
+) -> u32 {
+    match dict_weight.and_then(|w| w.trim().parse::<f64>().ok()) {
+        // 次读音（如 的di、和hu）：freq=1，与主读音的 LM 频率（≥1e4 量级）天然区分
+        Some(w) if w < SECONDARY_READING_THRESHOLD => 1,
+        _ => lm_freq(map, p_min, word, dict_weight),
+    }
+}
+
+/// 读取已编译的 `.cntl` 语言模型（替代解析 ARPA 文本）。
+fn read_cntl_unigrams(path: &str) -> CliResult<(std::collections::HashMap<String, f64>, f64)> {
+    use cnt_lm::CntLm;
+    let lm = CntLm::open(path)?;
+    let mut map = std::collections::HashMap::new();
+    let mut p_min = f64::MAX;
+    for (word, logprob, _backoff) in lm.unigrams() {
+        map.insert(word.to_string(), f64::from(logprob));
+        p_min = p_min.min(f64::from(logprob));
+    }
+    Ok((map, p_min))
+}
+
+/// 无 LM 时：dict 权重 → 频率（多音字正权重按 0 封顶）；无权重长尾 `freq = 1`。
+fn weight_freq(dict_weight: Option<&str>, min_w: f64) -> u32 {
+    dict_weight
+        .and_then(|w| w.trim().parse::<f64>().ok())
+        .map_or(1, |w| freq_u32((w.min(0.0) - min_w) * WEIGHT_SCALE))
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        usage();
+        std::process::exit(2);
+    }
+    let result = match args[1].as_str() {
+        "build" => {
+            if args.len() != 4 {
+                usage();
+                std::process::exit(2);
+            }
+            cmd_build(&args[2], &args[3])
+        }
+        "import-rime-table" => {
+            if args.len() != 4 {
+                usage();
+                std::process::exit(2);
+            }
+            cmd_import_rime_table(&args[2], &args[3])
+        }
+        "import-libime" => {
+            // import-libime <dict.txt> <out.tsv> [--lm <lm.arpa>]
+            let lm = match args.get(4).map(String::as_str) {
+                Some("--lm") if args.len() == 6 => Some(args[5].clone()),
+                _ => {
+                    if args.len() != 4 {
+                        usage();
+                        std::process::exit(2);
+                    }
+                    None
+                }
+            };
+            cmd_import_libime(&args[2], &args[3], lm.as_deref())
+        }
+        "build-lm" => {
+            if args.len() != 4 {
+                usage();
+                std::process::exit(2);
+            }
+            cmd_build_lm(&args[2], &args[3])
+        }
+        "decode" => {
+            if args.len() < 4 {
+                usage();
+                std::process::exit(2);
+            }
+            // decode <dict> <lm> [--user <user.dict>] <pinyin>...
+            let mut rest = &args[4..];
+            let user = if rest.first().map(String::as_str) == Some("--user") && rest.len() >= 2 {
+                let u = rest[1].clone();
+                rest = &rest[2..];
+                Some(u)
+            } else {
+                None
+            };
+            cmd_decode(&args[2], &args[3], user.as_deref(), rest)
+        }
+        "info" => {
+            if args.len() != 3 {
+                usage();
+                std::process::exit(2);
+            }
+            cmd_info(&args[2])
+        }
+        "query" => {
+            if args.len() < 4 {
+                usage();
+                std::process::exit(2);
+            }
+            cmd_query(&args[2], &args[3..])
+        }
+        _ => {
+            usage();
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn usage() {
+    eprintln!(
+        "usage:\n  cnt-dict-tools build <in.tsv> <out.cntd>\n  cnt-dict-tools import-rime-table <table.txt> <out.tsv>\n  cnt-dict-tools import-libime <dict.txt> <out.tsv> [--lm <lm.arpa>]\n  cnt-dict-tools build-lm <lm.arpa> <out.cntl>\n  cnt-dict-tools decode <dict.cntd> <lm.cntl> [--user <user.dict>] <pinyin>..\n  cnt-dict-tools info <dict.cntd>\n  cnt-dict-tools query <dict.cntd> <pinyin>..."
+    );
+}
+
+fn parse_wordlist(path: &str) -> io::Result<Vec<(String, String, u32)>> {
+    let f = BufReader::new(File::open(path)?);
+    let mut pairs = Vec::new();
+    for (lineno, line) in f.lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            [pinyin, word] => pairs.push((pinyin.to_string(), word.to_string(), 1000)),
+            [pinyin, word, freq] => {
+                let freq: u32 = freq.parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("line {}: bad freq {freq:?}", lineno + 1),
+                    )
+                })?;
+                pairs.push((pinyin.to_string(), word.to_string(), freq));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("line {}: expected 'pinyin word [freq]'", lineno + 1),
+                ))
+            }
+        }
+    }
+    Ok(pairs)
+}
+
+fn cmd_build(input: &str, output: &str) -> CliResult {
+    let pairs = parse_wordlist(input)?;
+    writer::write_to_file(&pairs, Path::new(output))?;
+    println!("built {} entries -> {output}", pairs.len());
+    Ok(())
+}
+
+/// 把 `Rime` 编译产物（`luna_pinyin.table.txt`）转成标准词表。
+///
+/// Rime 格式：`词<TAB>拼音(空格分隔音节)<TAB>权重`。
+/// 转换规则：
+/// - 音节空格去掉（ni hao → nihao，与我们的 key 一致）
+/// - 权重为浮点，四舍五入转 u32，≤0 的丢弃
+/// - 拼音或词为空的丢弃
+fn cmd_import_rime_table(input: &str, output: &str) -> CliResult {
+    let f = BufReader::new(File::open(input)?);
+    let mut out = BufWriter::new(File::create(output)?);
+    let mut imported = 0u64;
+    let mut skipped = 0u64;
+    for line in f.lines() {
+        let line = line?;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split('\t');
+        let (Some(word), Some(pinyin), Some(weight)) = (it.next(), it.next(), it.next()) else {
+            skipped += 1;
+            continue;
+        };
+        if word.is_empty() || pinyin.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let freq = match weight.trim().parse::<f64>() {
+            Ok(w) if w > 0.0 => freq_u32(w),
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let key: String = pinyin.split_whitespace().collect();
+        if key.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        writeln!(out, "{key}\t{word}\t{freq}")?;
+        imported += 1;
+    }
+    out.flush()?;
+    println!("imported {imported} entries ({skipped} skipped) -> {output}");
+    Ok(())
+}
+
+/// 把 `libime`（`fcitx5`）拼音词典转成标准词表。
+///
+/// libime 格式：`词<TAB>拼音(音节用 ' 分隔)<TAB>权重`，权重可省略。
+///
+/// 权重说明：dict.txt 里的权重并不可靠（0 是最常用基准，但多音字默认读音
+/// 会被给到正权重，如 螫+0.22 反而超过 是），真正决定候选顺序的是语言模型。
+/// 因此推荐传 `--lm lm.arpa`：用 ARPA 1-gram 的对数概率排序（是 -1.94，
+/// 时 -2.88，螫 -6.17），顺序完全正确。
+///
+/// 转换规则：
+/// - 去掉音节分隔符 `'`（ni'hao → nihao，与我们的 key 一致）
+/// - 有 `--lm`：`freq = round((p - p_min) * 1e4) + 1`，不在 `LM` 中的长尾词 `freq = 1`
+/// - 无 `--lm`：`freq = round((min(w,0) - min_w) * 1e5) + 1`，无权重条目 `freq = 1`
+fn cmd_import_libime(input: &str, output: &str, lm: Option<&str>) -> CliResult {
+
+    // 语言模型 unigram（若提供）：.arpa 文本或已编译的 .cntl
+    let unigrams: Option<(std::collections::HashMap<String, f64>, f64)> = match lm {
+        Some(path) if path.to_ascii_lowercase().ends_with(".cntl") => Some(read_cntl_unigrams(path)?),
+        Some(path) => Some(read_arpa_unigrams(path)?),
+        None => None,
+    };
+
+    // 先扫一遍找最小权重（次读音换算需要；多音字正权重按 0 封顶）。
+    // 哨兵用 f64::MAX：NEG_INFINITY.min(x) 恒为 -inf（负无穷即最小值），是经典陷阱。
+    let min_w = {
+        let mut min_w = f64::MAX;
+        let f = BufReader::new(File::open(input)?);
+        for line in f.lines() {
+            let line = line?;
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 2 || fields[1].is_empty() {
+                continue;
+            }
+            if let Some(w) = fields.get(2)
+                && let Ok(w) = w.trim().parse::<f64>()
+            {
+                min_w = min_w.min(w.min(0.0));
+            }
+        }
+        if min_w.is_finite() {
+            min_w
+        } else {
+            0.0
+        }
+    };
+
+    // 转换输出
+    let f = BufReader::new(File::open(input)?);
+    let mut out = BufWriter::new(File::create(output)?);
+    let mut imported = 0u64;
+    let mut skipped = 0u64;
+    for line in f.lines() {
+        let line = line?;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let (Some(word), Some(pinyin)) = (fields.first(), fields.get(1)) else {
+            skipped += 1;
+            continue;
+        };
+        if word.is_empty() || pinyin.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let key: String = pinyin.chars().filter(|c| *c != '\'').collect();
+        if key.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let freq = match &unigrams {
+            Some((map, p_min)) => blend_freq(map, *p_min, word, fields.get(2).copied(), min_w),
+            None => weight_freq(fields.get(2).copied(), min_w),
+        };
+        writeln!(out, "{key}\t{word}\t{freq}")?;
+        imported += 1;
+    }
+    out.flush()?;
+    println!("imported {imported} entries ({skipped} skipped) -> {output}");
+    Ok(())
+}
+
+/// 读取 ARPA 语言模型的 1-grams 部分（在 2-grams 处停止，只解析 unigram）。
+/// 返回 (word -> log10 概率, 概率最小值)。
+fn read_arpa_unigrams(path: &str) -> io::Result<(std::collections::HashMap<String, f64>, f64)> {
+    let f = BufReader::new(File::open(path)?);
+    let mut map = std::collections::HashMap::new();
+    let mut p_min = f64::MAX;
+    let mut in_unigrams = false;
+    for line in f.lines() {
+        let line = line?;
+        if line.starts_with("\\1-grams:") {
+            in_unigrams = true;
+            continue;
+        }
+        if line.starts_with("\\2-grams:") {
+            break;
+        }
+        if !in_unigrams || line.is_empty() {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let (Some(p), Some(word)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if word == "<unk>" {
+            continue;
+        }
+        let Ok(p) = p.parse::<f64>() else {
+            continue;
+        };
+        map.insert(word.to_string(), p);
+        p_min = p_min.min(p);
+    }
+    Ok((map, p_min))
+}
+
+fn cmd_info(path: &str) -> CliResult {
+    let d = MmapDict::open(path)?;
+    println!("dict: {path}");
+    println!("entries: {}", d.entry_count());
+    println!("candidates: {}", d.cand_count());
+    // 打印前 5 个 key 验证
+    println!("first keys:");
+    for i in 0..d.entry_count().min(5) {
+        println!("  {:?}", d.key_at(i));
+    }
+    Ok(())
+}
+
+fn cmd_query(path: &str, pinyins: &[String]) -> CliResult {
+    let d = MmapDict::open(path)?;
+    for pinyin in pinyins {
+        print!("{pinyin}: ");
+        let exact = d.exact(pinyin);
+        let prefix = d.prefix(pinyin);
+        let mut out: Vec<String> = Vec::new();
+        out.extend(exact.iter().map(|c| c.word.to_string()));
+        for h in prefix.iter().filter(|h| h.key != pinyin) {
+            out.push(format!("{}[{}]", h.word, h.key));
+        }
+        if out.is_empty() {
+            println!("(no candidates)");
+        } else {
+            println!("{}", out.join(" "));
+        }
+    }
+    Ok(())
+}
+
+/// 把 ARPA 文本语言模型编译成 `.cntl` 二进制。
+///
+/// 只解析 unigram 与 bigram 段（到 `\\3-grams:` 停止），`<unk>` 等伪词跳过。
+fn cmd_build_lm(input: &str, output: &str) -> CliResult {
+    use cnt_lm::writer::{build, Bigram, Unigram};
+
+    let f = BufReader::new(File::open(input)?);
+    let mut unigrams: Vec<Unigram> = Vec::new();
+    let mut bigrams: Vec<Bigram> = Vec::new();
+    let mut section = 0u8; // 0=头, 1=1-grams, 2=2-grams
+    for line in f.lines() {
+        let line = line?;
+        if line.starts_with("\\1-grams:") {
+            section = 1;
+            continue;
+        }
+        if line.starts_with("\\2-grams:") {
+            section = 2;
+            continue;
+        }
+        if line.starts_with("\\3-grams:") || line.starts_with("\\end\\") {
+            break;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match section {
+            1 => {
+                // logprob word [backoff]
+                let [logprob, word, ..] = fields.as_slice() else {
+                    continue;
+                };
+                if *word == "<unk>" {
+                    continue;
+                }
+                let backoff = fields.get(2).map_or(0.0, |b| b.parse().unwrap_or(0.0));
+                unigrams.push(Unigram {
+                    word: word.to_string(),
+                    logprob: logprob.parse()?,
+                    backoff,
+                });
+            }
+            2 => {
+                // logprob w1 w2 [backoff]
+                let [logprob, w1, w2, ..] = fields.as_slice() else {
+                    continue;
+                };
+                bigrams.push(Bigram {
+                    w1: w1.to_string(),
+                    w2: w2.to_string(),
+                    logprob: logprob.parse()?,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let bytes = build(&unigrams, &bigrams)?;
+    std::fs::write(Path::new(output), bytes)?;
+    println!(
+        "built {} unigrams, {} bigrams -> {output}",
+        unigrams.len(),
+        bigrams.len()
+    );
+    Ok(())
+}
+
+/// 整句解码（开发调试用）：加载词库 + 语言模型，对给定拼音串解码 Top-K 句子。
+fn cmd_decode(
+    dict_path: &str,
+    lm_path: &str,
+    user_path: Option<&str>,
+    pinyins: &[String],
+) -> CliResult {
+    use cnt_decode::Decoder;
+    use cnt_input::CandidateSource;
+    use cnt_dict::PinyinModel;
+    use cnt_lm::CntLm;
+
+    // 用户库：未指定时用临时空文件（不污染真实用户数据）
+    let tmp_user = std::env::temp_dir().join(format!("cnt-decode-{}.dict", std::process::id()));
+    let user_str = user_path.unwrap_or_else(|| tmp_user.to_str().unwrap());
+    let model = std::sync::Arc::new(PinyinModel::open(dict_path, user_str)?);
+    let lm = std::sync::Arc::new(CntLm::open(lm_path)?);
+    let decoder = Decoder::new(model, Some(lm), true);
+
+    for pinyin in pinyins {
+        println!("{pinyin}:");
+        for (i, cand) in decoder.candidates(pinyin).iter().take(10).enumerate() {
+            println!("  {}. {}", i + 1, cand.text);
+        }
+    }
+    let _ = std::fs::remove_file(&tmp_user);
+    Ok(())
+}

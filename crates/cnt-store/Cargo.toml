@@ -1,0 +1,13 @@
+[package]
+name = "cnt-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "二进制 mmap 存储公共底座：错误类型、字节读取、mmap 文件、区域校验"
+
+[dependencies]
+memmap2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

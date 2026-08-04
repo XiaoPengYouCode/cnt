@@ -1,0 +1,24 @@
+[package]
+name = "cnt-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cnt 主程序：连接 IBus、注册组件、加载词库、事件循环"
+
+[dependencies]
+zbus.workspace = true
+tokio.workspace = true
+cnt-ibus.workspace = true
+cnt-dict.workspace = true
+cnt-lm.workspace = true
+cnt-store.workspace = true
+cnt-config.workspace = true
+cnt-decode.workspace = true
+cnt-engine.workspace = true
+fastrace.workspace = true
+logforth.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

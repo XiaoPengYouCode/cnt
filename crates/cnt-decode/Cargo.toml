@@ -1,0 +1,14 @@
+[package]
+name = "cnt-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "拼音切分（音节表）+ 整句解码（beam search）"
+
+[dependencies]
+cnt-input.workspace = true
+cnt-dict.workspace = true
+cnt-lm.workspace = true
+
+[lints]
+workspace = true

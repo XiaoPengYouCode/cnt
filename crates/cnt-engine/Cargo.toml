@@ -1,0 +1,25 @@
+[package]
+name = "cnt-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IBus Factory/Engine D-Bus 服务端"
+
+[dependencies]
+zbus.workspace = true
+cnt-ibus.workspace = true
+cnt-input.workspace = true
+cnt-decode.workspace = true
+fastrace.workspace = true
+log.workspace = true
+
+[lints.clippy]
+# 与 workspace 一致的严格组（无法同时用 workspace = true + 覆盖，故显式列出）
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+# zbus 宏生成的分发代码会引用 `_` 前缀协议参数（方法级 allow 会被宏丢弃），
+# 本 crate 中所有 `_` 前缀绑定均为 IBus 协议签名参数，属有意为之。
+used_underscore_binding = "allow"
