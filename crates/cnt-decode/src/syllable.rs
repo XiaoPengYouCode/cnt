@@ -47,29 +47,47 @@ const SYLLABLES: &[&str] = &[
     "zuan", "zui", "zun", "zuo",
 ];
 
-/// 模糊音规则（双向）：平翘舌 / 边鼻音 / 前后鼻音等。
-const FUZZY_RULES: &[(&str, &str)] = &[
-    ("zh", "z"),
-    ("ch", "c"),
-    ("sh", "s"),
-    ("n", "l"),
-    ("f", "h"),
-    ("r", "l"),
-    ("k", "g"),
-    ("t", "d"),
-    ("an", "ang"),
-    ("en", "eng"),
-    ("in", "ing"),
-    ("ian", "iang"),
-    ("uan", "uang"),
+/// 模糊音规则（双向）+ 代价等级：等级越高，越不像「用户本意读音」。
+///
+/// 分级依据是方音混淆的真实频度——一视同仁的单一惩罚会让高频的模糊音词
+/// 压过精确读音词（xiangchen → 县城 挤掉 相称），而把惩罚整体加重又会
+/// 打死真正常见的混淆（sihou → 时候）。故按类别分档：
+/// - 1 = 平翘舌 zh/z、ch/c、sh/s：南方口音最普遍，惩罚最轻
+/// - 2 = 边鼻音 n/l 与前后鼻音韵尾 an/ang…：常见但已足以改变词形
+/// - 3 = 其他声母混淆 f/h、r/l、k/g、t/d：实际较少见，代价最高
+const FUZZY_RULES: &[(&str, &str, u8)] = &[
+    ("zh", "z", 1),
+    ("ch", "c", 1),
+    ("sh", "s", 1),
+    ("n", "l", 2),
+    ("f", "h", 3),
+    ("r", "l", 3),
+    ("k", "g", 3),
+    ("t", "d", 3),
+    ("an", "ang", 2),
+    ("en", "eng", 2),
+    ("in", "ing", 2),
+    ("ian", "iang", 2),
+    ("uan", "uang", 2),
 ];
 
-/// 一条切分边：结束位置 + 标准音节 + 是否模糊匹配（变体 → 标准）。
+/// 模糊代价的最大等级（`FUZZY_RULES` 中的最高档）。
+pub const MAX_FUZZY_COST: u8 = 3;
+
+/// 一条切分边：结束位置 + 标准音节 + 模糊代价等级（0 = 精确读音）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyllableEdge {
     pub end: usize,
     pub syl: &'static str,
-    pub fuzzy: bool,
+    pub cost: u8,
+}
+
+impl SyllableEdge {
+    /// 是否为模糊读音（非精确匹配）。
+    #[must_use]
+    pub const fn is_fuzzy(&self) -> bool {
+        self.cost > 0
+    }
 }
 
 /// 音节表：按首字母索引，查询 `input[pos..]` 处的合法音节。
@@ -78,9 +96,10 @@ pub struct SyllableTable {
     fuzzy: FuzzyTable,
 }
 
-/// 模糊变体表：`map[变体] = 可能的多个标准音节`（变体本身是标准音节时包含自己）。
+/// 模糊变体表：`map[变体] = [(标准音节, 代价等级)]`
+/// （变体本身是标准音节时以代价 0 包含自己）。
 struct FuzzyTable {
-    map: HashMap<&'static str, Vec<&'static str>>,
+    map: HashMap<&'static str, Vec<(&'static str, u8)>>,
     by_first: HashMap<char, Vec<&'static str>>,
 }
 
@@ -107,9 +126,9 @@ impl SyllableTable {
         syllables_in_bucket(&self.by_first, input, pos)
     }
 
-    /// 从 `input[pos..]` 能匹配到的音节（含模糊变体；`fuzzy=true` 表示变体读音）。
+    /// 从 `input[pos..]` 能匹配到的音节（含模糊变体；`cost > 0` 表示变体读音）。
     ///
-    /// 例：输入 `sang` → 标准 `sang`（精确）与 `shang`（模糊，s↔sh）。
+    /// 例：输入 `sang` → 标准 `sang`（精确，cost=0）与 `shang`（模糊 s↔sh，cost=1）。
     #[must_use]
     pub fn fuzzy_syllables_at(&self, input: &str, pos: usize) -> Vec<SyllableEdge> {
         let mut out: Vec<SyllableEdge> = Vec::new();
@@ -122,11 +141,11 @@ impl SyllableTable {
                     continue;
                 }
                 if let Some(canonicals) = self.fuzzy.map.get(*variant) {
-                    for syl in canonicals {
+                    for (syl, cost) in canonicals {
                         let edge = SyllableEdge {
                             end: pos + variant.len(),
                             syl,
-                            fuzzy: variant != syl, // 变体≠标准 → 模糊
+                            cost: *cost,
                         };
                         if !out.contains(&edge) {
                             out.push(edge);
@@ -208,7 +227,7 @@ fn syllables_in_bucket(
         .map(|s| SyllableEdge {
             end: pos + s.len(),
             syl: s,
-            fuzzy: false,
+            cost: 0,
         })
         .collect()
 }
@@ -216,21 +235,23 @@ fn syllables_in_bucket(
 impl FuzzyTable {
     fn new() -> Self {
         // 变体用 'static 生命周期：进程常驻，Leak 一次无妨。
-        let mut map: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+        let mut map: HashMap<&'static str, Vec<(&'static str, u8)>> = HashMap::new();
         let mut by_first: HashMap<char, Vec<&'static str>> = HashMap::new();
         // 第一遍：精确映射先入表（保证 `first()` 优先拿到标准读音，
         // 否则 f↔h 等规则会让 `fou` 遮蔽 `hou`，把 时候 拼成 是否）。
         for syl in SYLLABLES {
             let leaked: &'static str = Box::leak((*syl).into());
-            map.entry(leaked).or_default().push(syl);
+            map.entry(leaked).or_default().push((syl, 0));
             by_first.entry(leaked.chars().next().unwrap_or('a')).or_default().push(leaked);
         }
-        // 第二遍：模糊变体补入
+        // 第二遍：模糊变体补入（同一 变体→标准 由多条规则得到时保留最低代价）
         for syl in SYLLABLES {
-            for v in fuzzy_variants(syl) {
+            for (v, cost) in fuzzy_variants(syl) {
                 let leaked: &'static str = Box::leak(v.into_boxed_str());
-                if !map.get(leaked).is_some_and(|l| l.contains(syl)) {
-                    map.entry(leaked).or_default().push(syl);
+                let entry = map.entry(leaked).or_default();
+                match entry.iter_mut().find(|(s, _)| s == syl) {
+                    Some((_, c)) => *c = (*c).min(cost),
+                    None => entry.push((syl, cost)),
                 }
                 if let Some(c) = leaked.chars().next() {
                     by_first.entry(c).or_default().push(leaked);
@@ -244,21 +265,21 @@ impl FuzzyTable {
     }
 }
 
-/// 生成一个音节的所有模糊变体（每条规则最多一次替换）。
-fn fuzzy_variants(syl: &str) -> Vec<String> {
+/// 生成一个音节的所有模糊变体（每条规则最多一次替换），带规则代价等级。
+fn fuzzy_variants(syl: &str) -> Vec<(String, u8)> {
     let mut out = Vec::new();
-    for (a, b) in FUZZY_RULES {
+    for (a, b, cost) in FUZZY_RULES {
         // 方向 a→b：若 b 以 a 开头（前缀重叠，如 sh/s），跳过已被 b 占据的位置
         if let Some(pos) = syl.find(a)
             && !(a.len() < b.len() && syl[pos..].starts_with(b))
         {
-            out.push(substitute(syl, pos, a.len(), b));
+            out.push((substitute(syl, pos, a.len(), b), *cost));
         }
         // 方向 b→a
         if let Some(pos) = syl.find(b)
             && !(b.len() < a.len() && syl[pos..].starts_with(a))
         {
-            out.push(substitute(syl, pos, b.len(), a));
+            out.push((substitute(syl, pos, b.len(), a), *cost));
         }
     }
     out
@@ -325,6 +346,27 @@ mod tests {
             reachable.iter().any(|s| s == "shi hou"),
             "sihou 应能切出 shi hou: {reachable:?}"
         );
+    }
+
+    #[test]
+    fn fuzzy_cost_is_tiered() {
+        let t = SyllableTable::new();
+        let cost_of = |input: &str, syl: &str| {
+            t.fuzzy_syllables_at(input, 0)
+                .into_iter()
+                .find(|e| e.syl == syl)
+                .map(|e| e.cost)
+        };
+        // 精确匹配 cost=0
+        assert_eq!(cost_of("shang", "shang"), Some(0));
+        // 平翘舌（sh/s）= 1
+        assert_eq!(cost_of("sang", "shang"), Some(1));
+        // 前后鼻音韵尾（an/ang）= 2；边鼻音（n/l）= 2
+        assert_eq!(cost_of("san", "sang"), Some(2));
+        assert_eq!(cost_of("lan", "nan"), Some(2));
+        // 其他声母混淆（k/g、f/h、r/l）= 3
+        assert_eq!(cost_of("gou", "kou"), Some(3));
+        assert_eq!(cost_of("fou", "hou"), Some(3));
     }
 
     #[test]

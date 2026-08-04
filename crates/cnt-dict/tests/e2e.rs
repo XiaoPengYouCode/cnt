@@ -26,9 +26,11 @@ fn build_then_mmap_then_query() {
 
     let m = PinyinModel::open(&dict_path, &user_path).unwrap();
     let q = m.query("ni");
-    assert_eq!(q[0], "你好"); // 前缀词频更高
-    assert_eq!(q[1], "你好吗");
-    assert_eq!(q[2], "你");
+    // 精确读音优先：前缀词按 PREFIX_DISCOUNT 折价（你好 1000/4=250），
+    // 不再用全额词频压过同拼音的精确词 你(900)
+    assert_eq!(q[0], "你");
+    assert_eq!(q[1], "你好");
+    assert_eq!(q[2], "你好吗");
 
     m.bump("ni", "你");
     m.bump("ni", "你");

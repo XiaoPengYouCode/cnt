@@ -20,6 +20,13 @@ pub const QUERY_LIMIT: usize = 50;
 /// 用户计数换算成基础词频的权重。
 pub const USER_BOOST: u32 = 1000;
 
+/// 前缀候选（键比输入更长，如输入 `lian` 命中 `lianxi`/`lianghao`）的词频折扣。
+///
+/// 前缀词是「猜测用户还没打完」的候选，不该与精确读音的词平起平坐：
+/// 联系(24126)/良好(24121) 原先按全额词频压过 `lian` 下的 恋/链/帘，
+/// 让精确同音字全被挤出前 10。折扣 4 让高频前缀词仍靠前，但排在常用精确词之后。
+pub const PREFIX_DISCOUNT: u64 = 4;
+
 /// 供输入逻辑使用的查询接口（与具体实现解耦，便于测试/替换）。
 pub trait DictQuery {
     fn query(&self, pinyin: &str) -> Vec<String>;
@@ -84,7 +91,9 @@ impl PinyinModel {
         }
         for h in self.dict.prefix(pinyin) {
             let cnt = user.count(h.key, h.word);
-            let score = u64::from(h.freq) + u64::from(cnt) * u64::from(USER_BOOST);
+            // 前缀词打折：精确读音的词优先（见 PREFIX_DISCOUNT）
+            let score =
+                u64::from(h.freq) / PREFIX_DISCOUNT + u64::from(cnt) * u64::from(USER_BOOST);
             push(&mut scored, h.word, score, false);
         }
         // 用户词：精确 + 前缀（学过的复合词/新词；词典里没有的也参与）

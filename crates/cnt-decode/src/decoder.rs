@@ -14,7 +14,7 @@ use cnt_input::{Candidate, CandidateSource, LearnedWord};
 use fastrace::local::LocalSpan;
 use fastrace::{Event, Span};
 
-use crate::syllable::{SyllableEdge, SyllableTable};
+use crate::syllable::{SyllableEdge, SyllableTable, MAX_FUZZY_COST};
 
 /// beam 宽度：同时保留的假设数。
 const BEAM: usize = 8;
@@ -22,9 +22,14 @@ const BEAM: usize = 8;
 const WORDS_PER_SYLLABLE: usize = 8;
 /// 多音节词最多跨多少个音节（含首音节；4 = 成语如 莫名其妙）。
 const MAX_WORD_SYLLABLES: usize = 4;
-/// 模糊匹配的惩罚（log10）：模糊是回退读音，不应与精确读音平等竞争。
-/// -1.0：恰好压过「精确但生僻」的路径（死后 -4.95），又不至于让 时候 沉底。
-const FUZZY_PENALTY: f32 = -1.0;
+/// 模糊匹配的分级惩罚（log10），下标 = `SyllableEdge::cost`（0 = 精确，无惩罚）。
+///
+/// 模糊是回退读音，不应与精确读音平等竞争；但惩罚不能一刀切：
+/// - 1（平翘舌）-1.0：恰好压过「精确但生僻」的路径（死后 -4.95），
+///   又不至于让 时候 沉底（sihou → 时候 仍 #1）
+/// - 2（边鼻音 n/l、鼻韵尾 an/ang 等）-2.0：阻止 xiangchen → 县城 抢 #1
+/// - 3（f/h、r/l、k/g、t/d）-3.0：较少见的混淆，不得压过精确读音词
+const FUZZY_PENALTY: [f32; (MAX_FUZZY_COST as usize) + 1] = [0.0, -1.0, -2.0, -3.0];
 /// 返回的句子候选数。
 const TOP_SENTENCES: usize = 5;
 /// 词不在 LM 中时的默认 unigram log10 概率。
@@ -33,7 +38,9 @@ const UNK_LOGPROB: f32 = -12.0;
 /// 而拿到 UNK（-12）输给任何整句拼接，给一个与用户词同档的基础分。
 const OOV_BASE: f32 = -5.0;
 /// 补全词惩罚（completions 的延长音节词）：精确读音候选优先于补全候选。
-const COMPLETION_PENALTY: f32 = -0.5;
+/// -1.5：-0.5 太轻，输入 jian 时 jiang 的高频词（将 -2.82）会压过精确读音的
+/// 见/件/间，单音节候选前排被「猜你还没打完」的词占掉。
+const COMPLETION_PENALTY: f32 = -1.5;
 /// 次读音/极罕见词的基础分（`freq ≤ SECONDARY_FREQ_CAP`）。
 const SECONDARY_BASE: f32 = -6.0;
 /// 用户词（`freq == 0`，学过的复合词/新词）的基础分。
@@ -54,7 +61,8 @@ type WordCache = std::collections::HashMap<String, CachedWords>;
 /// 一条格的展开上下文（参数聚合，避免 expand 签名过长）。
 struct EdgeCtx<'a> {
     end: usize,
-    fuzzy: bool,
+    /// 该词键路径上的模糊代价等级（多音节取最大）
+    cost: u8,
     key: &'a Arc<str>,
 }
 
@@ -198,7 +206,7 @@ impl Decoder {
         let mut completions: Vec<(String, String)> = Vec::new();
         if max_pos == pinyin.len() {
             // 完整输入：末音节可延长（chijiuhu 的 hu → hua）
-            for e in lattice.iter().flatten().filter(|e| e.end == pinyin.len() && !e.fuzzy) {
+            for e in lattice.iter().flatten().filter(|e| e.end == pinyin.len() && !e.is_fuzzy()) {
                 let base = &pinyin[..e.end - e.syl.len()];
                 for ext in self.syllables.syllables_with_prefix(e.syl) {
                     completions.push((base.to_string(), ext.to_string()));
@@ -275,7 +283,7 @@ impl Decoder {
                     n_expand += words.len();
                     self.expand(
                         h,
-                        &EdgeCtx { end: edge.end, fuzzy: edge.fuzzy, key: key_arc },
+                        &EdgeCtx { end: edge.end, cost: edge.cost, key: key_arc },
                         words,
                         &mut next,
                         lm,
@@ -283,10 +291,10 @@ impl Decoder {
                     // 多音节词：沿格的所有路径拼接完整 key（如 xin-xi-liang → 信息量），
                     // 词库不存在的键剪枝——不依赖格内 edge 顺序（first() 会因音节表
                     // 顺序拼错路径，漏掉整词）。
-                    let mut chains = vec![(String::from(edge.syl), edge.end, edge.fuzzy)];
+                    let mut chains = vec![(String::from(edge.syl), edge.end, edge.cost)];
                     for _ in 1..MAX_WORD_SYLLABLES {
-                        let mut next_chains: Vec<(String, usize, bool)> = Vec::new();
-                        for (key, cur_end, fuzzy) in &chains {
+                        let mut next_chains: Vec<(String, usize, u8)> = Vec::new();
+                        for (key, cur_end, cost) in &chains {
                             let Some(edges) = lattice.get(*cur_end) else { continue };
                             for next_edge in edges {
                                 let mut k = key.clone();
@@ -294,15 +302,15 @@ impl Decoder {
                                 if !self.model.has_key_prefix(&k) {
                                     continue; // 词库无以此开头的键：不可能成词，剪枝
                                 }
-                                next_chains.push((k, next_edge.end, *fuzzy || next_edge.fuzzy));
+                                next_chains.push((k, next_edge.end, (*cost).max(next_edge.cost)));
                             }
                         }
-                        for (key, end, fuzzy) in &next_chains {
+                        for (key, end, cost) in &next_chains {
                             let (key_arc, words) = self.cached_words(&mut word_cache, key, lm);
                             n_expand += words.len();
                             self.expand(
                                 h,
-                                &EdgeCtx { end: *end, fuzzy: *fuzzy, key: key_arc },
+                                &EdgeCtx { end: *end, cost: *cost, key: key_arc },
                                 words,
                                 &mut next,
                                 lm,
@@ -421,7 +429,7 @@ impl Decoder {
         next: &mut Vec<Hyp>,
         lm: &CntLm,
     ) {
-        let penalty = if ctx.fuzzy { FUZZY_PENALTY } else { 0.0 };
+        let penalty = FUZZY_PENALTY[usize::from(ctx.cost.min(MAX_FUZZY_COST))];
         for (word_arc, freq, word_idx) in words {
             let mut nh = h.clone();
             // ARPA bigram 是条件概率 log P(w2|w1)：首词用读音感知的基础分，
@@ -706,6 +714,52 @@ mod tests {
         assert!(
             idx.is_some_and(|i| i <= 1),
             "时候 (fuzzy si->shi) should rank top: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn fuzzy_tier_keeps_exact_reading_first() {
+        // 鼻韵尾（an/ang，cost=2）：输入 xiangchen 时，即使 县城(xiancheng) 词频高得多，
+        // 也不得压过精确读音的 相称。
+        let d = decoder_with(
+            "fuzzy_tier",
+            &[
+                ("xiang", "相", 900),
+                ("chen", "称", 900),
+                ("xian", "县", 900),
+                ("cheng", "城", 900),
+            ],
+            &[
+                ("相", -3.0, 0.0),
+                ("称", -3.0, 0.0),
+                ("县", -2.0, 0.0),
+                ("城", -2.0, 0.0),
+            ],
+            &[("相", "称", -3.0), ("县", "城", -2.0)],
+            true,
+        );
+        let cands = d.candidates("xiangchen");
+        let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts.first(), Some(&"相称"), "精确读音应 #1: {texts:?}");
+    }
+
+    #[test]
+    fn completion_does_not_outrank_exact_syllable() {
+        // 输入 jian：补全候选 将(jiang，词频更高) 不得压过精确读音的 见。
+        let d = decoder_with(
+            "completion_rank",
+            &[("jian", "见", 900), ("jiang", "将", 900), ("hou", "后", 900)],
+            &[("见", -3.5, 0.0), ("将", -2.8, 0.0), ("后", -3.0, 0.0)],
+            &[],
+            false,
+        );
+        let cands = d.candidates("jian");
+        let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        let exact = texts.iter().position(|t| *t == "见");
+        let compl = texts.iter().position(|t| *t == "将");
+        assert!(
+            exact.is_some() && (compl.is_none() || exact < compl),
+            "精确读音 见 应在补全候选 将 之前: {texts:?}"
         );
     }
 
