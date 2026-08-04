@@ -155,10 +155,18 @@ struct KeyCache {
 }
 
 impl KeyCache {
-    /// 整体失效（用户调频/新词改变了候选词表与加成分）。
+    /// 整体失效（仅 `clear_cache` 用：内存回收 / 冷启动基准）。
     fn clear(&mut self) {
         self.words.clear();
         self.prefix.clear();
+    }
+
+    /// 单个词键失效（调频/新词只影响这个键的候选词表与加成分）。
+    ///
+    /// `prefix` 判定不用动：它只查静态词库（`MmapDict`，运行期不可变），
+    /// 用户学习不会改变「词库里有没有以此为前缀的键」的答案。
+    fn invalidate(&mut self, key: &str) {
+        self.words.remove(key);
     }
 }
 
@@ -304,19 +312,30 @@ impl<L: NgramLm> Decoder<L> {
 
     /// 提交学习数据：逐段调频 + 相邻两段拼合成新词（郑+爽 → zhengshuang/郑爽）。
     ///
-    /// 会清空词键缓存：调频/新词改变了候选词表与加成分。
+    /// 词键缓存做**精确失效**：只有这次动过的键（各段 + 拼合出的新词键）会被丢弃。
+    /// 早先图省事整体清空，代价是每次上屏后的下一句都退回冷路径（实测每键 +26%）——
+    /// 调频只影响它自己那个键的候选词表与加成分，没有理由连累其他键。
     pub fn learn(&self, learned: &[LearnedWord]) {
-        self.lock_keys().clear();
+        // 先写模型再失效：反过来的话，并发的解码可能拿旧数据重新填满缓存
         for seg in learned {
             self.model.bump(&seg.pinyin, &seg.word);
         }
         // 新词学习：相邻两段拼成复合词，下次输入完整拼音直接出
+        let mut compounds: Vec<String> = Vec::new();
         for pair in learned.windows(2) {
             let key = format!("{}{}", pair[0].pinyin, pair[1].pinyin);
             let word = format!("{}{}", pair[0].word, pair[1].word);
             if key.len() <= 12 {
                 self.model.bump(&key, &word);
+                compounds.push(key);
             }
+        }
+        let mut cache = self.lock_keys();
+        for seg in learned {
+            cache.invalidate(&seg.pinyin);
+        }
+        for key in &compounds {
+            cache.invalidate(key);
         }
     }
 
@@ -1257,6 +1276,36 @@ mod tests {
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts.first(), Some(&"主臣"), "叠加模糊不得占 #1: {texts:?}");
         assert!(texts.contains(&"组成"), "叠加模糊候选仍应保留（只是不占 #1）: {texts:?}");
+    }
+
+    #[test]
+    fn learn_boost_survives_key_cache() {
+        // 词键缓存把「候选词表 + 用户调频加成」一起缓存了，learn 必须让对应键失效，
+        // 否则用户调了半天频，beam 还在用旧加成分（越用越顺手直接失效）。
+        let d = decoder_with(
+            "learn_cache",
+            &[("shi", "是", 900), ("shi", "时", 800), ("hou", "候", 900)],
+            &[("是", -1.9, 0.0), ("时", -2.9, 0.0), ("候", -4.0, 0.0)],
+            &[],
+            false,
+        );
+        // 先查一次填满缓存（此时 是候 在前）
+        let before = d.candidates("shihou");
+        let pos_before = before.iter().position(|c| c.text == "时候");
+        assert!(pos_before.is_some_and(|i| i > 0), "初始 时候 不该是 #1: {before:?}");
+        // 反复选择 时（每次 +0.2 log10），足够翻过 是 与 时 的 1.0 差距
+        for _ in 0..6 {
+            d.learn(&[
+                LearnedWord::new("shi".to_string(), "时".to_string()),
+                LearnedWord::new("hou".to_string(), "候".to_string()),
+            ]);
+        }
+        let after = d.candidates("shihou");
+        assert_eq!(
+            after.first().map(|c| c.text.as_str()),
+            Some("时候"),
+            "调频后 时候 应升到 #1（缓存未失效则不会变）: {after:?}"
+        );
     }
 
     #[test]
