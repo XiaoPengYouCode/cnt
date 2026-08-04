@@ -241,6 +241,21 @@ rm -rf ~/.local/bin/cnt-daemon ~/.local/share/cnt
 ibus restart
 ```
 
+## 候选质量回归测试
+
+```bash
+cargo build --release -p cnt-dict-tools
+S=.agents/skills/fuzzy-test/fuzzy_test.py
+python3 $S selftest   # 判定器自检
+python3 $S sample     # 100 词随机取样（同 --seed 可复现），有读音误配则退出码 1
+python3 $S mono       # 单音节专项：词库高频前 10 字是否进候选前 10
+python3 $S words li sihou zhuchen   # 单个拼音的候选、分数、拼音键与来源判定
+```
+
+判定依据来自解码器自己：`cnt-dict-tools decode --tsv` 会输出每条候选**实际走的
+拼音键**，脚本据此区分「精确读音 / 模糊回退 / 尾音节补全 / 读音误配」，
+不必在测试里复制模糊音规则表。详见 `.agents/skills/fuzzy-test/SKILL.md`。
+
 ## 测试
 
 ```bash

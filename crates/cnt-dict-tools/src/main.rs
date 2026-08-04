@@ -6,6 +6,9 @@
 //! cnt-dict-tools import-libime <dict.txt> <out.tsv>      libime 词表 → 标准词表
 //! cnt-dict-tools build-lm <lm.arpa> <out.cntl>           ARPA 语言模型 → 二进制
 //! cnt-dict-tools decode <dict.cntd> <lm.cntl> <pinyin>.. 整句解码（开发调试）
+//!   decode 选项：--user <user.dict> 用真实用户库；--top <n> 候选条数；
+//!   --tsv 机器可读输出（`拼音<TAB>排名<TAB>候选<TAB>分数<TAB>拼音键`），
+//!   拼音键是解码器实际走的读音路径，供 fuzzy 测试判定精确/模糊/补全
 //! cnt-dict-tools info  <dict.cntd>                       打印词库统计
 //! cnt-dict-tools query <dict.cntd> <pinyin>..            查询候选
 //! ```
@@ -169,16 +172,9 @@ fn main() {
                 usage();
                 std::process::exit(2);
             }
-            // decode <dict> <lm> [--user <user.dict>] <pinyin>...
-            let mut rest = &args[4..];
-            let user = if rest.first().map(String::as_str) == Some("--user") && rest.len() >= 2 {
-                let u = rest[1].clone();
-                rest = &rest[2..];
-                Some(u)
-            } else {
-                None
-            };
-            cmd_decode(&args[2], &args[3], user.as_deref(), rest)
+            // decode <dict> <lm> [--user <user.dict>] [--tsv] [--top <n>] <pinyin>...
+            let (user, opts, rest) = parse_decode_args(&args[4..]);
+            cmd_decode(&args[2], &args[3], user.as_deref(), rest, opts)
         }
         "info" => {
             if args.len() != 3 {
@@ -518,11 +514,50 @@ fn cmd_build_lm(input: &str, output: &str) -> CliResult {
 }
 
 /// 整句解码（开发调试用）：加载词库 + 语言模型，对给定拼音串解码 Top-K 句子。
+/// 解析 `decode` 的可选参数，返回 (用户库, 输出选项, 剩余的拼音列表)。
+fn parse_decode_args(mut rest: &[String]) -> (Option<String>, DecodeOpts, &[String]) {
+    let mut opts = DecodeOpts::default();
+    let mut user: Option<String> = None;
+    loop {
+        match rest.first().map(String::as_str) {
+            Some("--user") if rest.len() >= 2 => {
+                user = Some(rest[1].clone());
+                rest = &rest[2..];
+            }
+            Some("--top") if rest.len() >= 2 => {
+                opts.top = rest[1].parse().unwrap_or(opts.top);
+                rest = &rest[2..];
+            }
+            Some("--tsv") => {
+                opts.tsv = true;
+                rest = &rest[1..];
+            }
+            _ => return (user, opts, rest),
+        }
+    }
+}
+
+/// `decode` 子命令的输出选项。
+#[derive(Clone, Copy)]
+struct DecodeOpts {
+    /// 每个输入打印多少候选
+    top: usize,
+    /// 机器可读输出（TSV，含解码器实际走的拼音键）
+    tsv: bool,
+}
+
+impl Default for DecodeOpts {
+    fn default() -> Self {
+        Self { top: 10, tsv: false }
+    }
+}
+
 fn cmd_decode(
     dict_path: &str,
     lm_path: &str,
     user_path: Option<&str>,
     pinyins: &[String],
+    opts: DecodeOpts,
 ) -> CliResult {
     use cnt_decode::Decoder;
     use cnt_dict::PinyinModel;
@@ -535,12 +570,27 @@ fn cmd_decode(
     let lm = std::sync::Arc::new(CntLm::open(lm_path)?);
     let decoder = Decoder::new(model, Some(lm), true);
 
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
     for pinyin in pinyins {
-        println!("{pinyin}:");
-        for (i, (cand, score)) in decoder.candidates_scored(pinyin).iter().take(10).enumerate() {
-            println!("  {}. {}  [{score:.3}]", i + 1, cand.text);
+        if !opts.tsv {
+            writeln!(out, "{pinyin}:")?;
+        }
+        let cands = decoder.candidates_scored(pinyin);
+        for (i, (cand, score)) in cands.iter().take(opts.top).enumerate() {
+            // 拼音键 = 解码器实际走的读音路径（整句为多段，用 '-' 连接）；
+            // fuzzy 测试据此区分「精确读音 / 模糊回退 / 尾音节补全」，
+            // 不必在测试脚本里重复实现模糊规则表。
+            let keys: Vec<&str> = cand.learned.iter().map(|l| l.pinyin.as_str()).collect();
+            let keys = keys.join("-");
+            if opts.tsv {
+                writeln!(out, "{pinyin}\t{}\t{}\t{score:.3}\t{keys}", i + 1, cand.text)?;
+            } else {
+                writeln!(out, "  {}. {}  [{score:.3}] {{{keys}}}", i + 1, cand.text)?;
+            }
         }
     }
+    out.flush()?;
     let _ = std::fs::remove_file(&tmp_user);
     Ok(())
 }
