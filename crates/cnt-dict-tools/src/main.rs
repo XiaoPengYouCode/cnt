@@ -583,10 +583,16 @@ fn cmd_decode(
             // 不必在测试脚本里重复实现模糊规则表。
             let keys: Vec<&str> = cand.learned.iter().map(|l| l.pinyin.as_str()).collect();
             let keys = keys.join("-");
-            if opts.tsv {
-                writeln!(out, "{pinyin}\t{}\t{}\t{score:.3}\t{keys}", i + 1, cand.text)?;
+            // 覆盖长度：小于输入长度 = 部分候选（选中后只确认这一段）
+            let cover = if cand.consumed >= pinyin.len() {
+                "full".to_string()
             } else {
-                writeln!(out, "  {}. {}  [{score:.3}] {{{keys}}}", i + 1, cand.text)?;
+                format!("part:{}", &pinyin[..cand.consumed])
+            };
+            if opts.tsv {
+                writeln!(out, "{pinyin}\t{}\t{}\t{score:.3}\t{keys}\t{cover}", i + 1, cand.text)?;
+            } else {
+                writeln!(out, "  {}. {}  [{score:.3}] {{{keys}}} {cover}", i + 1, cand.text)?;
             }
         }
     }

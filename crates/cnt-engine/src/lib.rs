@@ -98,7 +98,8 @@ pub struct Engine {
 
 /// 界面状态快照（所有数据均为 owned，可安全跨 await）
 struct UiState {
-    buffer: String,
+    /// 预编辑文本：已确认的汉字 + 分节显示的未确认拼音（`你好 shi jie`）
+    preedit: String,
     all_cands: Vec<String>,
     /// 光标在全部候选中的绝对位置（面板据此计算当前页）
     cursor_abs: u32,
@@ -129,8 +130,17 @@ impl Engine {
     /// 取当前状态快照（不持锁跨 await）
     fn snapshot(&self) -> UiState {
         let st = self.lock_state();
+        // 预编辑 = 已确认的汉字 + 未确认拼音（按音节分节，`nihaoshijie` → `ni hao shi jie`）。
+        // 这样用户能看见「切分成什么」与「确认到哪」，而不是一串连写字母。
+        let mut preedit = st.confirmed_text().to_string();
+        if !st.buffer().is_empty() {
+            if !preedit.is_empty() {
+                preedit.push(' ');
+            }
+            preedit.push_str(&self.decoder.display_pinyin(st.buffer()));
+        }
         UiState {
-            buffer: st.buffer().to_string(),
+            preedit,
             all_cands: st.candidates().iter().map(|c| c.text.clone()).collect(),
             cursor_abs: u32::try_from(st.cursor_abs()).expect("cursor fits u32"),
         }
@@ -139,10 +149,14 @@ impl Engine {
     /// 更新候选窗口与预编辑文本（上屏前的拼音）。
     async fn update_ui(&self, ui: &UiState) {
         // 预编辑文本（拼音缓冲区）
-        let (preedit, cursor, visible) = if ui.buffer.is_empty() {
+        let (preedit, cursor, visible) = if ui.preedit.is_empty() {
             (String::new(), 0u32, false)
         } else {
-            (ui.buffer.clone(), u32::try_from(ui.buffer.chars().count()).expect("preedit fits u32"), true)
+            (
+                ui.preedit.clone(),
+                u32::try_from(ui.preedit.chars().count()).expect("preedit fits u32"),
+                true,
+            )
         };
         let _ = self
             .conn

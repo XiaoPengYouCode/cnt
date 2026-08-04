@@ -24,12 +24,46 @@ impl LearnedWord {
     }
 }
 
-/// 一个候选（词或整句）。
+/// 一个候选（词、整句，或只覆盖输入前一段的「部分候选」）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub text: String,
     /// 用于用户调频学习的拼音-词段：单字/词 = 1 段，整句 = 多段。
     pub learned: Vec<LearnedWord>,
+    /// 该候选消耗掉的**输入字节数**。
+    ///
+    /// 不能从 `learned` 的拼音键推出来：模糊音的键和输入长度不同
+    /// （输入 `sihou` 走的键是 `shihou`）。小于当前输入长度 = 部分候选，
+    /// 选中后只确认这一段、剩余拼音继续组合（Rime 式增量确认）。
+    pub consumed: usize,
+}
+
+impl Candidate {
+    /// 覆盖整个输入的候选（整句 / 整键词 / 补全）。
+    #[must_use]
+    pub fn whole(text: impl Into<String>, learned: Vec<LearnedWord>, input_len: usize) -> Self {
+        Self {
+            text: text.into(),
+            learned,
+            consumed: input_len,
+        }
+    }
+
+    /// 只覆盖输入前 `consumed` 字节的部分候选。
+    #[must_use]
+    pub fn partial(text: impl Into<String>, learned: Vec<LearnedWord>, consumed: usize) -> Self {
+        Self {
+            text: text.into(),
+            learned,
+            consumed,
+        }
+    }
+
+    /// 是否覆盖了全部输入（`consumed >= input_len`）。
+    #[must_use]
+    pub const fn covers_all(&self, input_len: usize) -> bool {
+        self.consumed >= input_len
+    }
 }
 
 /// 候选来源：输入逻辑查询候选的统一接口（由 cnt-decode 的整句解码器实现）。
@@ -164,8 +198,12 @@ pub mod keysym {
 
 /// 输入组合状态（聚合根）：字段私有，行为通过方法暴露。
 pub struct EngineState {
-    /// 已输入的拼音串
+    /// 未确认的拼音串（已确认的部分不在里面）
     buffer: String,
+    /// 已确认的段（拼音, 词）：选中「部分候选」后先攒在这里，不马上上屏
+    confirmed: Vec<LearnedWord>,
+    /// 已确认段拼出的汉字（预编辑左半部分，避免每次重新拼接）
+    confirmed_text: String,
     /// 全部候选（多页）
     candidates: Vec<Candidate>,
     /// 当前页码（从 0 开始）
@@ -197,6 +235,8 @@ impl EngineState {
     pub const fn with_page_size(page_size: usize) -> Self {
         Self {
             buffer: String::new(),
+            confirmed: Vec::new(),
+            confirmed_text: String::new(),
             candidates: Vec::new(),
             page: 0,
             cursor: 0,
@@ -208,15 +248,74 @@ impl EngineState {
 
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.confirmed.clear();
+        self.confirmed_text.clear();
         self.candidates.clear();
         self.page = 0;
         self.cursor = 0;
         // 引号开合状态是会话级的（交替产生 “/”），不随组合清除
     }
 
+    /// 组合中（还有未确认拼音，或有已确认但未上屏的段）。
     #[must_use]
     pub const fn is_composing(&self) -> bool {
-        !self.buffer.is_empty()
+        !self.buffer.is_empty() || !self.confirmed_text.is_empty()
+    }
+
+    /// 已确认段拼出的汉字（预编辑左半部分；未做增量确认时为空）。
+    #[must_use]
+    pub fn confirmed_text(&self) -> &str {
+        &self.confirmed_text
+    }
+
+    /// 把「已确认 + 本次选中」合成一次上屏，并清空组合。
+    fn commit_with(&mut self, text: &str, learned: Vec<LearnedWord>) -> Action {
+        let mut full = std::mem::take(&mut self.confirmed_text);
+        full.push_str(text);
+        let mut segs = std::mem::take(&mut self.confirmed);
+        segs.extend(learned);
+        self.clear();
+        Action::Commit {
+            text: full,
+            learned: segs,
+        }
+    }
+
+    /// 选中一个候选：整段覆盖则上屏，只覆盖前一段则**确认这一段**、
+    /// 剩余拼音继续组合（Rime 式增量确认 —— 整句错了不必删光重打）。
+    fn take_candidate(&mut self, cand: Candidate, source: &dyn CandidateSource) -> Action {
+        if cand.covers_all(self.buffer.len()) {
+            return self.commit_with(&cand.text, cand.learned);
+        }
+        self.confirmed_text.push_str(&cand.text);
+        self.confirmed.extend(cand.learned);
+        self.buffer.drain(..cand.consumed);
+        self.refresh(source);
+        Action::Handled
+    }
+
+    /// 撤销最后一次「部分确认」，把那段拼音退回未确认串的前面。
+    fn unconfirm_last(&mut self, source: &dyn CandidateSource) -> bool {
+        let Some(last) = self.confirmed.pop() else {
+            return false;
+        };
+        // confirmed_text 去掉这一段的词
+        let keep = self.confirmed_text.len() - last.word.len();
+        self.confirmed_text.truncate(keep);
+        self.buffer.insert_str(0, &last.pinyin);
+        self.refresh(source);
+        true
+    }
+
+    /// 重查候选并把翻页/光标复位。
+    fn refresh(&mut self, source: &dyn CandidateSource) {
+        self.candidates = if self.buffer.is_empty() {
+            Vec::new()
+        } else {
+            source.candidates(&self.buffer)
+        };
+        self.page = 0;
+        self.cursor = 0;
     }
 
     /// 当前输入模式。
@@ -231,15 +330,17 @@ impl EngineState {
             InputMode::Chinese => InputMode::English,
             InputMode::English => InputMode::Chinese,
         };
-        if self.buffer.is_empty() {
+        if !self.is_composing() {
             return None;
         }
-        let commit = self.selected().cloned().map_or_else(
+        let (text, learned) = self.selected().cloned().map_or_else(
             || (self.buffer.clone(), Vec::new()),
             |c| (c.text, c.learned),
         );
-        self.clear();
-        Some(commit)
+        let Action::Commit { text, learned } = self.commit_with(&text, learned) else {
+            unreachable!("commit_with 只返回 Commit")
+        };
+        Some((text, learned))
     }
 
     /// 已输入的拼音串。
@@ -304,24 +405,21 @@ impl EngineState {
             if self.buffer.is_empty() {
                 return Action::Forward;
             }
-            let commit = self.selected().cloned().map_or_else(
+            let (text, learned) = self.selected().cloned().map_or_else(
                 || (self.buffer.clone(), Vec::new()),
                 |c| (c.text, c.learned),
             );
-            self.clear();
-            return Action::CommitAndForward {
-                text: commit.0,
-                learned: commit.1,
+            let Action::Commit { text, learned } = self.commit_with(&text, learned) else {
+                unreachable!("commit_with 只返回 Commit")
             };
+            return Action::CommitAndForward { text, learned };
         }
 
         // 字母键：进入/继续拼音组合
         let lower = keyval;
         if (keysym::A..=keysym::Z).contains(&lower) {
             self.buffer.push(char::from_u32(lower).unwrap_or('a')); // lower 必在 a-z 范围
-            self.candidates = source.candidates(&self.buffer);
-            self.page = 0;
-            self.cursor = 0;
+            self.refresh(source);
             return Action::Handled;
         }
 
@@ -340,37 +438,41 @@ impl EngineState {
             return action;
         }
 
-        // 未在组合中：一律转发
-        if self.buffer.is_empty() {
+        // 未在组合中（既无未确认拼音也无已确认段）：一律转发
+        if !self.is_composing() {
             return Action::Forward;
         }
 
         match keyval {
             // 空格：提交光标处候选；回车：把拼音原文当英文直接提交（不上屏候选、
             // 不产生学习数据）。两者都会清空组合。
-            keysym::SPACE | keysym::RETURN => {
-                let buf = self.buffer.clone();
-                let (text, learned) = if keyval == keysym::SPACE {
-                    self.selected().cloned().map_or_else(
-                        || (buf, Vec::new()),
-                        |c| (c.text, c.learned),
-                    )
+            // 空格：选中光标处候选（部分候选 → 确认这一段，继续组合）；
+            // 回车：把未确认的拼音原文当英文提交（已确认的汉字仍在前面）。
+            keysym::SPACE => {
+                if let Some(cand) = self.selected().cloned() {
+                    self.take_candidate(cand, source)
                 } else {
-                    (buf, Vec::new()) // 回车：拼音原文提交
-                };
-                self.clear();
-                Action::Commit { text, learned }
+                    let buf = self.buffer.clone();
+                    self.commit_with(&buf, Vec::new())
+                }
+            }
+            keysym::RETURN => {
+                let buf = self.buffer.clone();
+                self.commit_with(&buf, Vec::new())
             }
 
             // 退格
             keysym::BACKSPACE => {
-                self.buffer.pop();
                 if self.buffer.is_empty() {
-                    self.clear();
+                    // 未确认部分已空：撤销上一次「部分确认」，那段拼音退回来重选
+                    self.unconfirm_last(source);
                 } else {
-                    self.candidates = source.candidates(&self.buffer);
-                    self.page = 0;
-                    self.cursor = 0;
+                    self.buffer.pop();
+                    if self.buffer.is_empty() && self.confirmed.is_empty() {
+                        self.clear();
+                    } else {
+                        self.refresh(source);
+                    }
                 }
                 Action::Handled
             }
@@ -394,16 +496,10 @@ impl EngineState {
             // 1-9：选择候选
             keysym::DIGIT1..=keysym::DIGIT9 => {
                 let idx = self.page * self.page_size + (keyval - keysym::DIGIT1) as usize;
-                match self.candidates.get(idx).cloned() {
-                    Some(cand) => {
-                        self.clear();
-                        Action::Commit {
-                            text: cand.text,
-                            learned: cand.learned,
-                        }
-                    }
-                    None => Action::Handled,
-                }
+                self.candidates
+                    .get(idx)
+                    .cloned()
+                    .map_or(Action::Handled, |cand| self.take_candidate(cand, source))
             }
 
             _ => Action::Forward,
@@ -413,22 +509,21 @@ impl EngineState {
     /// 标点键：未组合直接上屏中文标点；组合中先提交候选再附带标点。
     fn handle_punctuation(&mut self, keyval: u32, half_width: bool) -> Option<Action> {
         let punct = punct_of(keyval, &mut self.quote_open, half_width)?;
-        if self.buffer.is_empty() {
+        if !self.is_composing() {
             self.clear();
             return Some(Action::Commit {
                 text: punct,
                 learned: Vec::new(),
             });
         }
+        // 组合中：已确认段 + 当前选中候选 + 标点，一次上屏
         let buf = self.buffer.clone();
-        let (mut text, learned) = if let Some(cand) = self.selected().cloned() {
-            (cand.text, cand.learned)
-        } else {
-            (buf, Vec::new())
-        };
+        let (mut text, learned) = self
+            .selected()
+            .cloned()
+            .map_or_else(|| (buf, Vec::new()), |c| (c.text, c.learned));
         text.push_str(&punct);
-        self.clear();
-        Some(Action::Commit { text, learned })
+        Some(self.commit_with(&text, learned))
     }
 
     /// 上一页。
@@ -506,9 +601,12 @@ mod tests {
                 .get(pinyin)
                 .map(|v| {
                     v.iter()
-                        .map(|w| Candidate {
-                            text: w.to_string(),
-                            learned: vec![LearnedWord::new(pinyin.to_string(), w.to_string())],
+                        .map(|w| {
+                            Candidate::whole(
+                                *w,
+                                vec![LearnedWord::new(pinyin.to_string(), w.to_string())],
+                                pinyin.len(),
+                            )
                         })
                         .collect()
                 })
@@ -671,6 +769,127 @@ mod tests {
                 assert_eq!(text, "你，");
                 assert_eq!(learned, vec![LearnedWord::new("ni".to_string(), "你".to_string())]);
             }
+            other => panic!("expected commit, got {other:?}"),
+        }
+        assert!(!st.is_composing());
+    }
+
+    /// 支持部分候选的测试源：`nihaoshijie` 给整句 + 「你好」这个部分候选。
+    struct PartialSource;
+
+    impl CandidateSource for PartialSource {
+        fn candidates(&self, pinyin: &str) -> Vec<Candidate> {
+            match pinyin {
+                "nihaoshijie" => vec![
+                    Candidate::whole(
+                        "你好时节",
+                        vec![
+                            LearnedWord::new("ni", "你"),
+                            LearnedWord::new("hao", "好"),
+                            LearnedWord::new("shijie", "时节"),
+                        ],
+                        pinyin.len(),
+                    ),
+                    Candidate::partial(
+                        "你好",
+                        vec![LearnedWord::new("nihao", "你好")],
+                        "nihao".len(),
+                    ),
+                ],
+                "shijie" => vec![Candidate::whole(
+                    "世界",
+                    vec![LearnedWord::new("shijie", "世界")],
+                    pinyin.len(),
+                )],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    /// 逐字母输入一串拼音。
+    fn type_pinyin(st: &mut EngineState, src: &dyn CandidateSource, s: &str) {
+        for c in s.chars() {
+            st.handle_key(c as u32, src, false);
+        }
+    }
+
+    #[test]
+    fn partial_candidate_confirms_prefix_and_keeps_composing() {
+        // Rime 式增量确认：整句候选不对时，选「你好」只确认这一段，
+        // 剩下的 shijie 继续组合，再选「世界」才一次上屏。
+        let mut st = EngineState::new();
+        let src = PartialSource;
+        type_pinyin(&mut st, &src, "nihaoshijie");
+
+        // 选第 2 个候选（部分候选 你好）：不该上屏，而是确认 + 继续组合
+        assert_eq!(st.handle_key(keysym::DIGIT1 + 1, &src, false), Action::Handled);
+        assert_eq!(st.confirmed_text(), "你好");
+        assert_eq!(st.buffer(), "shijie", "已确认的拼音要从未确认串里去掉");
+        assert!(st.is_composing());
+        assert_eq!(
+            st.candidates().first().map(|c| c.text.as_str()),
+            Some("世界"),
+            "剩余拼音应重新解码"
+        );
+
+        // 再选「世界」：整段覆盖 → 连同已确认部分一次上屏，学习段也要拼齐
+        match st.handle_key(keysym::DIGIT1, &src, false) {
+            Action::Commit { text, learned } => {
+                assert_eq!(text, "你好世界");
+                assert_eq!(
+                    learned,
+                    vec![
+                        LearnedWord::new("nihao", "你好"),
+                        LearnedWord::new("shijie", "世界"),
+                    ],
+                    "已确认段 + 本次选中，一起交给调频/新词学习"
+                );
+            }
+            other => panic!("expected commit, got {other:?}"),
+        }
+        assert!(!st.is_composing());
+    }
+
+    #[test]
+    fn backspace_undoes_partial_confirmation() {
+        // 未确认部分删空后，退格撤销上一次「部分确认」，那段拼音退回来重选
+        let mut st = EngineState::new();
+        let src = PartialSource;
+        type_pinyin(&mut st, &src, "nihaoshijie");
+        st.handle_key(keysym::DIGIT1 + 1, &src, false); // 确认 你好
+        for _ in 0..6 {
+            st.handle_key(keysym::BACKSPACE, &src, false); // 删掉 shijie
+        }
+        assert_eq!(st.buffer(), "");
+        assert_eq!(st.confirmed_text(), "你好");
+
+        st.handle_key(keysym::BACKSPACE, &src, false); // 再退一次：撤销确认
+        assert_eq!(st.confirmed_text(), "");
+        assert_eq!(st.buffer(), "nihao", "拼音要退回未确认串");
+        assert!(st.is_composing());
+    }
+
+    #[test]
+    fn escape_drops_confirmed_prefix_too() {
+        let mut st = EngineState::new();
+        let src = PartialSource;
+        type_pinyin(&mut st, &src, "nihaoshijie");
+        st.handle_key(keysym::DIGIT1 + 1, &src, false);
+        assert_eq!(st.handle_key(keysym::ESCAPE, &src, false), Action::Handled);
+        assert!(!st.is_composing());
+        assert_eq!(st.confirmed_text(), "");
+        assert_eq!(st.buffer(), "");
+    }
+
+    #[test]
+    fn punctuation_commits_confirmed_prefix() {
+        // 组合中打标点：已确认段 + 当前候选 + 标点，一次上屏
+        let mut st = EngineState::new();
+        let src = PartialSource;
+        type_pinyin(&mut st, &src, "nihaoshijie");
+        st.handle_key(keysym::DIGIT1 + 1, &src, false); // 确认 你好，剩 shijie
+        match st.handle_key(0x2c, &src, false) {
+            Action::Commit { text, .. } => assert_eq!(text, "你好世界，"),
             other => panic!("expected commit, got {other:?}"),
         }
         assert!(!st.is_composing());

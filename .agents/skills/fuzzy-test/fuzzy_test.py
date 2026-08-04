@@ -47,7 +47,7 @@ MONO_REF = 10
 # 「常用词」的词频门槛（取样时保证一半以上是常用词）
 COMMON_FREQ = 10
 
-EXACT, FUZZY, COMPLETION, MISMATCH = "精确", "模糊", "补全", "误配"
+EXACT, FUZZY, COMPLETION, PARTIAL, MISMATCH = "精确", "模糊", "补全", "部分", "误配"
 
 
 def die(msg: str) -> None:
@@ -73,8 +73,12 @@ def load_wordlist() -> list[tuple[str, str, int]]:
     return rows
 
 
-def decode(pinyins: list[str], user: str | None, top: int = TOP) -> dict[str, list[tuple[str, float, str]]]:
-    """跑解码器，返回 {输入: [(候选, 分数, 拼音键)]}（顺序即候选顺序）。"""
+def decode(pinyins: list[str], user: str | None, top: int = TOP) -> dict[str, list[tuple[str, float, str, str]]]:
+    """跑解码器，返回 {输入: [(候选, 分数, 拼音键, 覆盖)]}（顺序即候选顺序）。
+
+    覆盖列是 `full` 或 `part:<被消耗的输入前缀>` —— 部分候选（Rime 式增量确认的
+    修复入口）只覆盖输入的前一段，判定读音时要拿那一段比，而不是整串输入。
+    """
     if not TOOL.exists():
         die(f"缺少 {TOOL}，先 cargo build --release -p cnt-dict-tools")
     for path in (DICT, LM):
@@ -87,13 +91,13 @@ def decode(pinyins: list[str], user: str | None, top: int = TOP) -> dict[str, li
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         die(f"decode 失败: {proc.stderr.strip()}")
-    out: dict[str, list[tuple[str, float, str]]] = collections.defaultdict(list)
+    out: dict[str, list[tuple[str, float, str, str]]] = collections.defaultdict(list)
     for line in proc.stdout.splitlines():
         cols = line.split("\t")
-        if len(cols) != 5:
+        if len(cols) != 6:
             continue
-        pinyin, _rank, text, score, keys = cols
-        out[pinyin].append((text, float(score), keys))
+        pinyin, _rank, text, score, keys, cover = cols
+        out[pinyin].append((text, float(score), keys, cover))
     return out
 
 
@@ -137,12 +141,18 @@ def canon(keys: str) -> str:
     return flat.replace("n", "l")
 
 
-def classify(pinyin: str, keys: str) -> str:
+def classify(pinyin: str, keys: str, cover: str = "full") -> str:
     """按解码器实际走的拼音键判定候选来源。
 
     判定顺序要紧：`zhuchen → 著称(zhucheng)` 既像「补全一个 g」又像 en/eng 模糊，
     先做模糊归一才不会把模糊候选记成补全。
+
+    `cover` 是解码器给的覆盖信息：部分候选只覆盖输入的前一段，拿那一段做判定
+    （否则「你好」对 nihaoshijie 会被误报成读音误配）。
     """
+    if cover.startswith("part:"):
+        covered = cover[len("part:"):]
+        return PARTIAL if classify(covered, keys) in (EXACT, FUZZY) else MISMATCH
     flat = keys.replace("-", "")
     if flat == pinyin:
         return EXACT
@@ -169,7 +179,7 @@ def cmd_sample(args: argparse.Namespace) -> int:
 
     for pinyin, word, freq in sample:
         got = cands.get(pinyin, [])
-        texts = [t for t, _, _ in got]
+        texts = [t for t, _, _, _ in got]
         rank = texts.index(word) + 1 if word in texts else None
         if rank == 1:
             hit1 += 1
@@ -181,8 +191,8 @@ def cmd_sample(args: argparse.Namespace) -> int:
             hit10 += 1
         else:
             missing.append((pinyin, word, freq, texts[:5]))
-        for i, (text, _score, keys) in enumerate(got, start=1):
-            kind = classify(pinyin, keys)
+        for i, (text, _score, keys, cover) in enumerate(got, start=1):
+            kind = classify(pinyin, keys, cover)
             kinds[kind] += 1
             if kind == MISMATCH:
                 mismatches.append((pinyin, text, keys, i))
@@ -194,7 +204,7 @@ def cmd_sample(args: argparse.Namespace) -> int:
     print("  候选来源分布（前 %d）：%s" % (
         TOP,
         " ".join(f"{k} {kinds[k]}({kinds[k] * 100 // total_c}%)"
-                 for k in (EXACT, FUZZY, COMPLETION, MISMATCH)),
+                 for k in (EXACT, FUZZY, COMPLETION, PARTIAL, MISMATCH)),
     ))
     if mismatches:
         print(f"  读音误配 {len(mismatches)} 处（最高优先级 bug）：")
@@ -224,7 +234,7 @@ def cmd_mono(args: argparse.Namespace) -> int:
     rows_out: list[tuple[str, str, list[str]]] = []
     for syl in MONO_SYLLABLES:
         ref = [w for w, _ in sorted(by_pinyin.get(syl, []), key=lambda x: -x[1])[:MONO_REF]]
-        got = [t for t, _, _ in cands.get(syl, [])][:TOP]
+        got = [t for t, _, _, _ in cands.get(syl, [])][:TOP]
         total += len(ref)
         hit += sum(1 for w in ref if w in got)
         missed = [w for w in ref if w not in got]
@@ -243,8 +253,9 @@ def cmd_words(args: argparse.Namespace) -> int:
     cands = decode(args.pinyins, args.user)
     for pinyin in args.pinyins:
         print(f"{pinyin}:")
-        for i, (text, score, keys) in enumerate(cands.get(pinyin, []), start=1):
-            print(f"  {i:2}. {text:8} [{score:8.3f}] {keys:16} {classify(pinyin, keys)}")
+        for i, (text, score, keys, cover) in enumerate(cands.get(pinyin, []), start=1):
+            kind = classify(pinyin, keys, cover)
+            print(f"  {i:2}. {text:8} [{score:8.3f}] {keys:16} {cover:16} {kind}")
     return 0
 
 
@@ -267,13 +278,25 @@ SELFTEST_CASES = (
 )
 
 
+# 带覆盖列的自检用例：(输入, 拼音键, 覆盖, 期望分类)
+SELFTEST_COVER_CASES = (
+    ("nihaoshijie", "nihao", "part:nihao", PARTIAL),
+    ("sihou", "shi", "part:si", PARTIAL),          # 部分候选也可以是模糊读音
+    ("nihaoshijie", "he", "part:nihao", MISMATCH),  # 部分候选的读音也要对得上
+    ("nihaoshijie", "ni-hao-shijie", "full", EXACT),
+)
+
+
 def cmd_selftest(_args: argparse.Namespace) -> int:
     """判定器自检：分类逻辑是启发式的，先保证它自己不误报再看统计。"""
     bad = [(p, k, want, got) for p, k, want in SELFTEST_CASES
            if (got := classify(p, k)) != want]
+    bad += [(p, f"{k} [{c}]", want, got) for p, k, c, want in SELFTEST_COVER_CASES
+            if (got := classify(p, k, c)) != want]
     for pinyin, keys, want, got in bad:
         print(f"  FAIL {pinyin} 键={keys}: 期望 {want}，得到 {got}")
-    print(f"判定器自检：{len(SELFTEST_CASES) - len(bad)}/{len(SELFTEST_CASES)} 通过")
+    total = len(SELFTEST_CASES) + len(SELFTEST_COVER_CASES)
+    print(f"判定器自检：{total - len(bad)}/{total} 通过")
     return 1 if bad else 0
 
 

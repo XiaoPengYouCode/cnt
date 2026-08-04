@@ -68,6 +68,13 @@ const TOP_SENTENCES_SHORT: usize = 10;
 const WHOLE_KEY_WORDS: usize = 20;
 /// 对外返回的候选总数上限。
 const CANDIDATE_LIMIT: usize = 30;
+/// 候选分组：2 = 部分候选（只覆盖输入前一段）。
+const GROUP_PARTIAL: u8 = 2;
+/// 部分候选（只覆盖输入前一段的词）最多给几个。
+///
+/// Rime 式增量确认的修复入口：整句错了不必删光重打，选中前一段即可确认，
+/// 剩下的拼音继续组合。给太多会挤占整句候选的位置。
+const PARTIAL_LIMIT: usize = 8;
 /// LM 完全未知词的兜底 log10 概率（下界参照）。
 ///
 /// 打分不再直接用它：不在 LM 词表的词走 `first_word_base`（用户词/次读音/按词频的
@@ -270,10 +277,14 @@ struct Hyp {
     node: u32,
 }
 
-/// beam 搜索结果：完整假设 + 复原路径所需的 arena。
+/// beam 搜索结果：完整假设 + 复原路径所需的 arena + 各位置的词键。
+///
+/// `keys_at` 带出来给部分候选复用（位置 0 的词键就是「覆盖输入前一段的词」），
+/// 免得再枚举一遍。
 struct BeamResult {
     hyps: Vec<Hyp>,
     arena: Vec<Node>,
+    keys_at: Vec<Option<Vec<PosKey>>>,
 }
 
 /// 整句解码器：词库 + 语言模型（[`NgramLm`] 端口）+ 音节表 + 可选重排器。
@@ -349,6 +360,15 @@ impl<L: NgramLm> Decoder<L> {
         }
     }
 
+    /// 把拼音串按标准音节切开，供预编辑显示（`nihaoshijie` → `ni hao shi jie`）。
+    ///
+    /// 只用精确音节表（不含模糊变体）：预编辑要如实反映**用户打的**内容，
+    /// 不能显示成模糊映射后的读音。切不出来的尾巴原样附在后面。
+    #[must_use]
+    pub fn display_pinyin(&self, pinyin: &str) -> String {
+        self.syllables.split_for_display(pinyin)
+    }
+
     /// 清空词键缓存。
     ///
     /// 正常使用不需要调用（`learn` 会自动失效）；给内存压力回收与
@@ -391,14 +411,34 @@ impl<L: NgramLm> Decoder<L> {
         if let Some(lm) = &self.lm {
             scored.extend(self.completions(pinyin, lm));
         }
-        // 排序两级：
-        // 1. 完全覆盖输入的候选（精确/模糊）永远排在补全候选之前——补全是「猜你
-        //    还没打完」，不该插到你已经打完的读音前面（jian 的前排不能被 jiang 占）；
-        // 2. 组内按分数降序。
+        // 排序分三组（组间是硬顺序，组内按分数）：
+        // 0 完全覆盖输入的候选（整句/整键词）——你已经打完的读音优先；
+        // 1 补全候选（「猜你还没打完」）——不该插到已打完的读音前面
+        //   （输入 jian 时前排不能被 jiang 的词占掉）；
+        // 2 部分候选（只覆盖前一段）——修复入口，放在最后，不干扰正常整句选词。
+        let input_len = pinyin.len();
+        let group = |s: &Scored| -> u8 {
+            if s.cand.covers_all(input_len) {
+                u8::from(s.completion)
+            } else {
+                GROUP_PARTIAL
+            }
+        };
         scored.sort_by(|a, b| {
-            a.completion
-                .cmp(&b.completion)
-                .then_with(|| b.score.total_cmp(&a.score))
+            let (ga, gb) = (group(a), group(b));
+            ga.cmp(&gb)
+                // 覆盖长的优先（只对部分候选有意义）
+                .then_with(|| b.cand.consumed.cmp(&a.cand.consumed))
+                .then_with(|| {
+                    if ga == GROUP_PARTIAL {
+                        // 部分候选按词库排名（稳定排序保留原序），不按 LM 分：
+                        // 单词场景「词频高」比「unigram 高」更接近用户想要的
+                        // （你好 的 unigram 在 LM 地板上，词频却极高）
+                        std::cmp::Ordering::Equal
+                    } else {
+                        b.score.total_cmp(&a.score)
+                    }
+                })
         });
         // 去重：同文本保留首个（= 组内最高分）
         let mut out: Vec<Scored> = Vec::new();
@@ -446,10 +486,11 @@ impl<L: NgramLm> Decoder<L> {
                     |lm| reading_base(&word, freq, lm.as_ref()) + self.boost(pinyin, &word),
                 );
                 Scored {
-                    cand: Candidate {
-                        text: word.to_string(),
-                        learned: vec![LearnedWord::new(pinyin.to_string(), word.into_owned())],
-                    },
+                    cand: Candidate::whole(
+                        word.to_string(),
+                        vec![LearnedWord::new(pinyin.to_string(), word.into_owned())],
+                        pinyin.len(),
+                    ),
                     score,
                     fuzzy_edges: 0, // 整键精确匹配
                     completion: false,
@@ -517,10 +558,12 @@ impl<L: NgramLm> Decoder<L> {
                     score += COMPLETION_PENALTY;
                 }
                 out.push(Scored {
-                    cand: Candidate {
-                        text: word.to_string(),
-                        learned: vec![LearnedWord::new(key.clone(), word.into_owned())],
-                    },
+                    // 补全候选消耗掉全部已输入的拼音（它还多补了没打完的音节）
+                    cand: Candidate::whole(
+                        word.to_string(),
+                        vec![LearnedWord::new(key.clone(), word.into_owned())],
+                        pinyin.len(),
+                    ),
                     score,
                     fuzzy_edges: 0,
                     // 用户学过的补全词（持久化）仍按补全处理：它排在精确候选之后，
@@ -626,7 +669,11 @@ impl<L: NgramLm> Decoder<L> {
         let mut seen = std::collections::HashSet::new();
         done.retain(|h| seen.insert(sentence_of(&arena, h.node)));
         done.truncate(limits.top_sentences);
-        BeamResult { hyps: done, arena }
+        BeamResult {
+            hyps: done,
+            arena,
+            keys_at,
+        }
     }
 
     /// 枚举某个位置上所有可展开的词键（单音节 + 多音节整词）及其候选词。
@@ -806,25 +853,36 @@ impl<L: NgramLm> Decoder<L> {
         // 单音节 li 与七字整句用同一套上限是错的（前者要宽、后者要省）。
         let limits = Limits::for_syllables(min_syllables(&lattice));
 
-        let BeamResult { hyps, arena } = self.beam_search(pinyin, &lattice, &reachable, lm, limits);
-        hyps.into_iter()
+        let BeamResult {
+            hyps,
+            arena,
+            keys_at,
+        } = self.beam_search(pinyin, &lattice, &reachable, lm, limits);
+        let mut out: Vec<Scored> = hyps
+            .into_iter()
             .map(|h| {
                 // 路径只在这里（top-K 条）复原：热路径不碰字符串
                 let segments = segments_of(&arena, h.node);
                 Scored {
-                    cand: Candidate {
-                        text: segments.iter().map(|(_, w)| &***w).collect(),
-                        learned: segments
+                    cand: Candidate::whole(
+                        segments.iter().map(|(_, w)| &***w).collect::<String>(),
+                        segments
                             .iter()
                             .map(|(k, w)| LearnedWord::new(k.to_string(), w.to_string()))
                             .collect(),
-                    },
+                        pinyin.len(),
+                    ),
                     score: h.score,
                     fuzzy_edges: h.fuzzy_edges,
                     completion: false,
                 }
             })
-            .collect()
+            .collect();
+        // 部分候选：位置 0 出发、只覆盖输入前一段的词（整句错了就咬一段确认）
+        if let Some(keys) = keys_at.first().and_then(Option::as_ref) {
+            out.extend(partial_candidates(keys, pinyin.len()));
+        }
+        out
     }
 
     /// 用户调频加成：每选一次候选的 log10 权重（封顶 `USER_BOOST_CAP` 次）。
@@ -972,6 +1030,38 @@ fn first_word_base<L: NgramLm>(freq: u32, lm_id: Option<u32>, lm: &L) -> f32 {
             |i| lm.unigram_by_id(i).map_or_else(|| oov_score(freq), |(p, _)| p),
         )
     }
+}
+
+/// 从位置 0 的词键里取出「只覆盖输入前一段」的候选。
+///
+/// 打分与句首词同一套（读音基础分 + 用户调频 + 模糊惩罚），但它们在候选排序里
+/// 自成一组（见 `candidates_scored`），不与整句混排。
+fn partial_candidates(keys: &[PosKey], input_len: usize) -> Vec<Scored> {
+    let mut out: Vec<Scored> = Vec::new();
+    for pk in keys
+        .iter()
+        // 只取精确读音：部分确认是「修复入口」，给模糊读音的怪切分（niha → lifa）
+        // 只会添乱；模糊音该在整句候选里体现。
+        .filter(|pk| pk.end < input_len && pk.fuzzy_edges == 0)
+    {
+        for w in pk.words.iter().take(pk.limit) {
+            out.push(Scored {
+                cand: Candidate::partial(
+                    w.word.to_string(),
+                    vec![LearnedWord::new(pk.key.to_string(), w.word.to_string())],
+                    pk.end,
+                ),
+                score: w.first_base + w.boost,
+                fuzzy_edges: 0,
+                completion: false,
+            });
+        }
+    }
+    // 只按覆盖长度排（稳定排序，组内保持词库排名）：单词候选里「词频高」比
+    // 「LM unigram 高」更接近用户想要的（你好 的 unigram 在地板上，词频却极高）。
+    out.sort_by_key(|s| std::cmp::Reverse(s.cand.consumed));
+    out.truncate(PARTIAL_LIMIT);
+    out
 }
 
 /// 沿 arena 父指针复原路径（拼音键, 词），按输入顺序返回。
@@ -1289,6 +1379,50 @@ mod tests {
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts.first(), Some(&"主臣"), "叠加模糊不得占 #1: {texts:?}");
         assert!(texts.contains(&"组成"), "叠加模糊候选仍应保留（只是不占 #1）: {texts:?}");
+    }
+
+    #[test]
+    fn offers_partial_candidates_for_repair() {
+        // 整句候选之外必须给「只覆盖前一段」的词候选：整句错了不必删光重打，
+        // 选中前一段确认，剩余拼音继续组合。
+        let d = decoder_with(
+            "partial",
+            &[
+                ("ni", "你", 900),
+                ("hao", "好", 900),
+                ("nihao", "你好", 5000),
+                ("shijie", "世界", 5000),
+                ("shijie", "时节", 4000),
+            ],
+            &[
+                ("你", -2.5, -0.5),
+                ("好", -3.0, -0.5),
+                ("你好", -4.0, -0.5),
+                ("世界", -4.5, 0.0),
+                ("时节", -4.2, 0.0),
+            ],
+            &[("你好", "时节", -0.5), ("你好", "世界", -0.8)],
+            false,
+        );
+        let cands = d.candidates("nihaoshijie");
+        let partial = cands
+            .iter()
+            .find(|c| c.text == "你好")
+            .expect("应给出部分候选 你好");
+        assert_eq!(partial.consumed, "nihao".len(), "部分候选要记下消耗掉多少输入");
+        assert!(!partial.covers_all("nihaoshijie".len()));
+        // 结构约束：完全覆盖输入的候选一律排在部分候选之前
+        let first_partial = cands
+            .iter()
+            .position(|c| !c.covers_all("nihaoshijie".len()))
+            .expect("应有部分候选");
+        assert!(
+            cands[..first_partial]
+                .iter()
+                .all(|c| c.covers_all("nihaoshijie".len())),
+            "部分候选不得插到整句候选中间: {:?}",
+            cands.iter().map(|c| (&c.text, c.consumed)).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -173,6 +173,64 @@ impl SyllableTable {
             .collect()
     }
 
+    /// 按标准音节切分并用空格连接，供预编辑显示（`nihaoshijie` → `ni hao shi jie`）。
+    ///
+    /// 取「音节数最少」的切分（与解码器的规模判定同一口径）；某个位置切不下去时，
+    /// 把剩下的字母原样附上 —— 用户还没打完的尾巴（`shij` 的 `j`）也要看得见。
+    #[must_use]
+    pub fn split_for_display(&self, input: &str) -> String {
+        let n = input.len();
+        // 1) 正向可达：能切出音节的最远位置（还没打完的尾巴切不出来，如 shij 的 j）
+        let mut reachable = vec![false; n + 1];
+        reachable[0] = true;
+        let mut max_pos = 0usize;
+        for pos in 0..n {
+            if !reachable[pos] {
+                continue;
+            }
+            for e in self.syllables_at(input, pos) {
+                if e.is_fuzzy() {
+                    continue; // 显示层只认精确读音：预编辑要如实反映用户打的内容
+                }
+                reachable[e.end] = true;
+                max_pos = max_pos.max(e.end);
+            }
+        }
+        // 2) 反向 DP 到 max_pos：音节数最少的切分（与解码器的规模判定同一口径）
+        let mut hops = vec![usize::MAX; n + 1];
+        let mut choice: Vec<Option<&'static str>> = vec![None; n + 1];
+        hops[max_pos] = 0;
+        for pos in (0..max_pos).rev() {
+            for e in self.syllables_at(input, pos) {
+                if e.is_fuzzy() || e.end > max_pos {
+                    continue;
+                }
+                if hops[e.end] != usize::MAX && hops[e.end] + 1 < hops[pos] {
+                    hops[pos] = hops[e.end] + 1;
+                    choice[pos] = Some(e.syl);
+                }
+            }
+        }
+        // 3) 拼出「音节 音节 … 尾巴」
+        let mut out = String::with_capacity(n + n / 2);
+        let mut pos = 0usize;
+        while pos < max_pos {
+            let Some(syl) = choice[pos] else { break };
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&input[pos..pos + syl.len()]);
+            pos += syl.len();
+        }
+        if pos < n {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&input[pos..]);
+        }
+        out
+    }
+
     /// 全切分：`lattice[pos]` = 从 pos 开始的所有切分边。
     #[must_use]
     pub fn lattice(&self, input: &str) -> Vec<Vec<SyllableEdge>> {
@@ -346,6 +404,21 @@ mod tests {
             reachable.iter().any(|s| s == "shi hou"),
             "sihou 应能切出 shi hou: {reachable:?}"
         );
+    }
+
+    #[test]
+    fn split_for_display_segments_pinyin() {
+        let t = SyllableTable::new();
+        // 预编辑要看得见切分
+        assert_eq!(t.split_for_display("nihaoshijie"), "ni hao shi jie");
+        assert_eq!(t.split_for_display("womenzaigongzuo"), "wo men zai gong zuo");
+        // 没打完的尾巴原样附上（shij 的 j）
+        assert_eq!(t.split_for_display("nihaoshij"), "ni hao shi j");
+        // 单音节 / 空串
+        assert_eq!(t.split_for_display("ni"), "ni");
+        assert_eq!(t.split_for_display(""), "");
+        // 整串都切不出音节：原样返回
+        assert_eq!(t.split_for_display("zzz"), "zzz");
     }
 
     #[test]

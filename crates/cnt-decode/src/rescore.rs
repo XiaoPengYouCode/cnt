@@ -106,12 +106,13 @@ mod tests {
     }
 
     fn cand(text: &str, segs: usize) -> Candidate {
-        Candidate {
-            text: text.to_string(),
-            learned: (0..segs)
+        Candidate::whole(
+            text,
+            (0..segs)
                 .map(|i| LearnedWord::new(format!("p{i}"), text.to_string()))
                 .collect(),
-        }
+            segs * 2,
+        )
     }
 
     #[test]
