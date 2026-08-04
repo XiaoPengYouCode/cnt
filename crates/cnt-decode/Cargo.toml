@@ -9,6 +9,8 @@ description = "拼音切分（音节表）+ 整句解码（beam search）"
 cnt-input.workspace = true
 cnt-dict.workspace = true
 cnt-lm.workspace = true
+cnt-score.workspace = true
+log.workspace = true
 fastrace.workspace = true
 
 [lints]

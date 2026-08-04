@@ -9,6 +9,7 @@ description = "n-gram 语言模型：.cntl 二进制格式 + mmap 读取 + 生�
 memmap2.workspace = true
 thiserror.workspace = true
 cnt-store.workspace = true
+cnt-score.workspace = true
 
 [lints]
 workspace = true

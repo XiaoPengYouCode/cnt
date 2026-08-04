@@ -5,12 +5,18 @@
 //! logP(句子) ≈ Σ unigram(wᵢ) + Σ bigram(wᵢ₋₁, wᵢ) + 用户调频加成
 //! ```
 //! bigram 缺失时用 Katz backoff：`logP(wᵢ) + backoff(wᵢ₋₁)`。
+//!
+//! **搜索与打分解耦**：搜索（词图 + beam）在本文件，打分能力来自
+//! `cnt-score` 端口——
+//! - 热路径（beam 内每次展开）走 [`NgramLm`] 泛型，静态分派、零抽象开销；
+//! - 冷路径（每按键 ≤1 次）走 [`Rescorer`]（`dyn`），可换成小神经模型。
 
 use std::sync::Arc; // 同时用于 Decoder 与 Hyp 段
 
 use cnt_dict::PinyinModel;
 use cnt_lm::CntLm;
 use cnt_input::{Candidate, CandidateSource, LearnedWord};
+use cnt_score::{NgramLm, RescorePolicy, Rescorer};
 use fastrace::local::LocalSpan;
 use fastrace::{Event, Span};
 
@@ -81,25 +87,45 @@ struct Hyp {
     segments: Vec<(Arc<str>, Arc<str>)>,
 }
 
-/// 整句解码器：词库 + 语言模型 + 音节表。
-pub struct Decoder {
+/// 整句解码器：词库 + 语言模型（[`NgramLm`] 端口）+ 音节表 + 可选重排器。
+///
+/// `L` 默认是 `cnt-lm` 的 mmap n-gram（`CntLm`），因此下游 `Arc<Decoder>` 写法不变；
+/// 泛型参数存在的意义是打分实现可替换且不牺牲热路径性能（单态化，无虚表）。
+pub struct Decoder<L: NgramLm = CntLm> {
     model: Arc<PinyinModel>,
-    lm: Option<Arc<CntLm>>,
+    lm: Option<Arc<L>>,
     syllables: SyllableTable,
     /// 模糊音开关（平翘舌/边鼻音/前后鼻音等）。
     fuzzy: bool,
+    /// 可选的整句重排器（小神经模型等）；`None` = 纯 n-gram 基线。
+    rescorer: Option<Arc<dyn Rescorer>>,
+    /// 重排触发/融合策略。
+    policy: RescorePolicy,
 }
 
-impl Decoder {
+impl<L: NgramLm> Decoder<L> {
     /// 构造解码器。`lm` 为 `None` 时退化为单字/词候选（无整句）。
     #[must_use]
-    pub fn new(model: Arc<PinyinModel>, lm: Option<Arc<CntLm>>, fuzzy: bool) -> Self {
+    pub fn new(model: Arc<PinyinModel>, lm: Option<Arc<L>>, fuzzy: bool) -> Self {
         Self {
             model,
             lm,
             syllables: SyllableTable::new(),
             fuzzy,
+            rescorer: None,
+            policy: RescorePolicy::default(),
         }
+    }
+
+    /// 装上整句重排器（构造期注入，运行期不可变）。
+    ///
+    /// 未调用时解码行为与纯 n-gram 完全一致——重排是可选增强，不是必需路径。
+    #[must_use]
+    pub fn with_rescorer(mut self, rescorer: Arc<dyn Rescorer>, policy: RescorePolicy) -> Self {
+        log::info!("rescorer enabled: {} policy={policy:?}", rescorer.name());
+        self.rescorer = Some(rescorer);
+        self.policy = policy;
+        self
     }
 
     /// 提交学习数据：逐段调频 + 相邻两段拼合成新词（郑+爽 → zhengshuang/郑爽）。
@@ -149,6 +175,11 @@ impl Decoder {
             scored.extend(self.completions(pinyin, lm));
         }
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // 神经重排（可选）：仅在基线不确定时对前 top_n 条重排；
+        // 未装重排器时这里完全不产生开销。
+        if let Some(rescorer) = &self.rescorer {
+            crate::rescore::apply(rescorer.as_ref(), &self.policy, &mut scored);
+        }
         // 去重：同文本保留最高分
         let mut out: Vec<(Candidate, f32)> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -175,7 +206,7 @@ impl Decoder {
 
     /// 尾音节补全：末音节残缺（`chijiuh` → `h→hua`）或可延长（`chijiuhu` → `hu→hua`）时，
     /// 补出完整词候选（带分数；用户学过的词如 持久化 用 `USER_WORD_BASE` + 调频）。
-    fn completions(&self, pinyin: &str, lm: &CntLm) -> Vec<(Candidate, f32)> {
+    fn completions(&self, pinyin: &str, lm: &L) -> Vec<(Candidate, f32)> {
         let _span = Span::enter_with_local_parent("completions");
         if pinyin.len() < 2 {
             return Vec::new();
@@ -253,7 +284,7 @@ impl Decoder {
         pinyin: &str,
         lattice: &[Vec<SyllableEdge>],
         reachable: &[bool],
-        lm: &CntLm,
+        lm: &L,
     ) -> Vec<Hyp> {
         let mut hyps = vec![Hyp {
             pos: 0,
@@ -403,7 +434,7 @@ impl Decoder {
         &self,
         cache: &'a mut WordCache,
         key: &str,
-        lm: &CntLm,
+        lm: &L,
     ) -> &'a CachedWords {
         if !cache.contains_key(key) {
             let words = self.words_for(key);
@@ -427,7 +458,7 @@ impl Decoder {
         ctx: &EdgeCtx<'_>,
         words: &[(Arc<str>, u32, Option<u32>)],
         next: &mut Vec<Hyp>,
-        lm: &CntLm,
+        lm: &L,
     ) {
         let penalty = FUZZY_PENALTY[usize::from(ctx.cost.min(MAX_FUZZY_COST))];
         for (word_arc, freq, word_idx) in words {
@@ -438,38 +469,20 @@ impl Decoder {
             // 打分全程用缓存的 LM 词表下标（unigram_by_idx/bigram_by_idx），
             // 热路径零字符串查找。
             let boost = self.boost(ctx.key, word_arc);
-            let step = match (h.last.as_ref(), *word_idx) {
-                // 双词都在词表：bigram 下标查询；缺失时 Katz backoff（unigram 下标）
-                (Some((_, Some(prev_idx))), Some(word_idx)) => {
-                    lm.bigram_by_idx(*prev_idx, word_idx).unwrap_or_else(|| {
-                        let u2 = lm.unigram_by_idx(word_idx).map_or(UNK_LOGPROB, |(p, _)| p);
-                        let bk = lm.unigram_by_idx(*prev_idx).map_or(0.0, |(_, b)| b);
-                        u2 + bk
-                    })
-                }
-                // 词不全在词表：各自按下标查 unigram（不在词表的按 UNK/0）
-                (Some((_, prev_idx)), _) => {
-                    let u2 = word_idx.map_or(UNK_LOGPROB, |i| {
-                        lm.unigram_by_idx(i).map_or(UNK_LOGPROB, |(p, _)| p)
-                    });
-                    let bk = (*prev_idx).map_or(0.0, |i| {
-                        lm.unigram_by_idx(i).map_or(0.0, |(_, b)| b)
-                    });
-                    u2 + bk
-                }
-                // 首词：用户词/次读音走常量；主读音用下标 unigram（不在词表 → UNK）
-                _ => {
-                    if *freq == 0 {
-                        USER_WORD_BASE
-                    } else if *freq <= SECONDARY_FREQ_CAP {
-                        SECONDARY_BASE
-                    } else {
-                        // 不在 LM 的整词给 OOV_BASE，而非 UNK（否则必然输给整句拼接）
-                        word_idx.map_or(OOV_BASE, |i| {
-                            lm.unigram_by_idx(i).map_or(OOV_BASE, |(p, _)| p)
-                        })
-                    }
-                }
+            let step = if let Some((_, prev_idx)) = h.last.as_ref() {
+                // 续接：条件概率（bigram，缺失走 Katz backoff）——回退语义由
+                // NgramLm::conditional 统一定义，属于 n-gram 的领域规则。
+                lm.conditional(*prev_idx, *word_idx, UNK_LOGPROB)
+            } else if *freq == 0 {
+                // 首词：用户词/次读音走常量；主读音用下标 unigram（不在词表 → OOV）
+                USER_WORD_BASE
+            } else if *freq <= SECONDARY_FREQ_CAP {
+                SECONDARY_BASE
+            } else {
+                // 不在 LM 的整词给 OOV_BASE，而非 UNK（否则必然输给整句拼接）
+                word_idx.map_or(OOV_BASE, |i| {
+                    lm.unigram_by_id(i).map_or(OOV_BASE, |(p, _)| p)
+                })
             };
             let step = step + boost + penalty;
             nh.score += step;
@@ -498,7 +511,7 @@ impl Decoder {
 /// - 次读音（`freq ≤ SECONDARY_FREQ_CAP`，如 的di、和hu）：`SECONDARY_BASE`
 ///   —— 多音字不再串频（否则 fu 会出 和、diyige 会出 的一个）
 /// - 主读音：LM unigram（保留细粒度排序：是 > 时 > 事）
-fn reading_base(word: &str, freq: u32, lm: &CntLm) -> f32 {
+fn reading_base<L: NgramLm>(word: &str, freq: u32, lm: &L) -> f32 {
     if freq == 0 {
         USER_WORD_BASE
     } else if freq <= SECONDARY_FREQ_CAP {
@@ -508,7 +521,7 @@ fn reading_base(word: &str, freq: u32, lm: &CntLm) -> f32 {
     }
 }
 
-impl CandidateSource for Decoder {
+impl<L: NgramLm> CandidateSource for Decoder<L> {
     fn candidates(&self, pinyin: &str) -> Vec<Candidate> {
         self.candidates_merged(pinyin)
     }

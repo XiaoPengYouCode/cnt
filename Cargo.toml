@@ -8,6 +8,7 @@ members = [
     "crates/cnt-dict",
     "crates/cnt-dict-tools",
     "crates/cnt-lm",
+    "crates/cnt-score",
     "crates/cnt-store",
     "crates/cnt-config",
     "crates/cnt-decode",
@@ -62,6 +63,7 @@ toml = "=1.1.4"
 cnt-ibus = { path = "crates/cnt-ibus" }
 cnt-dict = { path = "crates/cnt-dict" }
 cnt-lm = { path = "crates/cnt-lm" }
+cnt-score = { path = "crates/cnt-score" }
 cnt-store = { path = "crates/cnt-store" }
 cnt-config = { path = "crates/cnt-config" }
 cnt-decode = { path = "crates/cnt-decode" }

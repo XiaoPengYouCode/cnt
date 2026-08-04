@@ -122,7 +122,9 @@ dependencies = [
  "cnt-dict",
  "cnt-input",
  "cnt-lm",
+ "cnt-score",
  "fastrace",
+ "log",
 ]
 
 [[package]]
@@ -174,10 +176,15 @@ version = "0.1.0"
 name = "cnt-lm"
 version = "0.1.0"
 dependencies = [
+ "cnt-score",
  "cnt-store",
  "memmap2",
  "thiserror",
 ]
+
+[[package]]
+name = "cnt-score"
+version = "0.1.0"
 
 [[package]]
 name = "cnt-store"

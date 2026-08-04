@@ -1,0 +1,13 @@
+[package]
+name = "cnt-score"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "打分端口层：n-gram 打分能力接口 + 整句重排（rescoring）契约与策略"
+
+# 端口层刻意保持零依赖：任何打分实现（n-gram / 小神经模型）都只依赖本 crate，
+# 不依赖解码器，方向永远是 实现 → 端口 ← 解码器。
+[dependencies]
+
+[lints]
+workspace = true
