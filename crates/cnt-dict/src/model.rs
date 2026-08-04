@@ -73,11 +73,19 @@ impl PinyinModel {
         self.dict.contains_key(key)
     }
 
-    /// 词库是否存在以该拼音为前缀的键（多音节链剪枝用：中间前缀可能无独立
-    /// 词条，但更长键存在，如 xuangai → xuangaiji）。
+    /// 词库或用户库是否存在以该拼音为前缀的键（多音节链剪枝用：中间前缀可能无
+    /// 独立词条，但更长键存在，如 xuangai → xuangaiji）。
+    ///
+    /// 必须带上用户库：否则用户学过的复合词（郑爽 / zhengshuang）只能在
+    /// 「整串输入 == 该键」时由整键候选命中，beam 不会把它当作句子中间的一个词。
     #[must_use]
     pub fn has_key_prefix(&self, key: &str) -> bool {
         self.dict.contains_prefix(key)
+            || self
+                .user
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .has_key_prefix(key)
     }
 
     pub fn query(&self, pinyin: &str) -> Vec<String> {
@@ -166,8 +174,10 @@ impl PinyinModel {
                 .user
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // 外层键只查一次（counts_of），之后按词哈希查找
+            let counts = user.counts_of(key);
             let rank_of = |word: &str, freq: u32| {
-                u64::from(freq) + u64::from(user.count(key, word)) * u64::from(USER_BOOST)
+                u64::from(freq) + u64::from(counts.get(word)) * u64::from(USER_BOOST)
             };
             for c in self.dict.exact(key) {
                 scored.push((Cow::Borrowed(c.word), c.freq, rank_of(c.word, c.freq)));

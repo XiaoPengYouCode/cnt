@@ -12,7 +12,7 @@
 //!
 //! 原子写盘：先写临时文件再 rename，避免中途崩溃写坏数据。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,19 @@ const MAX_USER_ENTRIES: usize = 20_000;
 /// 一天的秒数。
 const DAY_SECS: i64 = 86_400;
 
+/// 单个拼音下的计数视图（见 [`UserDb::counts_of`]）。
+pub struct CountsOf<'a>(Option<&'a HashMap<String, Entry>>);
+
+impl CountsOf<'_> {
+    /// 该拼音下某个词的有效计数（已按半衰期衰减）。
+    #[must_use]
+    pub fn get(&self, word: &str) -> u32 {
+        self.0
+            .and_then(|m| m.get(word))
+            .map_or(0, effective_u32)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     count: u32,
@@ -35,8 +48,11 @@ struct Entry {
 pub struct UserDb {
     path: PathBuf,
     /// 嵌套结构：`拼音 → 词 → 计数`。
-    /// 查询 `count()` 走两次 `HashMap` 查找，零分配（原先 `(String, String)` 键每次分配两个 `String`）。
-    counts: HashMap<String, HashMap<String, Entry>>,
+    ///
+    /// 外层用 `BTreeMap`：拼音键有序，前缀查询（`has_key_prefix` /
+    /// `words_for_pinyin_prefix`）走一次 `range` 而不是全表扫描 —— beam 的多音节链
+    /// 剪枝要靠它判断「用户学过的复合词键是否存在」，那是热路径。
+    counts: BTreeMap<String, HashMap<String, Entry>>,
     dirty: bool,
 }
 
@@ -47,7 +63,7 @@ impl UserDb {
     /// 文件读取失败时返回 IO 错误；格式非法的行会被忽略。
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut counts: HashMap<String, HashMap<String, Entry>> = HashMap::new();
+        let mut counts: BTreeMap<String, HashMap<String, Entry>> = BTreeMap::new();
         let now = now_secs();
         if let Ok(content) = fs::read_to_string(&path) {
             for line in content.lines() {
@@ -101,15 +117,41 @@ impl UserDb {
     #[must_use]
     pub fn words_for_pinyin_prefix(&self, prefix: &str) -> Vec<(String, String)> {
         let mut out: Vec<(String, String, u32)> = self
-            .counts
-            .iter()
-            .filter(|(p, _)| p.starts_with(prefix))
+            .keys_with_prefix(prefix)
             .flat_map(|(p, m)| {
                 m.iter().map(move |(w, e)| (p.clone(), w.clone(), effective_u32(e)))
             })
             .collect();
         out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
         out.into_iter().map(|(p, w, _)| (p, w)).collect()
+    }
+
+    /// 某个拼音下的计数视图：外层 `BTreeMap` 只查一次，之后按词做哈希查找。
+    ///
+    /// `ranked_words` 要对同一个键的十几个候选词逐个取计数，逐次 `count()` 会把
+    /// 外层 `BTreeMap` 的 O(log n) 字符串比较重复十几遍。
+    #[must_use]
+    pub fn counts_of(&self, pinyin: &str) -> CountsOf<'_> {
+        CountsOf(self.counts.get(pinyin))
+    }
+
+    /// 用户词库中是否存在以 `prefix` 开头的拼音键。
+    ///
+    /// beam 的多音节链剪枝用：只有「词库或用户库里存在以此为前缀的键」时才继续
+    /// 往下拼，否则学过的复合词（郑爽）永远拼不出来，只能在整串输入时靠整键候选命中。
+    #[must_use]
+    pub fn has_key_prefix(&self, prefix: &str) -> bool {
+        self.keys_with_prefix(prefix).next().is_some()
+    }
+
+    /// 以 `prefix` 开头的键（有序遍历，`BTreeMap::range` 一次定位后顺序扫描）。
+    fn keys_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> impl Iterator<Item = (&String, &HashMap<String, Entry>)> {
+        self.counts
+            .range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .take_while(move |(p, _)| p.starts_with(prefix))
     }
 
     /// 用户词库中某个拼音下的所有词（按有效计数降序）。

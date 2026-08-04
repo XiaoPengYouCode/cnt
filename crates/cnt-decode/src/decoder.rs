@@ -68,7 +68,11 @@ const TOP_SENTENCES_SHORT: usize = 10;
 const WHOLE_KEY_WORDS: usize = 20;
 /// 对外返回的候选总数上限。
 const CANDIDATE_LIMIT: usize = 30;
-/// 词不在 LM 中时的默认 unigram log10 概率。
+/// LM 完全未知词的兜底 log10 概率（下界参照）。
+///
+/// 打分不再直接用它：不在 LM 词表的词走 `first_word_base`（用户词/次读音/按词频的
+/// OOV 分），比 -12 的悬崖合理得多。留作 OOV 打分的下界断言。
+#[cfg(test)]
 const UNK_LOGPROB: f32 = -12.0;
 /// 词库有、LM 无的主读音整词基础分（如 信息量）：整词不该因不在 LM
 /// 而拿到 UNK（-12）输给任何整句拼接，给一个与用户词同档的基础分。
@@ -161,12 +165,18 @@ impl KeyCache {
         self.prefix.clear();
     }
 
-    /// 单个词键失效（调频/新词只影响这个键的候选词表与加成分）。
+    /// 单个词键失效（调频/新词影响这个键的候选词表、以及它各级前缀的存在性判定）。
     ///
-    /// `prefix` 判定不用动：它只查静态词库（`MmapDict`，运行期不可变），
-    /// 用户学习不会改变「词库里有没有以此为前缀的键」的答案。
+    /// 学到新复合词 `zhengshuang` 后，「有没有以 `zhengsh` 开头的键」的答案会从
+    /// false 变 true（用户库也参与该判定），而 beam 的多音节链剪枝正是靠它 ——
+    /// 不清掉这些前缀判定，新词就永远拼不进句子中间。
     fn invalidate(&mut self, key: &str) {
         self.words.remove(key);
+        for end in 1..=key.len() {
+            if key.is_char_boundary(end) {
+                self.prefix.remove(&key[..end]);
+            }
+        }
     }
 }
 
@@ -927,7 +937,10 @@ fn expand<L: NgramLm>(
         // 续接：在前词的 bigram 行内查条件概率（行已在上一步定位好，见 Hyp::row）；
         // 缺失走 Katz backoff —— 回退语义由 NgramLm 端口统一定义。
         let step = match h.prev {
-            Prev::Word(prev_id) => lm.conditional_in_row(row, prev_id, w.lm_id, UNK_LOGPROB),
+            // 不在 LM 词表的词（用户新词、词库长尾）用它的句首基础分当伪 unigram，
+            // 而不是一律 UNK(-12)：否则学过的复合词只能出现在句首，句子中间一定
+            // 输给逐字拼接（-12 的悬崖比任何拼接都差）。
+            Prev::Word(prev_id) => lm.conditional_in_row(row, prev_id, w.lm_id, w.first_base),
             Prev::Start => w.first_base,
         } + w.boost
             + penalty;
@@ -1276,6 +1289,47 @@ mod tests {
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts.first(), Some(&"主臣"), "叠加模糊不得占 #1: {texts:?}");
         assert!(texts.contains(&"组成"), "叠加模糊候选仍应保留（只是不占 #1）: {texts:?}");
+    }
+
+    #[test]
+    fn learned_compound_usable_mid_sentence() {
+        // 学过的复合词必须能被 beam 当作句子中间的一个词用：
+        // 教会 郑爽 之后，打 zhengshuangzhenpiaoliang 应切出 [郑爽][真][漂亮]，
+        // 而不是把 郑/爽 拆成两个字去和别的路径竞争。
+        let d = decoder_with(
+            "compound_mid",
+            &[
+                ("zheng", "郑", 900),
+                ("shuang", "爽", 900),
+                ("zhen", "真", 900),
+                ("piaoliang", "漂亮", 900),
+            ],
+            &[
+                ("郑", -3.0, -0.5),
+                ("爽", -3.5, -0.5),
+                ("真", -2.5, -0.5),
+                ("漂亮", -3.0, -0.5),
+            ],
+            &[("真", "漂亮", -0.5)],
+            false,
+        );
+        // 先查一遍填满词键缓存（含「zhengsh 前缀不存在」的判定）
+        let _ = d.candidates("zhengshuangzhenpiaoliang");
+        d.learn(&[
+            LearnedWord::new("zheng".to_string(), "郑".to_string()),
+            LearnedWord::new("shuang".to_string(), "爽".to_string()),
+        ]);
+        let cands = d.candidates("zhengshuangzhenpiaoliang");
+        let whole = cands.iter().find(|c| {
+            c.learned
+                .iter()
+                .any(|l| l.pinyin == "zhengshuang" && l.word == "郑爽")
+        });
+        assert!(
+            whole.is_some(),
+            "学过的 郑爽 应作为整词参与整句切分: {:?}",
+            cands.iter().map(|c| (&c.text, &c.learned)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
