@@ -24,8 +24,15 @@ use crate::syllable::{SyllableEdge, SyllableTable, MAX_FUZZY_COST};
 
 /// beam 宽度：同时保留的假设数。
 const BEAM: usize = 8;
-/// 每个音节/词键最多取多少个候选词。
+/// 每个音节/词键最多取多少个候选词（长输入）。
 const WORDS_PER_SYLLABLE: usize = 8;
+/// 单音节输入的每键候选词数。
+///
+/// 单音节同音字本身就几十个（li → 里/力/历/理/立/例……），只展开 8 个会让
+/// 词频上万的精确字（力/历/理）根本进不了候选。
+const WORDS_PER_SYLLABLE_MONO: usize = 20;
+/// 双音节输入的每键候选词数（比长输入宽、比单音节省：双音节的展开是乘性的）。
+const WORDS_PER_SYLLABLE_SHORT: usize = 12;
 /// 多音节词最多跨多少个音节（含首音节；4 = 成语如 莫名其妙）。
 const MAX_WORD_SYLLABLES: usize = 4;
 /// 模糊匹配的分级惩罚（log10），下标 = `SyllableEdge::cost`（0 = 精确，无惩罚）。
@@ -36,13 +43,45 @@ const MAX_WORD_SYLLABLES: usize = 4;
 /// - 2（边鼻音 n/l、鼻韵尾 an/ang 等）-2.0：阻止 xiangchen → 县城 抢 #1
 /// - 3（f/h、r/l、k/g、t/d）-3.0：较少见的混淆，不得压过精确读音词
 const FUZZY_PENALTY: [f32; (MAX_FUZZY_COST as usize) + 1] = [0.0, -1.0, -2.0, -3.0];
-/// 返回的句子候选数。
+/// 模糊边叠加的额外惩罚（超线性）：第 n 条模糊边额外扣 `(n-1) ×` 此值。
+///
+/// 逐边线性相加拦不住两处轻度模糊的高频词：zhuchen → 「组成」（zh/z + ch/c）
+/// 只扣 -2 就能抢 #1。现实中一个词同时打错两个音的概率远低于打错一个，
+/// 惩罚必须超线性增长（第 2 条额外 -2、第 3 条额外 -4……）。
+const FUZZY_STACK_PENALTY: f32 = 2.0;
+/// 单音节输入的模糊额外惩罚：无上下文佐证时，模糊回退纯属噪声。
+///
+/// 模糊音的价值来自整词/整句的佐证（sihou → 时候：两个音节互相印证）；输入
+/// 只有一个音节时既没有词也没有上下文，「li 出你」只会挤掉精确同音字（利/理）。
+const SINGLE_SYLLABLE_FUZZY_PENALTY: f32 = 3.0;
+/// 允许占 #1 的模糊边数上限：单处模糊（sihou → 时候）是模糊音的初衷，可以 #1；
+/// 两处以上同时模糊（zhuchen → 组成）则一律不得占 #1。
+const MAX_FUZZY_EDGES_AT_TOP: u8 = 1;
+/// 返回的句子候选数（长输入）。
 const TOP_SENTENCES: usize = 5;
+/// 单音节输入的句子候选数：整句候选就是精确同音字，只留 5 个会把位置
+/// 6~10 让给补全词与模糊音。
+const TOP_SENTENCES_MONO: usize = 15;
+/// 双音节输入的句子候选数。
+const TOP_SENTENCES_SHORT: usize = 10;
+/// 整个输入作为一个词键时取多少个词候选（含 LM 未覆盖的高频字：备/碑/辈/悲）。
+const WHOLE_KEY_WORDS: usize = 20;
+/// 对外返回的候选总数上限。
+const CANDIDATE_LIMIT: usize = 30;
 /// 词不在 LM 中时的默认 unigram log10 概率。
 const UNK_LOGPROB: f32 = -12.0;
 /// 词库有、LM 无的主读音整词基础分（如 信息量）：整词不该因不在 LM
 /// 而拿到 UNK（-12）输给任何整句拼接，给一个与用户词同档的基础分。
 const OOV_BASE: f32 = -5.0;
+/// OOV 打分的参考词频（`OOV_BASE` 对应的词频量级）。
+///
+/// 不在 LM 的词一律给 `OOV_BASE` 会让「词频 1 的生僻字」和「词频 2 万的常用字」
+/// 同分，单音节候选的 5~10 位于是被 㔹/㖀 这类字符占掉。按词库词频做 log10
+/// 修正后，常用字略高于基准、生僻字明显下沉。
+const OOV_REF_FREQ: f32 = 10_000.0;
+/// OOV 词频修正的下限/上限（log10）：防止极端词频把 OOV 抬过 LM 覆盖的词或砸穿 UNK。
+const OOV_ADJUST_MIN: f32 = -4.0;
+const OOV_ADJUST_MAX: f32 = 1.0;
 /// 补全词惩罚（completions 的延长音节词）：精确读音候选优先于补全候选。
 /// -1.5：-0.5 太轻，输入 jian 时 jiang 的高频词（将 -2.82）会压过精确读音的
 /// 见/件/间，单音节候选前排被「猜你还没打完」的词占掉。
@@ -64,11 +103,65 @@ type CachedWords = (Arc<str>, Vec<(Arc<str>, u32, Option<u32>)>);
 /// 候选词缓存：`key` → `CachedWords`
 type WordCache = std::collections::HashMap<String, CachedWords>;
 
+/// 候选规模上限：按输入音节数自适应。
+///
+/// 单/双音节输入的搜索空间本来就小（一两个位置），却有几十个同音字要展示；
+/// 长输入反之（搜索贵、候选少）。用同一套常量对待两者是错的。
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// 每个词键展开多少候选词
+    words_per_key: usize,
+    /// 保留多少整句候选
+    top_sentences: usize,
+    /// 模糊边的额外惩罚（单音节输入无上下文佐证时加重）
+    fuzzy_extra: f32,
+}
+
+impl Limits {
+    /// 按「覆盖输入所需的最少音节数」选规模。
+    const fn for_syllables(min_syllables: usize) -> Self {
+        match min_syllables {
+            // 单音节：搜索空间只有一个位置，尽管放宽；模糊回退无上下文佐证，加重惩罚
+            0 | 1 => Self {
+                words_per_key: WORDS_PER_SYLLABLE_MONO,
+                top_sentences: TOP_SENTENCES_MONO,
+                fuzzy_extra: SINGLE_SYLLABLE_FUZZY_PENALTY,
+            },
+            // 双音节：展开是乘性的，取中间档
+            2 => Self {
+                words_per_key: WORDS_PER_SYLLABLE_SHORT,
+                top_sentences: TOP_SENTENCES_SHORT,
+                fuzzy_extra: 0.0,
+            },
+            _ => Self {
+                words_per_key: WORDS_PER_SYLLABLE,
+                top_sentences: TOP_SENTENCES,
+                fuzzy_extra: 0.0,
+            },
+        }
+    }
+}
+
+/// 一个带分与来源信息的候选（排序阶段的内部表示）。
+///
+/// `fuzzy_edges` / `completion` 不只是元数据：它们参与**硬约束**（模糊叠加不得 #1、
+/// 补全词不得插到精确候选之前）——这些是分数调参担保不了的，必须结构上保证。
+struct Scored {
+    cand: Candidate,
+    score: f32,
+    /// 该候选路径上的模糊边数（0 = 精确读音）
+    fuzzy_edges: u8,
+    /// 是否为尾音节补全候选（「猜你还没打完」）
+    completion: bool,
+}
+
 /// 一条格的展开上下文（参数聚合，避免 expand 签名过长）。
 struct EdgeCtx<'a> {
     end: usize,
     /// 该词键路径上的模糊代价等级（多音节取最大）
     cost: u8,
+    /// 该词键路径上的模糊边条数（多音节整词可能连续错两个音：zhuchen → 组成）
+    fuzzy_edges: u8,
     key: &'a Arc<str>,
 }
 
@@ -83,6 +176,8 @@ struct Hyp {
     /// 上一个词的 (词, LM 词表下标)；下标用于快速 bigram 查询
     last: Option<(Arc<str>, Option<u32>)>,
     score: f32,
+    /// 已走过的模糊边数（用于超线性叠加惩罚与「不得占 #1」约束）
+    fuzzy_edges: u8,
     /// 已选的学习段（拼音, 词），Arc 克隆廉价
     segments: Vec<(Arc<str>, Arc<str>)>,
 }
@@ -170,43 +265,83 @@ impl<L: NgramLm> Decoder<L> {
     #[must_use]
     pub fn candidates_scored(&self, pinyin: &str) -> Vec<(Candidate, f32)> {
         let _span = Span::enter_with_local_parent("candidates");
-        let mut scored: Vec<(Candidate, f32)> = self.decode(pinyin);
+        let mut scored: Vec<Scored> = self.decode(pinyin);
+        // 整个输入作为词键的精确候选（含 LM 未覆盖但词频上万的字：备/碑/辈/悲），
+        // 它们与整句候选在同一分数空间里竞争——不再用 -inf 垫底排在补全词后面。
+        scored.extend(self.whole_key_words(pinyin));
         if let Some(lm) = &self.lm {
             scored.extend(self.completions(pinyin, lm));
         }
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // 排序两级：
+        // 1. 完全覆盖输入的候选（精确/模糊）永远排在补全候选之前——补全是「猜你
+        //    还没打完」，不该插到你已经打完的读音前面（jian 的前排不能被 jiang 占）；
+        // 2. 组内按分数降序。
+        scored.sort_by(|a, b| {
+            a.completion
+                .cmp(&b.completion)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
+        // 去重：同文本保留首个（= 组内最高分）
+        let mut out: Vec<Scored> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for s in &scored {
+            if seen.insert(s.cand.text.as_str()) {
+                out.push(Scored {
+                    cand: s.cand.clone(),
+                    score: s.score,
+                    fuzzy_edges: s.fuzzy_edges,
+                    completion: s.completion,
+                });
+            }
+        }
+        drop(scored);
+        demote_stacked_fuzzy(&mut out);
+        out.truncate(CANDIDATE_LIMIT);
+
+        let mut out: Vec<(Candidate, f32)> =
+            out.into_iter().map(|s| (s.cand, s.score)).collect();
         // 神经重排（可选）：仅在基线不确定时对前 top_n 条重排；
         // 未装重排器时这里完全不产生开销。
         if let Some(rescorer) = &self.rescorer {
-            crate::rescore::apply(rescorer.as_ref(), &self.policy, &mut scored);
-        }
-        // 去重：同文本保留最高分
-        let mut out: Vec<(Candidate, f32)> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (c, score) in scored {
-            if seen.insert(c.text.clone()) {
-                out.push((c, score));
-            }
-        }
-        out.truncate(20);
-        for w in self.model.query(pinyin) {
-            if !seen.contains(w.as_str()) {
-                seen.insert(w.clone());
-                out.push((
-                    Candidate {
-                        text: w.clone(),
-                        learned: vec![LearnedWord::new(pinyin.to_string(), w)],
-                    },
-                    f32::NEG_INFINITY, // 词候选无 LM 分，恒排最后
-                ));
-            }
+            crate::rescore::apply(rescorer.as_ref(), &self.policy, &mut out);
         }
         out
     }
 
+    /// 整个输入作为一个词键的精确候选（`li` → 里/力/历/理…，`xianzai` → 现在）。
+    ///
+    /// 分数走 `reading_base`（LM unigram / OOV / 次读音 / 用户词）+ 用户调频，
+    /// 与整句候选同一空间。曾经这些候选被硬塞 `-inf`「恒排最后」，导致
+    /// LM 未覆盖但词频上万的精确字（备/碑）永远排在补全词与模糊音之后。
+    fn whole_key_words(&self, pinyin: &str) -> Vec<Scored> {
+        let _span = Span::enter_with_local_parent("whole_key_words");
+        self.model
+            .ranked_words(pinyin, WHOLE_KEY_WORDS)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (word, freq))| {
+                // 无 LM 时退化为按词库排名给分（保持词频顺序，仍是有限值可参与排序）
+                #[allow(clippy::cast_precision_loss)] // rank < WHOLE_KEY_WORDS
+                let score = self.lm.as_ref().map_or_else(
+                    || -(rank as f32),
+                    |lm| reading_base(&word, freq, lm.as_ref()) + self.boost(pinyin, &word),
+                );
+                Scored {
+                    cand: Candidate {
+                        text: word.clone(),
+                        learned: vec![LearnedWord::new(pinyin.to_string(), word)],
+                    },
+                    score,
+                    fuzzy_edges: 0, // 整键精确匹配
+                    completion: false,
+                }
+            })
+            .collect()
+    }
+
     /// 尾音节补全：末音节残缺（`chijiuh` → `h→hua`）或可延长（`chijiuhu` → `hu→hua`）时，
     /// 补出完整词候选（带分数；用户学过的词如 持久化 用 `USER_WORD_BASE` + 调频）。
-    fn completions(&self, pinyin: &str, lm: &L) -> Vec<(Candidate, f32)> {
+    fn completions(&self, pinyin: &str, lm: &L) -> Vec<Scored> {
         let _span = Span::enter_with_local_parent("completions");
         if pinyin.len() < 2 {
             return Vec::new();
@@ -252,7 +387,7 @@ impl<L: NgramLm> Decoder<L> {
             }
         }
 
-        let mut out: Vec<(Candidate, f32)> = Vec::new();
+        let mut out: Vec<Scored> = Vec::new();
         for (base, ext) in completions {
             let key = format!("{base}{ext}");
             for (word, freq) in self.model.ranked_words(&key, 4) {
@@ -262,13 +397,17 @@ impl<L: NgramLm> Decoder<L> {
                 if freq != 0 {
                     score += COMPLETION_PENALTY;
                 }
-                out.push((
-                    Candidate {
+                out.push(Scored {
+                    cand: Candidate {
                         text: word.clone(),
                         learned: vec![LearnedWord::new(key.clone(), word)],
                     },
                     score,
-                ));
+                    fuzzy_edges: 0,
+                    // 用户学过的补全词（持久化）仍按补全处理：它排在精确候选之后，
+                    // 但精确候选里没有它的竞争者时依旧是第一梯队。
+                    completion: true,
+                });
             }
         }
         out
@@ -285,11 +424,13 @@ impl<L: NgramLm> Decoder<L> {
         lattice: &[Vec<SyllableEdge>],
         reachable: &[bool],
         lm: &L,
+        limits: Limits,
     ) -> Vec<Hyp> {
         let mut hyps = vec![Hyp {
             pos: 0,
             last: None,
             score: 0.0,
+            fuzzy_edges: 0,
             segments: Vec::new(),
         }];
         // 完整句子：已消费全部输入的假设直接进 done（如 打字/时候/莫名其妙 在
@@ -310,22 +451,34 @@ impl<L: NgramLm> Decoder<L> {
                 }
                 for edge in &lattice[h.pos] {
                     // 单音节词
-                    let (key_arc, words) = self.cached_words(&mut word_cache, edge.syl, lm);
+                    let (key_arc, words) =
+                        self.cached_words(&mut word_cache, edge.syl, lm, limits);
                     n_expand += words.len();
                     self.expand(
                         h,
-                        &EdgeCtx { end: edge.end, cost: edge.cost, key: key_arc },
+                        &EdgeCtx {
+                            end: edge.end,
+                            cost: edge.cost,
+                            fuzzy_edges: u8::from(edge.is_fuzzy()),
+                            key: key_arc,
+                        },
                         words,
                         &mut next,
                         lm,
+                        limits,
                     );
                     // 多音节词：沿格的所有路径拼接完整 key（如 xin-xi-liang → 信息量），
                     // 词库不存在的键剪枝——不依赖格内 edge 顺序（first() 会因音节表
                     // 顺序拼错路径，漏掉整词）。
-                    let mut chains = vec![(String::from(edge.syl), edge.end, edge.cost)];
+                    let mut chains = vec![(
+                        String::from(edge.syl),
+                        edge.end,
+                        edge.cost,
+                        u8::from(edge.is_fuzzy()),
+                    )];
                     for _ in 1..MAX_WORD_SYLLABLES {
-                        let mut next_chains: Vec<(String, usize, u8)> = Vec::new();
-                        for (key, cur_end, cost) in &chains {
+                        let mut next_chains: Vec<(String, usize, u8, u8)> = Vec::new();
+                        for (key, cur_end, cost, fuzzy_edges) in &chains {
                             let Some(edges) = lattice.get(*cur_end) else { continue };
                             for next_edge in edges {
                                 let mut k = key.clone();
@@ -333,18 +486,30 @@ impl<L: NgramLm> Decoder<L> {
                                 if !self.model.has_key_prefix(&k) {
                                     continue; // 词库无以此开头的键：不可能成词，剪枝
                                 }
-                                next_chains.push((k, next_edge.end, (*cost).max(next_edge.cost)));
+                                next_chains.push((
+                                    k,
+                                    next_edge.end,
+                                    (*cost).max(next_edge.cost),
+                                    fuzzy_edges.saturating_add(u8::from(next_edge.is_fuzzy())),
+                                ));
                             }
                         }
-                        for (key, end, cost) in &next_chains {
-                            let (key_arc, words) = self.cached_words(&mut word_cache, key, lm);
+                        for (key, end, cost, fuzzy_edges) in &next_chains {
+                            let (key_arc, words) =
+                                self.cached_words(&mut word_cache, key, lm, limits);
                             n_expand += words.len();
                             self.expand(
                                 h,
-                                &EdgeCtx { end: *end, cost: *cost, key: key_arc },
+                                &EdgeCtx {
+                                    end: *end,
+                                    cost: *cost,
+                                    fuzzy_edges: *fuzzy_edges,
+                                    key: key_arc,
+                                },
                                 words,
                                 &mut next,
                                 lm,
+                                limits,
                             );
                         }
                         chains = next_chains;
@@ -378,12 +543,12 @@ impl<L: NgramLm> Decoder<L> {
         // 去重：同一句文本可能来自「多音节词」和「单字拼合」两条路径，保留最高分
         let mut seen = std::collections::HashSet::new();
         done.retain(|h| seen.insert(join_segments(&h.segments)));
-        done.truncate(TOP_SENTENCES);
+        done.truncate(limits.top_sentences);
         done
     }
 
     /// beam search 解码：Top-K 句子候选（带分数）。
-    fn decode(&self, pinyin: &str) -> Vec<(Candidate, f32)> {
+    fn decode(&self, pinyin: &str) -> Vec<Scored> {
         let Some(lm) = &self.lm else {
             return Vec::new();
         };
@@ -409,22 +574,27 @@ impl<L: NgramLm> Decoder<L> {
             reachable[i] = lattice[i].iter().any(|e| reachable[e.end]);
         }
 
-        self.beam_search(pinyin, &lattice, &reachable, lm)
+        // 覆盖输入所需的最少音节数（最短跳数 DP）：候选规模按它自适应。
+        // 单音节 li 与七字整句用同一套上限是错的（前者要宽、后者要省）。
+        let limits = Limits::for_syllables(min_syllables(&lattice));
+
+        self.beam_search(pinyin, &lattice, &reachable, lm, limits)
             .into_iter()
             .map(|h| {
-                let score = h.score;
                 let learned = h
                     .segments
                     .iter()
                     .map(|(p, w)| LearnedWord::new(p.to_string(), w.to_string()))
                     .collect();
-                (
-                    Candidate {
+                Scored {
+                    cand: Candidate {
                         text: join_segments(&h.segments),
                         learned,
                     },
-                    score,
-                )
+                    score: h.score,
+                    fuzzy_edges: h.fuzzy_edges,
+                    completion: false,
+                }
             })
             .collect()
     }
@@ -435,9 +605,10 @@ impl<L: NgramLm> Decoder<L> {
         cache: &'a mut WordCache,
         key: &str,
         lm: &L,
+        limits: Limits,
     ) -> &'a CachedWords {
         if !cache.contains_key(key) {
-            let words = self.words_for(key);
+            let words = self.words_for(key, limits.words_per_key);
             let arcs: Vec<(Arc<str>, u32, Option<u32>)> = words
                 .into_iter()
                 .map(|(w, f)| {
@@ -459,8 +630,21 @@ impl<L: NgramLm> Decoder<L> {
         words: &[(Arc<str>, u32, Option<u32>)],
         next: &mut Vec<Hyp>,
         lm: &L,
+        limits: Limits,
     ) {
-        let penalty = FUZZY_PENALTY[usize::from(ctx.cost.min(MAX_FUZZY_COST))];
+        let base_penalty = FUZZY_PENALTY[usize::from(ctx.cost.min(MAX_FUZZY_COST))];
+        // 超线性叠加：本词贡献 ctx.fuzzy_edges 条模糊边，之前已有 h.fuzzy_edges 条，
+        // 除第 1 条外每条额外扣 FUZZY_STACK_PENALTY（整词内部连错两音同样算叠加：
+        // zhuchen → 组成 是 zh/z + en/eng 两条边，不能只按最大 cost 扣一次）。
+        let penalty = if ctx.fuzzy_edges > 0 {
+            let stacked = h
+                .fuzzy_edges
+                .saturating_add(ctx.fuzzy_edges)
+                .saturating_sub(1);
+            FUZZY_STACK_PENALTY.mul_add(-f32::from(stacked), base_penalty) - limits.fuzzy_extra
+        } else {
+            0.0
+        };
         for (word_arc, freq, word_idx) in words {
             let mut nh = h.clone();
             // ARPA bigram 是条件概率 log P(w2|w1)：首词用读音感知的基础分，
@@ -479,14 +663,16 @@ impl<L: NgramLm> Decoder<L> {
             } else if *freq <= SECONDARY_FREQ_CAP {
                 SECONDARY_BASE
             } else {
-                // 不在 LM 的整词给 OOV_BASE，而非 UNK（否则必然输给整句拼接）
-                word_idx.map_or(OOV_BASE, |i| {
-                    lm.unigram_by_id(i).map_or(OOV_BASE, |(p, _)| p)
-                })
+                // 不在 LM 的整词按词频给 OOV 分，而非 UNK（否则必然输给整句拼接）
+                word_idx.map_or_else(
+                    || oov_score(*freq),
+                    |i| lm.unigram_by_id(i).map_or_else(|| oov_score(*freq), |(p, _)| p),
+                )
             };
             let step = step + boost + penalty;
             nh.score += step;
             nh.pos = ctx.end;
+            nh.fuzzy_edges = h.fuzzy_edges.saturating_add(ctx.fuzzy_edges);
             nh.last = Some((word_arc.clone(), *word_idx));
             nh.segments.push((ctx.key.clone(), word_arc.clone()));
             next.push(nh);
@@ -494,8 +680,8 @@ impl<L: NgramLm> Decoder<L> {
     }
 
     /// 某音节/词键的高频候选词（带词库频率；领域规则在 `PinyinModel::ranked_words` 单点定义）。
-    fn words_for(&self, key: &str) -> Vec<(String, u32)> {
-        self.model.ranked_words(key, WORDS_PER_SYLLABLE)
+    fn words_for(&self, key: &str, limit: usize) -> Vec<(String, u32)> {
+        self.model.ranked_words(key, limit)
     }
 
     /// 用户调频加成：每选一次候选的 log10 权重（封顶 `USER_BOOST_CAP` 次）。
@@ -517,13 +703,61 @@ fn reading_base<L: NgramLm>(word: &str, freq: u32, lm: &L) -> f32 {
     } else if freq <= SECONDARY_FREQ_CAP {
         SECONDARY_BASE
     } else {
-        lm.unigram(word).map_or(OOV_BASE, |(p, _)| p)
+        lm.unigram(word).map_or_else(|| oov_score(freq), |(p, _)| p)
     }
+}
+
+/// 不在 LM 的词（OOV）的基础分：以 `OOV_BASE` 为基准，按词库词频做 log10 修正。
+#[allow(clippy::cast_precision_loss)] // 词频量级 ≤ 1e9，f32 精度足够
+fn oov_score(freq: u32) -> f32 {
+    let adjust = (freq.max(1) as f32 / OOV_REF_FREQ)
+        .log10()
+        .clamp(OOV_ADJUST_MIN, OOV_ADJUST_MAX);
+    OOV_BASE + adjust
 }
 
 impl<L: NgramLm> CandidateSource for Decoder<L> {
     fn candidates(&self, pinyin: &str) -> Vec<Candidate> {
         self.candidates_merged(pinyin)
+    }
+}
+
+/// 覆盖整个输入所需的最少音节数（音节格上的最短跳数 DP）。
+///
+/// 只用来选候选规模，不参与打分；走不通（无合法切分）时返回 `usize::MAX`，
+/// 此时按长输入的保守规模处理。
+fn min_syllables(lattice: &[Vec<SyllableEdge>]) -> usize {
+    let end = lattice.len();
+    let mut hops = vec![usize::MAX; end + 1];
+    hops[0] = 0;
+    for pos in 0..end {
+        if hops[pos] == usize::MAX {
+            continue;
+        }
+        for e in &lattice[pos] {
+            hops[e.end] = hops[e.end].min(hops[pos] + 1);
+        }
+    }
+    hops[end]
+}
+
+/// 硬约束：模糊边 ≥2 的候选不得占 #1。
+///
+/// 超线性惩罚已让多处模糊的分数大幅下沉，但「不占 #1」是可用性底线，不能只靠
+/// 调参：一旦榜首是叠加模糊候选，就把最靠前的「单处模糊或精确」候选提到 #1
+/// （其余相对顺序不变）。找不到这样的候选时（全是叠加模糊）保持原状。
+fn demote_stacked_fuzzy(out: &mut [Scored]) {
+    if out
+        .first()
+        .is_none_or(|s| s.fuzzy_edges <= MAX_FUZZY_EDGES_AT_TOP)
+    {
+        return;
+    }
+    if let Some(i) = out
+        .iter()
+        .position(|s| s.fuzzy_edges <= MAX_FUZZY_EDGES_AT_TOP && !s.completion)
+    {
+        out[..=i].rotate_right(1);
     }
 }
 
@@ -774,6 +1008,86 @@ mod tests {
             exact.is_some() && (compl.is_none() || exact < compl),
             "精确读音 见 应在补全候选 将 之前: {texts:?}"
         );
+    }
+
+    #[test]
+    fn mono_input_fills_top_with_exact_readings() {
+        // 单音节 li：精确同音字（里/力/历）必须排在补全词（两 = liang）
+        // 与模糊音候选（你 = ni，l/n）之前——单音节没有上下文佐证模糊回退。
+        let d = decoder_with(
+            "mono",
+            &[
+                ("li", "里", 50_000),
+                ("li", "力", 30_000),
+                ("li", "历", 20_000),
+                ("liang", "两", 90_000),
+                ("ni", "你", 90_000),
+            ],
+            &[
+                ("里", -3.0, 0.0),
+                ("力", -3.5, 0.0),
+                ("历", -4.0, 0.0),
+                ("两", -2.5, 0.0), // 补全词 LM 分更高，仍不得插到精确读音前
+                ("你", -2.0, 0.0), // 模糊候选 LM 分最高，同样不得插队
+            ],
+            &[],
+            true,
+        );
+        let cands = d.candidates("li");
+        let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        let pos = |t: &str| texts.iter().position(|x| *x == t);
+        let (li, force, hist) = (pos("里"), pos("力"), pos("历"));
+        assert!(li.is_some() && force.is_some() && hist.is_some(), "精确字应全部在候选里: {texts:?}");
+        for exact in [li, force, hist] {
+            for other in [pos("两"), pos("你")] {
+                if let (Some(e), Some(o)) = (exact, other) {
+                    assert!(e < o, "精确读音应在补全/模糊之前: {texts:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stacked_fuzzy_never_ranks_first() {
+        // zhuchen：组成（zu-cheng，zh/z + en/eng 两处模糊）即使分数最高，
+        // 也不得占 #1——两处同时打错的概率远低于一处。
+        let d = decoder_with(
+            "stacked_fuzzy",
+            &[("zhu", "主", 90_000), ("chen", "臣", 50_000), ("zucheng", "组成", 80_000)],
+            &[("主", -3.0, -0.5), ("臣", -4.0, 0.0), ("组成", -2.0, 0.0)],
+            &[],
+            true,
+        );
+        let cands = d.candidates("zhuchen");
+        let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts.first(), Some(&"主臣"), "叠加模糊不得占 #1: {texts:?}");
+        assert!(texts.contains(&"组成"), "叠加模糊候选仍应保留（只是不占 #1）: {texts:?}");
+    }
+
+    #[test]
+    fn oov_score_follows_dict_frequency() {
+        // 不在 LM 的词按词库词频分层，别让「词频 1 的生僻字」与常用字同分
+        assert!(oov_score(20_000) > oov_score(5_000));
+        assert!(oov_score(5_000) > oov_score(1));
+        // 上下限：极高词频不得抬过 LM 覆盖词的量级，极低词频不得砸穿 UNK
+        assert!(oov_score(u32::MAX) <= OOV_BASE + OOV_ADJUST_MAX);
+        assert!(oov_score(0) >= OOV_BASE + OOV_ADJUST_MIN);
+        assert!(oov_score(0) > UNK_LOGPROB);
+    }
+
+    #[test]
+    fn limits_scale_with_input_length() {
+        // 单音节最宽、双音节居中、长输入最省（展开是乘性的，长输入不能放宽）
+        let mono = Limits::for_syllables(1);
+        let short = Limits::for_syllables(2);
+        let long = Limits::for_syllables(5);
+        assert!(mono.words_per_key > short.words_per_key);
+        assert!(short.words_per_key > long.words_per_key);
+        assert!(mono.top_sentences > short.top_sentences);
+        assert!(short.top_sentences > long.top_sentences);
+        // 只有单音节加重模糊惩罚（多音节靠上下文互相印证）
+        assert!(mono.fuzzy_extra > 0.0);
+        assert!(short.fuzzy_extra.abs() < f32::EPSILON);
     }
 
     #[test]
