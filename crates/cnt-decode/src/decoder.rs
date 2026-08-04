@@ -283,9 +283,13 @@ impl Decoder {
                     }
                 }
             }
+            // 束剪枝：先丢死路（in-place retain），再 in-place 分区为
+            // 「部分假设（前）」与「完整假设（后）」，零分配（此前 partition()
+            // 每轮新建 2 个 Vec）。
             // 束剪枝：先丢死路 + 分离完整假设，再对部分假设取前 BEAM。
-            // 用 select_nth_unstable（O(N) 分区）替代全排序（O(N log N)）——
-            // 每轮展开可能产生数百个假设，全排序是 beam 循环的主要开销。
+            // 用 partition() 保持与原实现一致的假设顺序：select_nth_unstable 是
+            // 不稳定选择，若 next 顺序变化，beam top-8 的选择会变（sihou 的
+            // 「时」路径曾因此被剪掉，时候 掉出 #1）。
             next.retain(|h| reachable[h.pos]); // 丢弃走不到末尾的死路
             let (complete, partial): (Vec<Hyp>, Vec<Hyp>) =
                 next.into_iter().partition(|h| h.pos >= lattice.len());
@@ -394,22 +398,42 @@ impl Decoder {
             // ARPA bigram 是条件概率 log P(w2|w1)：首词用读音感知的基础分，
             // 后续词用条件概率（bigram 或 Katz backoff），用户调频加成始终加。
             // 模糊读音加惩罚：回退读音不能与精确读音平等竞争（否则 dazi 会出「他只」）。
-            // 双词都在词表时走下标查询，避免热路径上的字符串二分。
+            // 打分全程用缓存的 LM 词表下标（unigram_by_idx/bigram_by_idx），
+            // 热路径零字符串查找。
             let boost = self.boost(ctx.key, word_arc);
             let step = match (h.last.as_ref(), *word_idx) {
+                // 双词都在词表：bigram 下标查询；缺失时 Katz backoff（unigram 下标）
                 (Some((_, Some(prev_idx))), Some(word_idx)) => {
-                    lm.bigram_by_idx(*prev_idx, word_idx)
-                        .unwrap_or_else(|| {
-                            let u2 = lm.unigram_by_idx(word_idx).map_or(UNK_LOGPROB, |(p, _)| p);
-                            let bk = lm.unigram_by_idx(*prev_idx).map_or(0.0, |(_, b)| b);
-                            u2 + bk
-                        })
-                        + boost
-                        + penalty
+                    lm.bigram_by_idx(*prev_idx, word_idx).unwrap_or_else(|| {
+                        let u2 = lm.unigram_by_idx(word_idx).map_or(UNK_LOGPROB, |(p, _)| p);
+                        let bk = lm.unigram_by_idx(*prev_idx).map_or(0.0, |(_, b)| b);
+                        u2 + bk
+                    })
                 }
-                (Some((prev, _)), _) => backoff_score(lm, prev, word_arc) + boost + penalty,
-                _ => reading_base(word_arc, *freq, lm) + boost + penalty,
+                // 词不全在词表：各自按下标查 unigram（不在词表的按 UNK/0）
+                (Some((_, prev_idx)), _) => {
+                    let u2 = word_idx.map_or(UNK_LOGPROB, |i| {
+                        lm.unigram_by_idx(i).map_or(UNK_LOGPROB, |(p, _)| p)
+                    });
+                    let bk = (*prev_idx).map_or(0.0, |i| {
+                        lm.unigram_by_idx(i).map_or(0.0, |(_, b)| b)
+                    });
+                    u2 + bk
+                }
+                // 首词：用户词/次读音走常量；主读音用下标 unigram（不在词表 → UNK）
+                _ => {
+                    if *freq == 0 {
+                        USER_WORD_BASE
+                    } else if *freq <= SECONDARY_FREQ_CAP {
+                        SECONDARY_BASE
+                    } else {
+                        word_idx.map_or(UNK_LOGPROB, |i| {
+                            lm.unigram_by_idx(i).map_or(UNK_LOGPROB, |(p, _)| p)
+                        })
+                    }
+                }
             };
+            let step = step + boost + penalty;
             nh.score += step;
             nh.pos = ctx.end;
             nh.last = Some((word_arc.clone(), *word_idx));
@@ -446,20 +470,13 @@ fn reading_base(word: &str, freq: u32, lm: &CntLm) -> f32 {
     }
 }
 
-/// bigram 缺失时的 Katz backoff：`logP(w2) + backoff(w1)`。
-fn backoff_score(lm: &CntLm, w1: &str, w2: &str) -> f32 {
-    let u2 = lm.unigram(w2).map_or(UNK_LOGPROB, |(p, _)| p);
-    let bk = lm.unigram(w1).map_or(0.0, |(_, b)| b);
-    u2 + bk
-}
-
 impl CandidateSource for Decoder {
     fn candidates(&self, pinyin: &str) -> Vec<Candidate> {
         self.candidates_merged(pinyin)
     }
 }
 
-/// 词的 unigram 分（首词用）。
+/// 词的 unigram 分（首词用；`completions` 的低频路径）。
 fn unigram_score(lm: &CntLm, word: &str) -> f32 {
     lm.unigram(word).map_or(UNK_LOGPROB, |(p, _)| p)
 }
