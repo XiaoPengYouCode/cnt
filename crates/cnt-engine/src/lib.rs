@@ -11,7 +11,7 @@ use zbus::connection::Connection;
 use zbus::zvariant::OwnedObjectPath;
 
 use cnt_decode::Decoder;
-use cnt_input::{Action, EngineState, LearnedWord};
+use cnt_input::{latin_before_cursor, Action, EngineState, LearnedWord};
 
 const ENGINE_IFACE: &str = "org.freedesktop.IBus.Engine";
 const FACTORY_PATH: &str = "/org/freedesktop/IBus/Factory";
@@ -86,8 +86,14 @@ pub struct Engine {
     decoder: Arc<Decoder>,
     page_size: usize,
     shift_tap: Mutex<ShiftTap>,
-    /// 应用提供的 surrounding text（文本, 光标字节偏移）；应用不支持时为 None。
-    surrounding: Mutex<Option<(String, i32)>>,
+    /// 应用提供的 surrounding text（文本, 光标**字符**偏移）；应用不支持时为 None。
+    surrounding: Mutex<Option<(String, usize)>>,
+    /// 我们自己刚上屏的最后一个字符（比 surrounding 更新）。
+    ///
+    /// 很多应用不会在每次 `CommitText` 后重发 surrounding text，导致缓存过期：
+    /// 先打英文再打中文，前一字符会一直停在那个英文字母上 → 标点永远半角。
+    /// 所以以自己的上屏为权威，应用下次发 surrounding 时再交回去。
+    last_commit_char: Mutex<Option<char>>,
 }
 
 /// 界面状态快照（所有数据均为 owned，可安全跨 await）
@@ -116,6 +122,7 @@ impl Engine {
             page_size,
             shift_tap: Mutex::new(ShiftTap::default()),
             surrounding: Mutex::new(None),
+            last_commit_char: Mutex::new(None),
         }
     }
 
@@ -197,6 +204,12 @@ impl Engine {
 
     /// 提交一段文字并清空状态。
     async fn commit(&self, text: &str) {
+        // 记住自己上屏的最后一个字符：下一个标点的宽度判定以此为准，
+        // 不再依赖应用是否及时重发 surrounding text。
+        *self
+            .last_commit_char
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = text.chars().last();
         let _ = self
             .conn
             .emit_signal(
@@ -209,6 +222,61 @@ impl Engine {
             .await;
         self.lock_state().clear();
         self.hide_ui().await;
+    }
+
+    /// 丢弃半角判定的上下文（焦点切换/重置：旧位置的前一字符已无意义）。
+    fn forget_context(&self) {
+        *self
+            .last_commit_char
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .surrounding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// 转发给应用的可打印 ASCII 键也要计入上下文（数字、英文模式的字母都走转发，
+    /// 应用未必重发 surrounding）。这正是「3, / abc,」要半角的那一类情形。
+    fn note_forwarded_key(&self, keyval: u32) {
+        if let Some(c) = char::from_u32(keyval).filter(char::is_ascii_graphic) {
+            *self
+                .last_commit_char
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(c);
+        }
+    }
+
+    /// 标点半角判定：自己刚上屏的字符优先，否则看应用给的 surrounding text。
+    ///
+    /// 两边都没信息时返回 false（全角）——中文输入法的默认应当是全角。
+    fn punct_half_width(&self) -> bool {
+        let last = *self
+            .last_commit_char
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(c) = last {
+            return c.is_ascii_alphanumeric();
+        }
+        self.surrounding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|(text, cursor)| latin_before_cursor(text, *cursor))
+    }
+
+    /// 请应用下发光标周围文本（不发这个信号，大多数应用根本不会调 `SetSurroundingText`）。
+    async fn require_surrounding_text(&self) {
+        let _ = self
+            .conn
+            .emit_signal(
+                None::<&str>,
+                self.path.as_str(),
+                ENGINE_IFACE,
+                "RequireSurroundingText",
+                &(),
+            )
+            .await;
     }
 
     async fn refresh_after_handled(&self) {
@@ -321,21 +389,9 @@ impl Engine {
 
             let act = {
                 let mut st = self.lock_state();
-                // 半角标点上下文：未组合且前一个字符是数字/英文 → 标点用半角（3，→ 3,）
-                let punct_half_width = if st.is_composing() {
-                    false
-                } else {
-                    let sur = self
-                        .surrounding
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    sur.as_ref().is_some_and(|(text, cursor)| {
-                        usize::try_from((*cursor - 1).max(0))
-                            .ok()
-                            .and_then(|idx| text.as_bytes().get(idx))
-                            .is_some_and(u8::is_ascii_alphanumeric)
-                    })
-                };
+                // 半角标点上下文：未组合且光标前一个字符是数字/英文 → 半角（3，→ 3,）。
+                // 组合中（前面肯定是刚上屏的中文）永远全角。
+                let punct_half_width = !st.is_composing() && self.punct_half_width();
                 st.handle_key(keyval, &*self.decoder, punct_half_width)
             };
             // 同步段结束：释放 thread-local local parent，避免跨 await 污染
@@ -349,6 +405,7 @@ impl Engine {
         match action {
             Action::Forward => {
                 log::debug!("forwarded");
+                self.note_forwarded_key(keyval);
                 Ok(false)
             }
             Action::Handled => {
@@ -362,36 +419,51 @@ impl Engine {
             Action::CommitAndForward { text, learned } => {
                 // 提交预编辑后把原按键转发给应用（如 Shift+字母 输出大写）
                 self.handle_commit(text, learned).await;
+                self.note_forwarded_key(keyval);
                 Ok(false)
             }
         }
     }
 
-    fn focus_in(&self) {}
+    async fn focus_in(&self) {
+        // 新的输入上下文：丢掉旧的半角判定依据，并请应用下发光标周围文本
+        self.forget_context();
+        self.require_surrounding_text().await;
+    }
 
-    fn focus_in_id(&self, _object_path: &str, _client: &str) {}
+    async fn focus_in_id(&self, _object_path: &str, _client: &str) {
+        self.forget_context();
+        self.require_surrounding_text().await;
+    }
 
     async fn focus_out(&self) {
         self.lock_state().clear();
+        self.forget_context();
         self.hide_ui().await;
         self.flush_user();
     }
 
     async fn focus_out_id(&self, _object_path: &str) {
         self.lock_state().clear();
+        self.forget_context();
         self.hide_ui().await;
         self.flush_user();
     }
 
     async fn reset(&self) {
         self.lock_state().clear();
+        self.forget_context();
         self.hide_ui().await;
     }
 
-    fn enable(&self) {}
+    async fn enable(&self) {
+        self.forget_context();
+        self.require_surrounding_text().await;
+    }
 
     async fn disable(&self) {
         self.lock_state().clear();
+        self.forget_context();
         self.hide_ui().await;
         self.flush_user();
     }
@@ -468,10 +540,21 @@ impl Engine {
             });
         match text_str {
             Some(t) => {
+                let cursor = usize::try_from(cursor_pos).unwrap_or(0);
+                log::debug!(
+                    "surrounding: cursor={cursor} char, prev_is_latin={}",
+                    latin_before_cursor(&t, cursor)
+                );
+                // 应用的数据是新鲜的（包含光标移动/删除等我们看不到的编辑），
+                // 一旦收到就不再用自己缓的上屏字符。
+                *self
+                    .last_commit_char
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 *self
                     .surrounding
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((t, i32::try_from(cursor_pos).unwrap_or(0)));
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((t, cursor));
             }
             None => log::debug!("unparseable surrounding text"),
         }

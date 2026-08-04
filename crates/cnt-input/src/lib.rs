@@ -101,11 +101,18 @@ fn punct_of(keyval: u32, quote_open: &mut bool, half_width: bool) -> Option<Stri
         '|' => ("｜", "|"),
         '`' => ("·", "`"),
         '"' => {
+            // 英文/数字后（写代码、写 `x="1"`）要的是直引号，不是弯引号
+            if half_width {
+                return Some('"'.to_string());
+            }
             let p = if *quote_open { "”" } else { "“" };
             *quote_open = !*quote_open;
             return Some(p.to_string());
         }
         '\'' => {
+            if half_width {
+                return Some('\''.to_string());
+            }
             let p = if *quote_open { "’" } else { "‘" };
             *quote_open = !*quote_open;
             return Some(p.to_string());
@@ -113,6 +120,27 @@ fn punct_of(keyval: u32, quote_open: &mut bool, half_width: bool) -> Option<Stri
         _ => return None,
     };
     Some(if half_width { pair.1 } else { pair.0 }.to_string())
+}
+
+/// 标点宽度判定：光标前一个字符是否为 ASCII 字母/数字。
+///
+/// 语义就是「英文/数字后面紧跟的**第一个**标点用半角」：只看紧邻的那一个字符，
+/// 所以 `abc,` 之后再打标点（前一字符是 `,`）会回到全角。
+///
+/// `cursor_chars` 是 **字符** 偏移 —— `IBus` 的 `SetSurroundingText` 的 `cursor_pos`
+/// 按字符计（不是字节）。曾经把它当字节下标用：中文一字 3 字节，字符偏移 N 会
+/// 落在文本约 1/3 处，只要前文有任何英文/数字就误判成半角，表现为「所有标点都变半角」。
+///
+/// 光标越界（应用给的 surrounding text 过期）时返回 `false`，即回到全角——
+/// 宁可全角错一次，也不要在中文里冒出半角标点。
+#[must_use]
+pub fn latin_before_cursor(text: &str, cursor_chars: usize) -> bool {
+    if cursor_chars == 0 {
+        return false; // 行首/空缓冲：没有前一个字符
+    }
+    text.chars()
+        .nth(cursor_chars - 1)
+        .is_some_and(|c| c.is_ascii_alphanumeric())
 }
 
 /// X11 keysym（IBus 的 keyval 即 keysym）
@@ -662,6 +690,44 @@ mod tests {
             Action::Commit { text, .. } => assert_eq!(text, "，"),
             other => panic!("expected commit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn half_width_quotes_after_latin() {
+        let mut st = EngineState::new();
+        let d = source();
+        // 英文/数字后的引号要直引号（写代码），且不扰动开合状态
+        for _ in 0..2 {
+            match st.handle_key(0x22, &d, true) {
+                Action::Commit { text, .. } => assert_eq!(text, "\""),
+                other => panic!("expected commit, got {other:?}"),
+            }
+        }
+        // 中文上下文仍然是智能弯引号，从开引号开始
+        match st.handle_key(0x22, &d, false) {
+            Action::Commit { text, .. } => assert_eq!(text, "“"),
+            other => panic!("expected commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn latin_context_uses_char_offset_not_bytes() {
+        // 回归：cursor 是字符偏移（IBus 语义）。曾经当字节下标用，
+        // “abc你好世界” 的光标（字符 6）会取到字节 5（“你” 的尾字节），
+        // 而光标 4 会取到字节 3 = 'c' → 中文后面误判成半角。
+        let text = "abc你好世界";
+        assert!(!latin_before_cursor(text, 4)); // 前一字符 = 你
+        assert!(!latin_before_cursor(text, 7)); // 末尾，前一字符 = 界
+        assert!(latin_before_cursor(text, 3)); // 前一字符 = c
+        // 边界：行首、空文本、过期（越界）光标 → 保守取全角
+        assert!(!latin_before_cursor(text, 0));
+        assert!(!latin_before_cursor("", 0));
+        assert!(!latin_before_cursor(text, 999));
+        // 半角标点后再打标点 → 回到全角（“只有紧跟英文/数字的第一个标点半角”）
+        assert!(!latin_before_cursor("3,", 2));
+        assert!(latin_before_cursor("3", 1));
+        // 空格不算 latin 上下文（“abc ” + 标点 → 全角）
+        assert!(!latin_before_cursor("abc ", 4));
     }
 
     #[test]
