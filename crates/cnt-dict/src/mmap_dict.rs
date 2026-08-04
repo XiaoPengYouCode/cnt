@@ -174,6 +174,24 @@ impl MmapDict {
 
     // ---- 查询 ----
 
+    /// 键是否存在（键表有序，二分查找）。
+    #[must_use]
+    pub fn contains_key(&self, pinyin: &str) -> bool {
+        let i = self.lower_bound(pinyin.as_bytes());
+        i < self.entry_count && self.str_of_entry(self.entry(i)).ok() == Some(pinyin)
+    }
+
+    /// 是否存在以 `pinyin` 为前缀的键（二分定位后检查下一个键）。
+    #[must_use]
+    pub fn contains_prefix(&self, pinyin: &str) -> bool {
+        let i = self.lower_bound(pinyin.as_bytes());
+        i < self.entry_count
+            && self
+                .str_of_entry(self.entry(i))
+                .ok()
+                .is_some_and(|k| k.starts_with(pinyin))
+    }
+
     /// 精确匹配：返回该拼音的全部候选（文件内已按频率降序）。
     #[must_use]
     pub fn exact(&self, pinyin: &str) -> Vec<Candidate<'_>> {

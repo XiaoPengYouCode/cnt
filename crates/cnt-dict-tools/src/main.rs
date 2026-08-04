@@ -525,7 +525,6 @@ fn cmd_decode(
     pinyins: &[String],
 ) -> CliResult {
     use cnt_decode::Decoder;
-    use cnt_input::CandidateSource;
     use cnt_dict::PinyinModel;
     use cnt_lm::CntLm;
 
@@ -538,8 +537,8 @@ fn cmd_decode(
 
     for pinyin in pinyins {
         println!("{pinyin}:");
-        for (i, cand) in decoder.candidates(pinyin).iter().take(10).enumerate() {
-            println!("  {}. {}", i + 1, cand.text);
+        for (i, (cand, score)) in decoder.candidates_scored(pinyin).iter().take(10).enumerate() {
+            println!("  {}. {}  [{score:.3}]", i + 1, cand.text);
         }
     }
     let _ = std::fs::remove_file(&tmp_user);

@@ -59,6 +59,19 @@ impl PinyinModel {
     ///
     /// 包含用户词库：学过的复合词/新词在「精确」与「前缀」输入阶段都参与排序，
     /// 这样输入到一半（如 chijiuh）时学过的词（持久化）也能出现。
+    /// 词库是否存在该拼音键。
+    #[must_use]
+    pub fn has_key(&self, key: &str) -> bool {
+        self.dict.contains_key(key)
+    }
+
+    /// 词库是否存在以该拼音为前缀的键（多音节链剪枝用：中间前缀可能无独立
+    /// 词条，但更长键存在，如 xuangai → xuangaiji）。
+    #[must_use]
+    pub fn has_key_prefix(&self, key: &str) -> bool {
+        self.dict.contains_prefix(key)
+    }
+
     pub fn query(&self, pinyin: &str) -> Vec<String> {
         let user = self.user.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // word -> (score, 是否精确匹配；精确匹配在平分时优先)

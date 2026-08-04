@@ -29,6 +29,11 @@ const FUZZY_PENALTY: f32 = -1.0;
 const TOP_SENTENCES: usize = 5;
 /// 词不在 LM 中时的默认 unigram log10 概率。
 const UNK_LOGPROB: f32 = -12.0;
+/// 词库有、LM 无的主读音整词基础分（如 信息量）：整词不该因不在 LM
+/// 而拿到 UNK（-12）输给任何整句拼接，给一个与用户词同档的基础分。
+const OOV_BASE: f32 = -5.0;
+/// 补全词惩罚（completions 的延长音节词）：精确读音候选优先于补全候选。
+const COMPLETION_PENALTY: f32 = -0.5;
 /// 次读音/极罕见词的基础分（`freq ≤ SECONDARY_FREQ_CAP`）。
 const SECONDARY_BASE: f32 = -6.0;
 /// 用户词（`freq == 0`，学过的复合词/新词）的基础分。
@@ -120,6 +125,16 @@ impl Decoder {
     /// fastrace 埋点：有 local parent（daemon/bench 设置了 root span）时记录
     /// `candidates` span；无 context 时 `enter_with_local_parent` 为 noop，零开销。
     fn candidates_merged(&self, pinyin: &str) -> Vec<Candidate> {
+        self.candidates_scored(pinyin)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect()
+    }
+
+    /// 完整候选（带分数，诊断/测试用）：decode 整句 + 补全 + 词候选，
+    /// 与用户实际看到的候选完全一致（同一 `CandidateSource` 路径）。
+    #[must_use]
+    pub fn candidates_scored(&self, pinyin: &str) -> Vec<(Candidate, f32)> {
         let _span = Span::enter_with_local_parent("candidates");
         let mut scored: Vec<(Candidate, f32)> = self.decode(pinyin);
         if let Some(lm) = &self.lm {
@@ -127,21 +142,24 @@ impl Decoder {
         }
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         // 去重：同文本保留最高分
-        let mut out: Vec<Candidate> = Vec::new();
+        let mut out: Vec<(Candidate, f32)> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (c, _) in scored {
+        for (c, score) in scored {
             if seen.insert(c.text.clone()) {
-                out.push(c);
+                out.push((c, score));
             }
         }
         out.truncate(20);
         for w in self.model.query(pinyin) {
             if !seen.contains(w.as_str()) {
                 seen.insert(w.clone());
-                out.push(Candidate {
-                    text: w.clone(),
-                    learned: vec![LearnedWord::new(pinyin.to_string(), w)],
-                });
+                out.push((
+                    Candidate {
+                        text: w.clone(),
+                        learned: vec![LearnedWord::new(pinyin.to_string(), w)],
+                    },
+                    f32::NEG_INFINITY, // 词候选无 LM 分，恒排最后
+                ));
             }
         }
         out
@@ -199,8 +217,12 @@ impl Decoder {
         for (base, ext) in completions {
             let key = format!("{base}{ext}");
             for (word, freq) in self.model.ranked_words(&key, 4) {
-                let score = reading_base(&word, freq, lm)
-                    + self.boost(&key, &word);
+                let mut score = reading_base(&word, freq, lm) + self.boost(&key, &word);
+                // 补全词（延长音节）减惩罚：精确读音候选优先于补全候选；
+                // 用户词（freq == 0）不动，保证 持久化 这类仍能压过拼接。
+                if freq != 0 {
+                    score += COMPLETION_PENALTY;
+                }
                 out.push((
                     Candidate {
                         text: word.clone(),
@@ -258,28 +280,35 @@ impl Decoder {
                         &mut next,
                         lm,
                     );
-                    // 多音节词：贪心拼接后续最长音节成完整 key（如 gong-zuo → 工作）
-                    let mut key = String::from(edge.syl);
-                    let mut cur_end = edge.end;
-                    let mut fuzzy = edge.fuzzy;
+                    // 多音节词：沿格的所有路径拼接完整 key（如 xin-xi-liang → 信息量），
+                    // 词库不存在的键剪枝——不依赖格内 edge 顺序（first() 会因音节表
+                    // 顺序拼错路径，漏掉整词）。
+                    let mut chains = vec![(String::from(edge.syl), edge.end, edge.fuzzy)];
                     for _ in 1..MAX_WORD_SYLLABLES {
-                        let Some(next_edge) =
-                            lattice.get(cur_end).and_then(|edges| edges.first())
-                        else {
-                            break;
-                        };
-                        key.push_str(next_edge.syl);
-                        cur_end = next_edge.end;
-                        fuzzy |= next_edge.fuzzy;
-                        let (key_arc, words) = self.cached_words(&mut word_cache, &key, lm);
-                        n_expand += words.len();
-                        self.expand(
-                            h,
-                            &EdgeCtx { end: cur_end, fuzzy, key: key_arc },
-                            words,
-                            &mut next,
-                            lm,
-                        );
+                        let mut next_chains: Vec<(String, usize, bool)> = Vec::new();
+                        for (key, cur_end, fuzzy) in &chains {
+                            let Some(edges) = lattice.get(*cur_end) else { continue };
+                            for next_edge in edges {
+                                let mut k = key.clone();
+                                k.push_str(next_edge.syl);
+                                if !self.model.has_key_prefix(&k) {
+                                    continue; // 词库无以此开头的键：不可能成词，剪枝
+                                }
+                                next_chains.push((k, next_edge.end, *fuzzy || next_edge.fuzzy));
+                            }
+                        }
+                        for (key, end, fuzzy) in &next_chains {
+                            let (key_arc, words) = self.cached_words(&mut word_cache, key, lm);
+                            n_expand += words.len();
+                            self.expand(
+                                h,
+                                &EdgeCtx { end: *end, fuzzy: *fuzzy, key: key_arc },
+                                words,
+                                &mut next,
+                                lm,
+                            );
+                        }
+                        chains = next_chains;
                     }
                 }
             }
@@ -427,8 +456,9 @@ impl Decoder {
                     } else if *freq <= SECONDARY_FREQ_CAP {
                         SECONDARY_BASE
                     } else {
-                        word_idx.map_or(UNK_LOGPROB, |i| {
-                            lm.unigram_by_idx(i).map_or(UNK_LOGPROB, |(p, _)| p)
+                        // 不在 LM 的整词给 OOV_BASE，而非 UNK（否则必然输给整句拼接）
+                        word_idx.map_or(OOV_BASE, |i| {
+                            lm.unigram_by_idx(i).map_or(OOV_BASE, |(p, _)| p)
                         })
                     }
                 }
@@ -466,7 +496,7 @@ fn reading_base(word: &str, freq: u32, lm: &CntLm) -> f32 {
     } else if freq <= SECONDARY_FREQ_CAP {
         SECONDARY_BASE
     } else {
-        unigram_score(lm, word)
+        lm.unigram(word).map_or(OOV_BASE, |(p, _)| p)
     }
 }
 
@@ -474,11 +504,6 @@ impl CandidateSource for Decoder {
     fn candidates(&self, pinyin: &str) -> Vec<Candidate> {
         self.candidates_merged(pinyin)
     }
-}
-
-/// 词的 unigram 分（首词用；`completions` 的低频路径）。
-fn unigram_score(lm: &CntLm, word: &str) -> f32 {
-    lm.unigram(word).map_or(UNK_LOGPROB, |(p, _)| p)
 }
 
 /// 把学习段拼成候选文本。
