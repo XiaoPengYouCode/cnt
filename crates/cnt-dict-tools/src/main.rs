@@ -650,6 +650,26 @@ fn ns_to_us(ns: u64) -> f64 {
 }
 
 /// 性能基准：对一组常见拼音反复解码，报告每次候选生成的延迟统计。
+/// 冷启动延迟：每次解码前清空词键缓存，返回排序后的耗时样本。
+fn measure_cold(
+    decoder: &cnt_decode::Decoder,
+    samples: &[&str],
+    rounds: usize,
+) -> Vec<std::time::Duration> {
+    use cnt_input::CandidateSource;
+    let mut out = Vec::with_capacity(samples.len() * rounds);
+    for _ in 0..rounds {
+        for s in samples {
+            decoder.clear_cache();
+            let t = std::time::Instant::now();
+            let _ = decoder.candidates(s);
+            out.push(t.elapsed());
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) -> CliResult {
     use cnt_decode::Decoder;
     use cnt_input::CandidateSource;
@@ -685,6 +705,11 @@ fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) 
         }
     }
 
+    // 冷启动延迟：每次解码前清空词键缓存（首次进入某个输入上下文的延迟）。
+    // 与「热」数值一起报，避免缓存把基准做得比真实体验好看。
+    // 冷样本方差大（依赖页缓存/分支状态），多跑几轮取分位数才稳
+    let cold = measure_cold(&decoder, &samples, 10);
+
     let mut latencies = Vec::with_capacity(samples.len() * n);
     let mut total_keys = 0usize;
     for round in 0..n {
@@ -717,7 +742,14 @@ fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) 
         "{} 次解码（{} 个样例 × {n} 轮），共 {total_keys} 个候选",
         count, samples.len()
     );
-    println!("平均 {avg:?}  中位 {p50:?}  90% {p90:?}  99% {p99:?}  最差 {max:?}");
+    println!("热（词键缓存命中，= 连续打字的第 2 键起）：");
+    println!("  平均 {avg:?}  中位 {p50:?}  90% {p90:?}  99% {p99:?}  最差 {max:?}");
+    let cold_avg = cold.iter().sum::<std::time::Duration>() / u32::try_from(cold.len()).unwrap();
+    println!(
+        "冷（每次清空词键缓存，= 首次进入该输入上下文）：\n  平均 {cold_avg:?}  中位 {:?}  最差 {:?}",
+        cold[cold.len() / 2],
+        cold[cold.len() - 1]
+    );
 
     // fastrace 阶段分布表（每样例第 1 轮，即 18 棵树）
     {

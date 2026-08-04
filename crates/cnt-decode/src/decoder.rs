@@ -98,10 +98,92 @@ const USER_BOOST_LOG: f32 = 0.2;
 /// 让 32 次选择的 boost 不至于压过整个分数空间）。
 const USER_BOOST_CAP: u32 = 10;
 
-/// 单个 key 的缓存值：key 的 Arc + 候选词列表（词 Arc、词频、LM 词表下标）
-type CachedWords = (Arc<str>, Vec<(Arc<str>, u32, Option<u32>)>);
-/// 候选词缓存：`key` → `CachedWords`
-type WordCache = std::collections::HashMap<String, CachedWords>;
+/// 一个词键下的候选词。
+///
+/// 与假设无关的量全部在枚举阶段算好（句首基础分、用户调频、LM 下标），
+/// beam 展开时只做加法 + 一次 bigram 查询。
+struct WordCand {
+    word: Arc<str>,
+    /// LM 词表下标（热路径打分零字符串查找）
+    lm_id: Option<u32>,
+    /// 作为句首词的基础分（用户词/次读音/OOV/LM unigram）
+    first_base: f32,
+    /// 用户调频加成：每个 (词键, 词) 只查一次用户库
+    /// （此前每次展开都要抢一次用户库的锁 + 两次哈希查找）
+    boost: f32,
+}
+
+/// 某个位置上可展开的一个词键（单音节或多音节整词）及其候选词。
+///
+/// 词键只取决于「位置 + 音节格」，与假设无关，所以每个位置只枚举一次：
+/// 此前每条假设都要重做一遍字符串拼接与词库前缀查找，BEAM=8 就是 8 倍冗余。
+struct PosKey {
+    end: usize,
+    /// 该词键路径上的模糊代价等级（多音节取最大）
+    cost: u8,
+    /// 该词键路径上的模糊边条数（整词可能连错两个音：zhuchen → 组成）
+    fuzzy_edges: u8,
+    key: Arc<str>,
+    /// 本次输入实际使用的候选词数（缓存按最宽上限存）
+    limit: usize,
+    words: Arc<[WordCand]>,
+}
+
+/// beam 路径的 arena 节点：假设只存父节点下标。
+///
+/// 此前每条假设持有 `Vec<(Arc, Arc)> segments`，每次展开都要克隆整个 Vec
+/// （一次堆分配 + 全部 Arc 引用计数），而每次解码有数百次展开。
+struct Node {
+    parent: u32,
+    key: Arc<str>,
+    word: Arc<str>,
+}
+
+/// 跨按键的词键缓存。
+///
+/// 打字是**增量**的：敲 `womenzaigongzuo` 的每一个字母都会把整个前缀重新解码一遍，
+/// 同一批词键（wo/women/zai/gong/gongzuo…）会被反复查词库、反复分配 `Arc<str>`。
+/// 缓存按词键存两样东西：候选词表、以及「词库里有没有以它为前缀的键」（链剪枝用）。
+///
+/// 缓存条目记下「按多宽的上限算过」：请求更窄时直接 `take`（`ranked_words` 是
+/// 先定序再截断，前缀等价），请求更宽时才重算 —— 长输入不必为单音节档的 20 个
+/// 候选付代价。
+#[derive(Default)]
+struct KeyCache {
+    words: std::collections::HashMap<Box<str>, (usize, Arc<[WordCand]>)>,
+    prefix: std::collections::HashMap<Box<str>, bool>,
+}
+
+impl KeyCache {
+    /// 整体失效（用户调频/新词改变了候选词表与加成分）。
+    fn clear(&mut self) {
+        self.words.clear();
+        self.prefix.clear();
+    }
+}
+
+/// 缓存条目上限：超过就整体清空（键的复用是局部的，简单清空比 LRU 划算）。
+const KEY_CACHE_CAP: usize = 4096;
+
+/// `Hyp::node` 的空值（尚未选任何词）。
+const NO_NODE: u32 = u32::MAX;
+
+/// 上一个词的状态（打分用）：句首 vs 有前词（可能不在 LM 词表）。
+#[derive(Clone, Copy)]
+enum Prev {
+    /// 句首：用读音感知的基础分
+    Start,
+    /// 有前词，携带其 LM 词表下标（`None` = 前词不在词表，条件概率退化为 unigram）
+    Word(Option<u32>),
+}
+
+/// 一条待收录的词键路径（参数聚合，避免 `push_key` 签名过长）。
+struct KeyPath<'a> {
+    key: &'a str,
+    end: usize,
+    cost: u8,
+    fuzzy_edges: u8,
+}
 
 /// 候选规模上限：按输入音节数自适应。
 ///
@@ -155,31 +237,25 @@ struct Scored {
     completion: bool,
 }
 
-/// 一条格的展开上下文（参数聚合，避免 expand 签名过长）。
-struct EdgeCtx<'a> {
-    end: usize,
-    /// 该词键路径上的模糊代价等级（多音节取最大）
-    cost: u8,
-    /// 该词键路径上的模糊边条数（多音节整词可能连续错两个音：zhuchen → 组成）
-    fuzzy_edges: u8,
-    key: &'a Arc<str>,
-}
-
-/// beam search 中的一条部分假设。
+/// beam search 中的一条部分假设（`Copy`，克隆零成本、零分配）。
 ///
-/// `segments`/`last` 用 `Arc<str>`：expand 时克隆只增引用计数、不拷贝堆数据
-/// （原先 `Vec<LearnedWord>` + `String` 每次 expand 要 10+ 次堆分配，
-/// 平均每 decode 451 次 expand —— 这是 beam 循环慢的主因）。
-#[derive(Clone)]
+/// 路径不存在假设里，而是 arena 的父指针链（`node`）——展开时只拷贝几十字节。
+#[derive(Clone, Copy)]
 struct Hyp {
     pos: usize,
-    /// 上一个词的 (词, LM 词表下标)；下标用于快速 bigram 查询
-    last: Option<(Arc<str>, Option<u32>)>,
+    /// 上一个词的状态（句首 / 前词的 LM 下标）
+    prev: Prev,
     score: f32,
     /// 已走过的模糊边数（用于超线性叠加惩罚与「不得占 #1」约束）
     fuzzy_edges: u8,
-    /// 已选的学习段（拼音, 词），Arc 克隆廉价
-    segments: Vec<(Arc<str>, Arc<str>)>,
+    /// arena 中的路径节点下标（`NO_NODE` = 空路径）
+    node: u32,
+}
+
+/// beam 搜索结果：完整假设 + 复原路径所需的 arena。
+struct BeamResult {
+    hyps: Vec<Hyp>,
+    arena: Vec<Node>,
 }
 
 /// 整句解码器：词库 + 语言模型（[`NgramLm`] 端口）+ 音节表 + 可选重排器。
@@ -196,6 +272,8 @@ pub struct Decoder<L: NgramLm = CntLm> {
     rescorer: Option<Arc<dyn Rescorer>>,
     /// 重排触发/融合策略。
     policy: RescorePolicy,
+    /// 跨按键的词键缓存（用户调频变化时整体失效）。
+    keys: std::sync::Mutex<KeyCache>,
 }
 
 impl<L: NgramLm> Decoder<L> {
@@ -209,6 +287,7 @@ impl<L: NgramLm> Decoder<L> {
             fuzzy,
             rescorer: None,
             policy: RescorePolicy::default(),
+            keys: std::sync::Mutex::new(KeyCache::default()),
         }
     }
 
@@ -224,7 +303,10 @@ impl<L: NgramLm> Decoder<L> {
     }
 
     /// 提交学习数据：逐段调频 + 相邻两段拼合成新词（郑+爽 → zhengshuang/郑爽）。
+    ///
+    /// 会清空词键缓存：调频/新词改变了候选词表与加成分。
     pub fn learn(&self, learned: &[LearnedWord]) {
+        self.lock_keys().clear();
         for seg in learned {
             self.model.bump(&seg.pinyin, &seg.word);
         }
@@ -236,6 +318,14 @@ impl<L: NgramLm> Decoder<L> {
                 self.model.bump(&key, &word);
             }
         }
+    }
+
+    /// 清空词键缓存。
+    ///
+    /// 正常使用不需要调用（`learn` 会自动失效）；给内存压力回收与
+    /// 「冷启动延迟」基准测量用。
+    pub fn clear_cache(&self) {
+        self.lock_keys().clear();
     }
 
     /// 持久化用户数据。
@@ -328,8 +418,8 @@ impl<L: NgramLm> Decoder<L> {
                 );
                 Scored {
                     cand: Candidate {
-                        text: word.clone(),
-                        learned: vec![LearnedWord::new(pinyin.to_string(), word)],
+                        text: word.to_string(),
+                        learned: vec![LearnedWord::new(pinyin.to_string(), word.into_owned())],
                     },
                     score,
                     fuzzy_edges: 0, // 整键精确匹配
@@ -399,8 +489,8 @@ impl<L: NgramLm> Decoder<L> {
                 }
                 out.push(Scored {
                     cand: Candidate {
-                        text: word.clone(),
-                        learned: vec![LearnedWord::new(key.clone(), word)],
+                        text: word.to_string(),
+                        learned: vec![LearnedWord::new(key.clone(), word.into_owned())],
                     },
                     score,
                     fuzzy_edges: 0,
@@ -414,7 +504,10 @@ impl<L: NgramLm> Decoder<L> {
     }
 
     /// beam search 主循环：在音节格上反复展开 + 束剪枝，返回完整句子假设
-    /// （按分数降序、已去重截断）。
+    /// （按分数降序、已去重截断）与复原路径用的 arena。
+    ///
+    /// 每个位置的可用词键只枚举一次（`PosKey`），假设本身是 `Copy` 的小结构，
+    /// 路径靠 arena 父指针表示 —— 展开阶段没有任何堆分配。
     ///
     /// 展开次数以 fastrace 事件（`expand`）记录在 `beam` span 上，供阶段
     /// 工作量分解（无 context 时 noop 零开销）。
@@ -425,100 +518,60 @@ impl<L: NgramLm> Decoder<L> {
         reachable: &[bool],
         lm: &L,
         limits: Limits,
-    ) -> Vec<Hyp> {
+    ) -> BeamResult {
+        let mut arena: Vec<Node> = Vec::new();
+        // 每个位置的词键（懒枚举：只有 beam 真的走到的位置才算）
+        let mut keys_at: Vec<Option<Vec<PosKey>>> = (0..lattice.len()).map(|_| None).collect();
         let mut hyps = vec![Hyp {
             pos: 0,
-            last: None,
+            prev: Prev::Start,
             score: 0.0,
             fuzzy_edges: 0,
-            segments: Vec::new(),
+            node: NO_NODE,
         }];
         // 完整句子：已消费全部输入的假设直接进 done（如 打字/时候/莫名其妙 在
         // 第一轮就完整），它们是与「半截探索」并列的答案，不能被 beam 剪掉。
         let mut done: Vec<Hyp> = Vec::new();
-        // 按 key 缓存候选词（decode 内同一 key 会被多条路径重复查询）
-        let mut word_cache: WordCache = std::collections::HashMap::new();
+
+        // 前词 → bigram 行的小缓存（每轮存活假设 ≤ BEAM 条，线性扫描最快）
+        let mut rows: Vec<(u32, (u32, u32))> = Vec::with_capacity(BEAM * 2);
 
         let _beam_span = Span::enter_with_local_parent("beam");
         let mut n_expand = 0usize;
         for _ in 0..pinyin.len() {
-
+            // 先把这一轮要用到的位置的词键补齐，再进展开循环
+            // （避免边遍历假设边改 keys_at 的借用冲突）
+            for pos in hyps.iter().map(|h| h.pos).filter(|p| *p < lattice.len()) {
+                if keys_at[pos].is_none() {
+                    keys_at[pos] = Some(self.keys_at(lattice, pos, limits));
+                }
+            }
             let mut next: Vec<Hyp> = Vec::new();
             for h in &hyps {
                 if h.pos >= lattice.len() {
-                    done.push(h.clone());
+                    done.push(*h);
                     continue;
                 }
-                for edge in &lattice[h.pos] {
-                    // 单音节词
-                    let (key_arc, words) =
-                        self.cached_words(&mut word_cache, edge.syl, lm, limits);
-                    n_expand += words.len();
-                    self.expand(
-                        h,
-                        &EdgeCtx {
-                            end: edge.end,
-                            cost: edge.cost,
-                            fuzzy_edges: u8::from(edge.is_fuzzy()),
-                            key: key_arc,
-                        },
-                        words,
-                        &mut next,
-                        lm,
-                        limits,
-                    );
-                    // 多音节词：沿格的所有路径拼接完整 key（如 xin-xi-liang → 信息量），
-                    // 词库不存在的键剪枝——不依赖格内 edge 顺序（first() 会因音节表
-                    // 顺序拼错路径，漏掉整词）。
-                    let mut chains = vec![(
-                        String::from(edge.syl),
-                        edge.end,
-                        edge.cost,
-                        u8::from(edge.is_fuzzy()),
-                    )];
-                    for _ in 1..MAX_WORD_SYLLABLES {
-                        let mut next_chains: Vec<(String, usize, u8, u8)> = Vec::new();
-                        for (key, cur_end, cost, fuzzy_edges) in &chains {
-                            let Some(edges) = lattice.get(*cur_end) else { continue };
-                            for next_edge in edges {
-                                let mut k = key.clone();
-                                k.push_str(next_edge.syl);
-                                if !self.model.has_key_prefix(&k) {
-                                    continue; // 词库无以此开头的键：不可能成词，剪枝
-                                }
-                                next_chains.push((
-                                    k,
-                                    next_edge.end,
-                                    (*cost).max(next_edge.cost),
-                                    fuzzy_edges.saturating_add(u8::from(next_edge.is_fuzzy())),
-                                ));
-                            }
+                let Some(keys) = keys_at[h.pos].as_ref() else { continue };
+                // 前词的 bigram 行：只有活下来的假设（≤BEAM 条）才定位，且同一前词
+                // 复用 —— 定位一次行 = 两次全表二分，绝不能放到「每次展开」里。
+                let row = match h.prev {
+                    Prev::Word(Some(id)) => {
+                        if let Some((_, r)) = rows.iter().find(|(w, _)| *w == id) {
+                            *r
+                        } else {
+                            let r = lm.bigram_row(id);
+                            rows.push((id, r));
+                            r
                         }
-                        for (key, end, cost, fuzzy_edges) in &next_chains {
-                            let (key_arc, words) =
-                                self.cached_words(&mut word_cache, key, lm, limits);
-                            n_expand += words.len();
-                            self.expand(
-                                h,
-                                &EdgeCtx {
-                                    end: *end,
-                                    cost: *cost,
-                                    fuzzy_edges: *fuzzy_edges,
-                                    key: key_arc,
-                                },
-                                words,
-                                &mut next,
-                                lm,
-                                limits,
-                            );
-                        }
-                        chains = next_chains;
                     }
+                    _ => (0, 0),
+                };
+                for pk in keys {
+                    n_expand += pk.limit;
+                    expand(h, row, pk, &mut next, &mut arena, lm, limits);
                 }
             }
-            // 束剪枝：先丢死路（in-place retain），再 in-place 分区为
-            // 「部分假设（前）」与「完整假设（后）」，零分配（此前 partition()
-            // 每轮新建 2 个 Vec）。
             // 束剪枝：先丢死路 + 分离完整假设，再对部分假设取前 BEAM。
             // 用 partition() 保持与原实现一致的假设顺序：select_nth_unstable 是
             // 不稳定选择，若 next 顺序变化，beam top-8 的选择会变（sihou 的
@@ -542,9 +595,155 @@ impl<L: NgramLm> Decoder<L> {
         done.sort_by(|a, b| b.score.total_cmp(&a.score));
         // 去重：同一句文本可能来自「多音节词」和「单字拼合」两条路径，保留最高分
         let mut seen = std::collections::HashSet::new();
-        done.retain(|h| seen.insert(join_segments(&h.segments)));
+        done.retain(|h| seen.insert(sentence_of(&arena, h.node)));
         done.truncate(limits.top_sentences);
-        done
+        BeamResult { hyps: done, arena }
+    }
+
+    /// 枚举某个位置上所有可展开的词键（单音节 + 多音节整词）及其候选词。
+    ///
+    /// 与假设无关，因此每个位置只调一次；词库前缀查询用于剪掉不可能成词的链。
+    fn keys_at(&self, lattice: &[Vec<SyllableEdge>], pos: usize, limits: Limits) -> Vec<PosKey> {
+        let _span = Span::enter_with_local_parent("keys_at");
+        let mut out: Vec<PosKey> = Vec::new();
+        // 链键拼接的复用缓冲：只有确认成键（前缀命中）时才真的分配 String
+        let mut buf = String::new();
+        for edge in &lattice[pos] {
+            self.push_key(
+                &mut out,
+                &KeyPath {
+                    key: edge.syl,
+                    end: edge.end,
+                    cost: edge.cost,
+                    fuzzy_edges: u8::from(edge.is_fuzzy()),
+                },
+                limits,
+            );
+            // 多音节词：沿格的所有路径拼接完整 key（如 xin-xi-liang → 信息量），
+            // 词库不存在的键剪枝——不依赖格内 edge 顺序（first() 会因音节表
+            // 顺序拼错路径，漏掉整词）。
+            let mut chains: Vec<(String, usize, u8, u8)> = vec![(
+                String::from(edge.syl),
+                edge.end,
+                edge.cost,
+                u8::from(edge.is_fuzzy()),
+            )];
+            for _ in 1..MAX_WORD_SYLLABLES {
+                let mut next_chains: Vec<(String, usize, u8, u8)> = Vec::new();
+                for (key, cur_end, cost, fuzzy_edges) in &chains {
+                    let Some(edges) = lattice.get(*cur_end) else { continue };
+                    for next_edge in edges {
+                        buf.clear();
+                        buf.push_str(key);
+                        buf.push_str(next_edge.syl);
+                        if !self.has_key_prefix(&buf) {
+                            continue; // 词库无以此开头的键：不可能成词，剪枝
+                        }
+                        next_chains.push((
+                            buf.clone(),
+                            next_edge.end,
+                            (*cost).max(next_edge.cost),
+                            fuzzy_edges.saturating_add(u8::from(next_edge.is_fuzzy())),
+                        ));
+                    }
+                }
+                for (key, end, cost, fuzzy_edges) in &next_chains {
+                    self.push_key(
+                        &mut out,
+                        &KeyPath {
+                            key,
+                            end: *end,
+                            cost: *cost,
+                            fuzzy_edges: *fuzzy_edges,
+                        },
+                        limits,
+                    );
+                }
+                chains = next_chains;
+            }
+        }
+        out
+    }
+
+    /// 锁词键缓存（毒锁恢复：缓存是纯派生数据，锁中毒不该让输入法崩）。
+    fn lock_keys(&self) -> std::sync::MutexGuard<'_, KeyCache> {
+        self.keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 词键的候选词（缓存命中则零查询零分配）。
+    fn words_of(&self, key: &str, limit: usize) -> Arc<[WordCand]> {
+        if let Some((cached_limit, hit)) = self.lock_keys().words.get(key)
+            && (*cached_limit >= limit || hit.len() < *cached_limit)
+        {
+            return hit.clone(); // 够宽，或词库本身就没那么多词
+        }
+        let words: Arc<[WordCand]> = self
+            .model
+            .ranked_words(key, limit)
+            .into_iter()
+            .map(|(word, freq)| {
+                let lm_id = self.lm.as_ref().and_then(|lm| lm.word_index(&word));
+                WordCand {
+                    first_base: self
+                        .lm
+                        .as_ref()
+                        .map_or(OOV_BASE, |lm| first_word_base(freq, lm_id, lm.as_ref())),
+                    boost: self.boost(key, &word),
+                    word: Arc::from(word),
+                    lm_id,
+                }
+            })
+            .collect();
+        let mut cache = self.lock_keys();
+        if cache.words.len() >= KEY_CACHE_CAP {
+            cache.words.clear();
+        }
+        cache.words.insert(Box::from(key), (limit, words.clone()));
+        words
+    }
+
+    /// 词库里是否存在以 `key` 开头的词键（多音节链剪枝，结果缓存）。
+    fn has_key_prefix(&self, key: &str) -> bool {
+        if let Some(hit) = self.lock_keys().prefix.get(key) {
+            return *hit;
+        }
+        let hit = self.model.has_key_prefix(key);
+        let mut cache = self.lock_keys();
+        if cache.prefix.len() >= KEY_CACHE_CAP {
+            cache.prefix.clear();
+        }
+        cache.prefix.insert(Box::from(key), hit);
+        hit
+    }
+
+    /// 把一个词键的候选词收进枚举结果（无候选词的键直接丢弃）。
+    ///
+    /// 同一位置的同一词键可能由多条边得到（多个模糊变体归一到同一标准音节），
+    /// 只保留代价最低的一份：代价低 = 分高，此前重复展开也是靠最终去重留高分。
+    fn push_key(&self, out: &mut Vec<PosKey>, path: &KeyPath<'_>, limits: Limits) {
+        let KeyPath { key, end, cost, fuzzy_edges } = *path;
+        if let Some(prev) = out.iter_mut().find(|p| p.end == end && &*p.key == key) {
+            if cost < prev.cost {
+                prev.cost = cost;
+                prev.fuzzy_edges = fuzzy_edges;
+            }
+            return;
+        }
+        let words = self.words_of(key, limits.words_per_key);
+        if words.is_empty() {
+            return;
+        }
+        out.push(PosKey {
+            end,
+            cost,
+            fuzzy_edges,
+            key: Arc::from(key),
+            // 缓存可能比本次需要的更宽（另一档输入填的），只取前 limit 个
+            limit: limits.words_per_key.min(words.len()),
+            words,
+        });
     }
 
     /// beam search 解码：Top-K 句子候选（带分数）。
@@ -578,18 +777,18 @@ impl<L: NgramLm> Decoder<L> {
         // 单音节 li 与七字整句用同一套上限是错的（前者要宽、后者要省）。
         let limits = Limits::for_syllables(min_syllables(&lattice));
 
-        self.beam_search(pinyin, &lattice, &reachable, lm, limits)
-            .into_iter()
+        let BeamResult { hyps, arena } = self.beam_search(pinyin, &lattice, &reachable, lm, limits);
+        hyps.into_iter()
             .map(|h| {
-                let learned = h
-                    .segments
-                    .iter()
-                    .map(|(p, w)| LearnedWord::new(p.to_string(), w.to_string()))
-                    .collect();
+                // 路径只在这里（top-K 条）复原：热路径不碰字符串
+                let segments = segments_of(&arena, h.node);
                 Scored {
                     cand: Candidate {
-                        text: join_segments(&h.segments),
-                        learned,
+                        text: segments.iter().map(|(_, w)| &***w).collect(),
+                        learned: segments
+                            .iter()
+                            .map(|(k, w)| LearnedWord::new(k.to_string(), w.to_string()))
+                            .collect(),
                     },
                     score: h.score,
                     fuzzy_edges: h.fuzzy_edges,
@@ -597,91 +796,6 @@ impl<L: NgramLm> Decoder<L> {
                 }
             })
             .collect()
-    }
-
-    /// 按 key 缓存候选词（decode 内同一 key 会被多条路径重复查询，避免重复计算）。
-    fn cached_words<'a>(
-        &self,
-        cache: &'a mut WordCache,
-        key: &str,
-        lm: &L,
-        limits: Limits,
-    ) -> &'a CachedWords {
-        if !cache.contains_key(key) {
-            let words = self.words_for(key, limits.words_per_key);
-            let arcs: Vec<(Arc<str>, u32, Option<u32>)> = words
-                .into_iter()
-                .map(|(w, f)| {
-                    let idx = lm.word_index(&w);
-                    (Arc::<str>::from(w), f, idx)
-                })
-                .collect();
-            cache.insert(key.to_string(), (Arc::<str>::from(key), arcs));
-        }
-        &cache[key]
-    }
-
-    /// 把一个 (结束位置, 词键, 是否模糊) 的候选词展开进 beam。
-    /// `ctx.key`/`words` 来自缓存，`segments` 克隆只增 Arc 引用计数，零堆拷贝。
-    fn expand(
-        &self,
-        h: &Hyp,
-        ctx: &EdgeCtx<'_>,
-        words: &[(Arc<str>, u32, Option<u32>)],
-        next: &mut Vec<Hyp>,
-        lm: &L,
-        limits: Limits,
-    ) {
-        let base_penalty = FUZZY_PENALTY[usize::from(ctx.cost.min(MAX_FUZZY_COST))];
-        // 超线性叠加：本词贡献 ctx.fuzzy_edges 条模糊边，之前已有 h.fuzzy_edges 条，
-        // 除第 1 条外每条额外扣 FUZZY_STACK_PENALTY（整词内部连错两音同样算叠加：
-        // zhuchen → 组成 是 zh/z + en/eng 两条边，不能只按最大 cost 扣一次）。
-        let penalty = if ctx.fuzzy_edges > 0 {
-            let stacked = h
-                .fuzzy_edges
-                .saturating_add(ctx.fuzzy_edges)
-                .saturating_sub(1);
-            FUZZY_STACK_PENALTY.mul_add(-f32::from(stacked), base_penalty) - limits.fuzzy_extra
-        } else {
-            0.0
-        };
-        for (word_arc, freq, word_idx) in words {
-            let mut nh = h.clone();
-            // ARPA bigram 是条件概率 log P(w2|w1)：首词用读音感知的基础分，
-            // 后续词用条件概率（bigram 或 Katz backoff），用户调频加成始终加。
-            // 模糊读音加惩罚：回退读音不能与精确读音平等竞争（否则 dazi 会出「他只」）。
-            // 打分全程用缓存的 LM 词表下标（unigram_by_idx/bigram_by_idx），
-            // 热路径零字符串查找。
-            let boost = self.boost(ctx.key, word_arc);
-            let step = if let Some((_, prev_idx)) = h.last.as_ref() {
-                // 续接：条件概率（bigram，缺失走 Katz backoff）——回退语义由
-                // NgramLm::conditional 统一定义，属于 n-gram 的领域规则。
-                lm.conditional(*prev_idx, *word_idx, UNK_LOGPROB)
-            } else if *freq == 0 {
-                // 首词：用户词/次读音走常量；主读音用下标 unigram（不在词表 → OOV）
-                USER_WORD_BASE
-            } else if *freq <= SECONDARY_FREQ_CAP {
-                SECONDARY_BASE
-            } else {
-                // 不在 LM 的整词按词频给 OOV 分，而非 UNK（否则必然输给整句拼接）
-                word_idx.map_or_else(
-                    || oov_score(*freq),
-                    |i| lm.unigram_by_id(i).map_or_else(|| oov_score(*freq), |(p, _)| p),
-                )
-            };
-            let step = step + boost + penalty;
-            nh.score += step;
-            nh.pos = ctx.end;
-            nh.fuzzy_edges = h.fuzzy_edges.saturating_add(ctx.fuzzy_edges);
-            nh.last = Some((word_arc.clone(), *word_idx));
-            nh.segments.push((ctx.key.clone(), word_arc.clone()));
-            next.push(nh);
-        }
-    }
-
-    /// 某音节/词键的高频候选词（带词库频率；领域规则在 `PinyinModel::ranked_words` 单点定义）。
-    fn words_for(&self, key: &str, limit: usize) -> Vec<(String, u32)> {
-        self.model.ranked_words(key, limit)
     }
 
     /// 用户调频加成：每选一次候选的 log10 权重（封顶 `USER_BOOST_CAP` 次）。
@@ -761,13 +875,94 @@ fn demote_stacked_fuzzy(out: &mut [Scored]) {
     }
 }
 
-/// 把学习段拼成候选文本。
-fn join_segments(segments: &[(Arc<str>, Arc<str>)]) -> String {
-    let mut text = String::new();
-    for (_, word) in segments {
-        text.push_str(word);
+/// 把一个词键的候选词展开进 beam。
+///
+/// 热路径：每次展开只做「加法 + 一次 bigram 查询 + 一次 arena push」，
+/// 没有堆分配、没有字符串、没有锁（这些都在 `PosKey` 枚举阶段做完了）。
+fn expand<L: NgramLm>(
+    h: &Hyp,
+    row: (u32, u32),
+    pk: &PosKey,
+    next: &mut Vec<Hyp>,
+    arena: &mut Vec<Node>,
+    lm: &L,
+    limits: Limits,
+) {
+    let base_penalty = FUZZY_PENALTY[usize::from(pk.cost.min(MAX_FUZZY_COST))];
+    // 超线性叠加：本词贡献 pk.fuzzy_edges 条模糊边，之前已有 h.fuzzy_edges 条，
+    // 除第 1 条外每条额外扣 FUZZY_STACK_PENALTY（整词内部连错两音同样算叠加：
+    // zhuchen → 组成 是 zh/z + en/eng 两条边，不能只按最大 cost 扣一次）。
+    let penalty = if pk.fuzzy_edges > 0 {
+        let stacked = h
+            .fuzzy_edges
+            .saturating_add(pk.fuzzy_edges)
+            .saturating_sub(1);
+        FUZZY_STACK_PENALTY.mul_add(-f32::from(stacked), base_penalty) - limits.fuzzy_extra
+    } else {
+        0.0
+    };
+    let fuzzy_edges = h.fuzzy_edges.saturating_add(pk.fuzzy_edges);
+    for w in pk.words.iter().take(pk.limit) {
+        // 句首用读音感知的基础分（枚举期算好），续接用条件概率
+        // （bigram，缺失走 Katz backoff —— 回退语义由 NgramLm::conditional 定义）。
+        // 续接：在前词的 bigram 行内查条件概率（行已在上一步定位好，见 Hyp::row）；
+        // 缺失走 Katz backoff —— 回退语义由 NgramLm 端口统一定义。
+        let step = match h.prev {
+            Prev::Word(prev_id) => lm.conditional_in_row(row, prev_id, w.lm_id, UNK_LOGPROB),
+            Prev::Start => w.first_base,
+        } + w.boost
+            + penalty;
+        arena.push(Node {
+            parent: h.node,
+            key: pk.key.clone(),
+            word: w.word.clone(),
+        });
+        next.push(Hyp {
+            pos: pk.end,
+            prev: Prev::Word(w.lm_id),
+            score: h.score + step,
+            fuzzy_edges,
+            node: u32::try_from(arena.len() - 1).unwrap_or(NO_NODE),
+        });
     }
-    text
+}
+
+/// 句首词的读音感知基础分（枚举期算一次，见 `reading_base` 的同款规则）。
+fn first_word_base<L: NgramLm>(freq: u32, lm_id: Option<u32>, lm: &L) -> f32 {
+    if freq == 0 {
+        USER_WORD_BASE // 用户词：学过的词应能浮现
+    } else if freq <= SECONDARY_FREQ_CAP {
+        SECONDARY_BASE // 次读音：多音字不串频
+    } else {
+        // 不在 LM 的整词按词频给 OOV 分，而非 UNK（否则必然输给整句拼接）
+        lm_id.map_or_else(
+            || oov_score(freq),
+            |i| lm.unigram_by_id(i).map_or_else(|| oov_score(freq), |(p, _)| p),
+        )
+    }
+}
+
+/// 沿 arena 父指针复原路径（拼音键, 词），按输入顺序返回。
+fn segments_of(arena: &[Node], node: u32) -> Vec<(&Arc<str>, &Arc<str>)> {
+    let mut out = Vec::new();
+    let mut cur = node;
+    while let Some(n) = arena.get(cur as usize) {
+        out.push((&n.key, &n.word));
+        if n.parent == NO_NODE {
+            break;
+        }
+        cur = n.parent;
+    }
+    out.reverse();
+    out
+}
+
+/// 复原整句文本（去重用）。
+fn sentence_of(arena: &[Node], node: u32) -> String {
+    segments_of(arena, node)
+        .into_iter()
+        .map(|(_, w)| &**w)
+        .collect()
 }
 
 #[cfg(test)]

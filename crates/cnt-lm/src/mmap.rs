@@ -178,30 +178,78 @@ impl CntLm {
     /// 仅当 mmap 内部损坏导致大下标越界切片时（打开时已校验范围，不可能）。
     #[must_use]
     pub fn bigram_by_idx(&self, w1: u32, w2: u32) -> Option<f32> {
+        let i = self.bigram_lower_bound(w1, w2);
+        if i >= self.bigram_count {
+            return None;
+        }
+        let e = self.bigram_entry(i);
+        ((e.w1, e.w2) == (w1, w2)).then_some(e.logprob)
+    }
+
+    /// 前词 `w1` 的 bigram 行：`(起始下标, 结束下标)`（左闭右开）。
+    ///
+    /// bigram 表按 `(w1, w2)` 排序，所以同一前词的后继是连续区间。beam 展开时
+    /// 一条假设要对同一前词查几十个后继，先定位一次行、再在行内二分，能把
+    /// 「几十次跨 60MB mmap 的随机二分」压成「一次定位 + 行内小范围二分」。
+    #[must_use]
+    pub fn bigram_row(&self, w1: u32) -> (u32, u32) {
+        let lo = self.bigram_lower_bound(w1, 0);
+        let hi = self.bigram_lower_bound(w1.saturating_add(1), 0);
+        (
+            u32::try_from(lo).unwrap_or(u32::MAX),
+            u32::try_from(hi).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// 在 bigram 行内查 `log P(w2 | w1)`（行由 [`Self::bigram_row`] 给出）。
+    #[must_use]
+    pub fn bigram_in_row(&self, row: (u32, u32), w2: u32) -> Option<f32> {
+        let (lo, hi) = (row.0 as usize, row.1 as usize);
+        if lo >= hi || hi > self.bigram_count {
+            return None;
+        }
+        let mut left = lo;
+        let mut right = hi;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let e = self.bigram_entry(mid);
+            if e.w2 < w2 {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        if left >= hi {
+            return None;
+        }
+        let e = self.bigram_entry(left);
+        (e.w2 == w2).then_some(e.logprob)
+    }
+
+    /// bigram 表内 `(w1, w2)` 的 lower bound 下标。
+    fn bigram_lower_bound(&self, w1: u32, w2: u32) -> usize {
         let mut lo = 0usize;
         let mut hi = self.bigram_count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let off = self.bigram_off + mid * BIGRAM_ENTRY_SIZE;
-            let b = &self.mmap[off..off + BIGRAM_ENTRY_SIZE];
-            let e = BigramEntry::read(b).expect("bigram range validated at open");
+            let e = self.bigram_entry(mid);
             if (e.w1, e.w2) < (w1, w2) {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        if lo >= self.bigram_count {
-            return None;
-        }
-        let off = self.bigram_off + lo * BIGRAM_ENTRY_SIZE;
-        let e = BigramEntry::read(&self.mmap[off..off + BIGRAM_ENTRY_SIZE])
-            .expect("bigram range validated at open");
-        if (e.w1, e.w2) == (w1, w2) {
-            Some(e.logprob)
-        } else {
-            None
-        }
+        lo
+    }
+
+    /// 读第 `i` 条 bigram（下标越界由调用方保证；打开时已校验区间范围）。
+    ///
+    /// # Panics
+    /// 仅当 mmap 内部损坏导致越界切片时（打开时已校验范围，不可能）。
+    fn bigram_entry(&self, i: usize) -> BigramEntry {
+        let off = self.bigram_off + i * BIGRAM_ENTRY_SIZE;
+        BigramEntry::read(&self.mmap[off..off + BIGRAM_ENTRY_SIZE])
+            .expect("bigram range validated at open")
     }
 
     /// bigram 条件概率 `log P(w2 | w1)`。

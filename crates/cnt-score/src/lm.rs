@@ -27,6 +27,39 @@ pub trait NgramLm: Send + Sync {
         self.word_index(word).and_then(|id| self.unigram_by_id(id))
     }
 
+    /// 前词的 bigram「行」：同一前词的后继在实现里通常是连续区间，返回
+    /// `(起始, 结束)` 下标（左闭右开）。默认实现表示「没有行的概念」。
+    ///
+    /// 为什么要暴露它：beam 展开时一条假设要对同一前词查几十个后继，
+    /// 先定位一次行、再在行内查，比每次都在整张表里二分（跨几十 MB 随机访问）
+    /// 少一个数量级的 cache miss。不支持行的实现忽略即可。
+    fn bigram_row(&self, _prev: WordId) -> (u32, u32) {
+        (0, 0)
+    }
+
+    /// 在行内查 `log10 P(cur | prev)`；默认退化为整表查询。
+    fn bigram_in_row(&self, _row: (u32, u32), prev: WordId, cur: WordId) -> Option<f32> {
+        self.bigram_by_id(prev, cur)
+    }
+
+    /// 条件概率 `log10 P(cur | prev)`，行版本：`row` 由 [`Self::bigram_row`] 给出。
+    fn conditional_in_row(
+        &self,
+        row: (u32, u32),
+        prev: Option<WordId>,
+        cur: Option<WordId>,
+        unk: f32,
+    ) -> f32 {
+        if let (Some(p), Some(c)) = (prev, cur)
+            && let Some(logp) = self.bigram_in_row(row, p, c)
+        {
+            return logp;
+        }
+        let backoff = prev.map_or(0.0, |p| self.unigram_by_id(p).map_or(0.0, |(_, b)| b));
+        let logp = cur.map_or(unk, |c| self.unigram_by_id(c).map_or(unk, |(p, _)| p));
+        logp + backoff
+    }
+
     /// 条件概率 `log10 P(cur | prev)`，缺失时按 Katz backoff 回退：
     /// `logP(cur) + backoff(prev)`；任一词不在词表时该项按 `unk` / `0.0` 处理。
     ///

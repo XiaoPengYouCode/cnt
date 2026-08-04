@@ -31,7 +31,16 @@
   退出/批次结束 `fastrace::flush()`。span 名小写下划线，工作量指标用 `Event` 属性
   （如 `expand(count=…)`）。
 - **性能对照**：`cnt-dict-tools bench <dict> <lm> --user <u.dict> <rounds>` 输出
-  wall-time 分位数 + fastrace 阶段聚合表；改动前后各跑一次对比。
+  **热/冷** wall-time 分位数（热 = 词键缓存命中 = 连续打字的第 2 键起；冷 = 每次
+  清空缓存）+ fastrace 阶段聚合表；改动前后各跑一次对比。
+- **测量纪律**：机器状态会漂移（频率/负载），跨时间点的绝对值不可比——用
+  `git worktree` 建旧版本，**交替**跑新旧两个二进制再比（本项目实测：同一份
+  二进制在降频状态下慢 2~3 倍，足以把优化误判成回退）。报数字时带上机器状态，
+  并注明是否开了 trace（开启约 +4%，别拿 trace-on 的构建对比 trace-off 的）。
+- **埋点开销预算**（fastrace benches：约 40ns/span、500ns/root span）：
+  阶段级 span（每次解码个位数）成本可忽略；即使密到每候选词一个 span
+  （约 500/解码）也只 +30%，诊断期完全可用——热路径别怕埋，怕的是拿不可比的
+  数字下结论。
 - **daemon 诊断**：每按键一棵 `process_key_event` root span，<5ms 的 cancel 不上报，
   慢按键的 span 树才会落盘——stderr 出现树即延迟异常，据此定位卡顿阶段。
 - **工作流**：先埋 span 再优化 → span 树确认瓶颈 → 聚合表验证效果 → 确认质量无回退。

@@ -23,6 +23,14 @@ impl NgramLm for CntLm {
     fn unigram(&self, word: &str) -> Option<(f32, f32)> {
         Self::unigram(self, word)
     }
+
+    fn bigram_row(&self, prev: WordId) -> (u32, u32) {
+        Self::bigram_row(self, prev)
+    }
+
+    fn bigram_in_row(&self, row: (u32, u32), _prev: WordId, cur: WordId) -> Option<f32> {
+        Self::bigram_in_row(self, row, cur)
+    }
 }
 
 #[cfg(test)]

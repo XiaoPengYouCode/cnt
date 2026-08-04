@@ -6,6 +6,7 @@
 //! ```
 //! 即：基础词频为主，用户每多选一次该候选，权重 +`USER_BOOST`，让它逐渐往前挤。
 
+use std::borrow::Cow;
 use std::io;
 use std::path::Path;
 use std::sync::Mutex;
@@ -148,28 +149,39 @@ impl PinyinModel {
 
     /// 某个拼音/词键的高频候选词：词典精确词 + 用户词（含新词），
     /// 按「词频 + 用户调频」排序取前 N（领域规则单点定义，解码器复用）。
+    ///
     /// 返回 `(词, 词库频率)`：频率 0 表示用户新词（不在词库），
     /// 频率 1 表示次读音（多音字低频读音）。
+    ///
+    /// 词用 `Cow`：词库词直接借 mmap（零拷贝），只有用户词是拥有型 ——
+    /// 调用方通常要转成自己的表示（如 `Arc<str>`），少一次 `String` 中转。
     #[must_use]
-    pub fn ranked_words(&self, key: &str, limit: usize) -> Vec<(String, u32)> {
-        let mut scored: Vec<(String, u32)> = self
-            .dict
-            .exact(key)
-            .into_iter()
-            .map(|c| (c.word.to_string(), c.freq))
-            .collect();
-        for w in self.user_words_for(key) {
-            if !scored.iter().any(|(x, _)| x == &w) {
-                scored.push((w, 0));
+    pub fn ranked_words<'a>(&'a self, key: &str, limit: usize) -> Vec<(Cow<'a, str>, u32)> {
+        // 排序键先算好再排（Schwartzian transform）：此前比较器里调 user_count，
+        // 每次比较都要抢一次用户库的锁 + 两次哈希查找 —— 20 个候选就是上百次加锁，
+        // 而这是 beam 每个词键都会走的热路径。
+        let mut scored: Vec<(Cow<'a, str>, u32, u64)> = Vec::new();
+        {
+            let user = self
+                .user
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rank_of = |word: &str, freq: u32| {
+                u64::from(freq) + u64::from(user.count(key, word)) * u64::from(USER_BOOST)
+            };
+            for c in self.dict.exact(key) {
+                scored.push((Cow::Borrowed(c.word), c.freq, rank_of(c.word, c.freq)));
             }
-        }
-        scored.sort_by(|a, b| {
-            let sa = u64::from(a.1) + u64::from(self.user_count(key, &a.0)) * u64::from(USER_BOOST);
-            let sb = u64::from(b.1) + u64::from(self.user_count(key, &b.0)) * u64::from(USER_BOOST);
-            sb.cmp(&sa).then_with(|| a.0.cmp(&b.0))
-        });
+            for w in user.words_for_pinyin(key) {
+                if !scored.iter().any(|(x, _, _)| x.as_ref() == w.as_str()) {
+                    let rank = rank_of(&w, 0);
+                    scored.push((Cow::Owned(w), 0, rank));
+                }
+            }
+        } // 锁只覆盖计数读取，排序不持锁
+        scored.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(limit);
-        scored
+        scored.into_iter().map(|(w, freq, _)| (w, freq)).collect()
     }
 
     /// 用户选中了候选 (pinyin, word)：记录调频。
