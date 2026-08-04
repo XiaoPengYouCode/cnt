@@ -45,9 +45,9 @@ tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "time", 
 futures-util = "=0.3.33"
 memmap2 = "=0.9.11"
 
-# 可观测性：log（日志宏）+ fastrace（span）+ logforth（日志分发/与 fastrace 关联）
+# 可观测性：log + fastrace（`--features "fastrace/enable"` 全局开启，默认关闭零开销）+ logforth
 log = "=0.4.33"
-fastrace = { version = "=0.7.19", features = ["enable"] }
+fastrace = { version = "=0.7.19" }
 logforth = { version = "=0.30.1", features = ["starter-log", "append-fastrace", "diagnostic-fastrace"] }
 
 # 错误类型（显式，不用 anyhow）
@@ -67,3 +67,10 @@ cnt-config = { path = "crates/cnt-config" }
 cnt-decode = { path = "crates/cnt-decode" }
 cnt-input = { path = "crates/cnt-input" }
 cnt-engine = { path = "crates/cnt-engine" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

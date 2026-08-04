@@ -22,6 +22,10 @@
 
 - **技术栈**：`log`（日志）+ `fastrace`（span 树）+ `logforth`（分发，日志挂 span）。
   禁止 `eprintln!` 调试输出；**禁止用手工 `Instant` 计时当正式观测**（临时定位可以，用完必删）。
+- **trace 开关**：fastrace 的 `enable` 是编译期开关，依赖 feature 在构建图内全局合并。
+  发布构建（install.sh、`cargo build --release -p cnt-daemon`）默认关闭——span 宏编译为
+  noop、零开销；诊断/bench 时 `cargo build --release --features "fastrace/enable"`
+  全局开启（一条命令影响整个构建图）。
 - **埋点**：库代码用 `Span::enter_with_local_parent("名")` 建子 span——上层无 context 时
   零开销，热路径放心埋；应用代码建 root span（`Span::root` + `set_local_parent`），
   退出/批次结束 `fastrace::flush()`。span 名小写下划线，工作量指标用 `Event` 属性

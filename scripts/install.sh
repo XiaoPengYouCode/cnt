@@ -20,8 +20,11 @@ DATA_DIR="${HOME}/.local/share/cnt"
 COMPONENT_DIR="/usr/share/ibus/component"
 EXEC="${BIN_DIR}/cnt-daemon"
 
-echo "[1/5] 构建 release 版..."
-cargo build --release
+echo "[1/5] 构建 release 版（发布构建：trace 全局关闭，span 编译期零开销）..."
+# fastrace 的 enable 是编译期开关，且依赖 feature 在构建图内全局合并：
+# 不带 flag 即全局关闭（发布构建，零开销）；诊断/bench 构建用
+# `cargo build --release --features \"fastrace/enable\"` 全局开启。
+cargo build --release -p cnt-daemon
 
 # 平滑激活 cnt 引擎：ibus spawn 引擎进程存在握手竞态（首次 spawn 常超时），
 # 失败则间隔重试，最多 3 次。
