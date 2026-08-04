@@ -130,15 +130,9 @@ impl Engine {
     /// 取当前状态快照（不持锁跨 await）
     fn snapshot(&self) -> UiState {
         let st = self.lock_state();
-        // 预编辑 = 已确认的汉字 + 未确认拼音（按音节分节，`nihaoshijie` → `ni hao shi jie`）。
-        // 这样用户能看见「切分成什么」与「确认到哪」，而不是一串连写字母。
-        let mut preedit = st.confirmed_text().to_string();
-        if !st.buffer().is_empty() {
-            if !preedit.is_empty() {
-                preedit.push(' ');
-            }
-            preedit.push_str(&self.decoder.display_pinyin(st.buffer()));
-        }
+        let preedit = render_preedit(st.confirmed_text(), st.preview(), st.buffer(), |py| {
+            self.decoder.display_pinyin(py)
+        });
         UiState {
             preedit,
             all_cands: st.candidates().iter().map(|c| c.text.clone()).collect(),
@@ -584,5 +578,89 @@ impl Engine {
     fn panel_extension_register_keys(&self, _data: zbus::zvariant::OwnedValue) {}
 }
 
+/// 拼出预编辑文本：已确认的汉字 + （浏览候选时的内联预览）+ 未覆盖的分节拼音。
+///
+/// - 不浏览候选时是 `你好 shi jie` 形态：用户看得见自己打了什么、怎么切分的；
+/// - 浏览候选时把选中候选内联进来（整句 → `你好世界`；部分候选 → `你好 shi jie`），
+///   空格确认前就能看到结果；
+/// - 汉字与拼音之间留一个空格，界限清楚。
+///
+/// `segment` 是拼音分节函数（由解码器的音节表提供）。纯函数，便于测试边界。
+fn render_preedit(
+    confirmed: &str,
+    preview: Option<(&str, usize)>,
+    buffer: &str,
+    segment: impl Fn(&str) -> String,
+) -> String {
+    let mut out = String::with_capacity(confirmed.len() + buffer.len() + 8);
+    out.push_str(confirmed);
+    let tail = match preview {
+        Some((text, consumed)) => {
+            out.push_str(text);
+            // consumed 来自候选自报的覆盖长度，越界时按全覆盖处理（不 panic）
+            buffer.get(consumed.min(buffer.len())..).unwrap_or("")
+        }
+        None => buffer,
+    };
+    if !tail.is_empty() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&segment(tail));
+    }
+    out
+}
+
 /// 供 cnt-daemon 使用的常量
 pub const FACTORY_OBJ_PATH: &str = FACTORY_PATH;
+
+#[cfg(test)]
+mod tests {
+    use super::render_preedit;
+
+    /// 测试用分节函数：按 3 字母一节切（不依赖真实音节表）
+    fn seg(py: &str) -> String {
+        py.as_bytes()
+            .chunks(3)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn preedit_shows_segmented_pinyin_by_default() {
+        assert_eq!(render_preedit("", None, "nihaoshi", seg), "nih aos hi");
+        assert_eq!(render_preedit("", None, "", seg), "");
+    }
+
+    #[test]
+    fn preedit_keeps_confirmed_prefix() {
+        // 已确认的汉字 + 剩余拼音，中间一个空格
+        assert_eq!(render_preedit("你好", None, "shijie", seg), "你好 shi jie");
+    }
+
+    #[test]
+    fn preedit_inlines_preview_while_browsing() {
+        // 整句候选：全覆盖 → 只剩汉字
+        assert_eq!(
+            render_preedit("", Some(("你好世界", 11)), "nihaoshijie", seg),
+            "你好世界"
+        );
+        // 部分候选：覆盖 nihao，剩余仍是拼音
+        assert_eq!(
+            render_preedit("", Some(("你好", 5)), "nihaoshijie", seg),
+            "你好 shi jie"
+        );
+        // 已确认段 + 预览 + 剩余
+        assert_eq!(
+            render_preedit("我说", Some(("你好", 5)), "nihaoshijie", seg),
+            "我说你好 shi jie"
+        );
+    }
+
+    #[test]
+    fn preedit_tolerates_out_of_range_coverage() {
+        // 覆盖长度越界（不该发生）也不 panic，按全覆盖处理
+        assert_eq!(render_preedit("", Some(("你好", 99)), "nihao", seg), "你好");
+    }
+}

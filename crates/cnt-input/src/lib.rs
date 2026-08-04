@@ -381,6 +381,21 @@ impl EngineState {
         self.candidates.get(index).cloned()
     }
 
+    /// 预编辑预览：正在**浏览候选**时，返回 `(选中候选的文本, 它消耗的输入字节数)`。
+    ///
+    /// 判据是「光标离开首位」——光标在 #1 时说明用户还没挑，预编辑保持分节拼音
+    /// （看得见自己打了什么、怎么切分的）；一旦按方向键浏览，预编辑就同步预览
+    /// 选中的候选（`你好世界` / 部分候选则是 `你好 shi jie`），空格确认前就能看到结果。
+    ///
+    /// 无状态判定：光标移回 #1 就回到拼音显示，行为可预测。
+    #[must_use]
+    pub fn preview(&self) -> Option<(&str, usize)> {
+        if self.cursor_abs() == 0 {
+            return None;
+        }
+        self.selected().map(|c| (c.text.as_str(), c.consumed))
+    }
+
     /// 当前光标处的候选（若有）。
     #[must_use]
     pub fn selected(&self) -> Option<&Candidate> {
@@ -1017,6 +1032,29 @@ mod tests {
             Action::Commit { text, .. } => assert_eq!(text, "时"),
             other => panic!("expected commit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn preview_only_while_browsing_candidates() {
+        // 光标在 #1：不预览（预编辑保持分节拼音，看得见自己打了什么）
+        let mut st = EngineState::new();
+        let src = PartialSource;
+        type_pinyin(&mut st, &src, "nihaoshijie");
+        assert_eq!(st.preview(), None, "光标在首位说明还没挑，不该预览");
+
+        // 移到 #2（部分候选 你好）：预览它，并告诉上层它只覆盖了 nihao
+        st.handle_key(keysym::RIGHT, &src, false);
+        assert_eq!(st.preview(), Some(("你好", "nihao".len())));
+
+        // 移回 #1：回到拼音显示（无状态判定，可预测）
+        st.handle_key(keysym::LEFT, &src, false);
+        assert_eq!(st.preview(), None);
+
+        // 确认部分候选后，剩余组合的光标又回到首位 → 不预览
+        st.handle_key(keysym::RIGHT, &src, false);
+        st.handle_key(keysym::SPACE, &src, false);
+        assert_eq!(st.buffer(), "shijie");
+        assert_eq!(st.preview(), None);
     }
 
     #[test]
