@@ -70,7 +70,7 @@ CNT_DICT=data/cnt.dict CNT_LM=data/lm.cntl cargo run -p cnt-daemon
 
 # 6. 另一终端：测试客户端模拟输入
 cargo run -p cnt-test-client
-#   输入 a-z、space、enter、backspace、esc、1-9、up/down/pageup/pagedown，空行退出
+#   输入 a-z、space、enter、backspace、esc、1-9、left/right/up/down/pageup/pagedown，空行退出
 ```
 
 环境变量：
@@ -116,6 +116,20 @@ cargo run -p cnt-test-client
 另有一条硬约束：**两处以上模糊不得占 #1** —— 单处模糊是模糊音的初衷
 （`sihou → 时候` 仍 #1），但 `zhuchen → 组成`（zh/z + en/eng）这种同时错两个音的
 不得抢榜首。
+
+### 键位
+
+| 键 | 作用 |
+|---|---|
+| `a`-`z` | 输入拼音 |
+| `空格` | 选中光标处候选（部分候选 → 确认该段，继续组合） |
+| `1`-`9` | 直接选该序号的候选 |
+| `←` `→` / `↑` `↓` | **在候选间移动光标**（跨页自动翻页）—— 候选窗默认横排，左右与上下都映射到「上一个/下一个候选」 |
+| `PageUp` `PageDown` / `-` `=` | 翻页（光标落到新页首） |
+| `退格` | 删未确认的字母；未确认部分为空时撤销上一次部分确认 |
+| `Esc` | 丢弃整个组合（含已确认段） |
+| `回车` | 把未确认的拼音原文当英文提交 |
+| `Shift` 单击 | 中/英模式切换 |
 
 ### 增量确认（Rime 式）
 

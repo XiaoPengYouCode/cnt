@@ -183,7 +183,9 @@ pub mod keysym {
     pub const BACKSPACE: u32 = 0xff08;
     pub const RETURN: u32 = 0xff0d;
     pub const ESCAPE: u32 = 0xff1b;
+    pub const LEFT: u32 = 0xff51;
     pub const UP: u32 = 0xff52;
+    pub const RIGHT: u32 = 0xff53;
     pub const DOWN: u32 = 0xff54;
     pub const PAGE_UP: u32 = 0xff55;
     pub const PAGE_DOWN: u32 = 0xff56;
@@ -483,12 +485,22 @@ impl EngineState {
                 Action::Handled
             }
 
-            // 上下翻页
-            keysym::UP | keysym::PAGE_UP => {
+            // 方向键：在候选间移动光标（跨页自动翻页）。
+            // 候选窗默认横排，所以左右与上下都映射到「上一个/下一个候选」，
+            // 与 Rime/搜狗一致；翻页交给 Page_Up/Page_Down 与 -/= 。
+            keysym::LEFT | keysym::UP => {
+                self.cursor_up();
+                Action::Handled
+            }
+            keysym::RIGHT | keysym::DOWN => {
+                self.cursor_down();
+                Action::Handled
+            }
+            keysym::PAGE_UP => {
                 self.page_up();
                 Action::Handled
             }
-            keysym::DOWN | keysym::PAGE_DOWN => {
+            keysym::PAGE_DOWN => {
                 self.page_down();
                 Action::Handled
             }
@@ -530,6 +542,7 @@ impl EngineState {
     pub const fn page_up(&mut self) {
         if self.page > 0 {
             self.page -= 1;
+            self.cursor = 0; // 翻页后光标落到新页首，避免指向上一页的位置
         }
     }
 
@@ -538,6 +551,7 @@ impl EngineState {
         let max_page = self.candidates.len().saturating_sub(1) / self.page_size;
         if self.page < max_page {
             self.page += 1;
+            self.cursor = 0;
         }
     }
 
@@ -961,6 +975,65 @@ mod tests {
             Action::Commit { text, .. } => assert_eq!(text, "”"),
             other => panic!("expected commit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn arrow_keys_move_selection_within_candidates() {
+        // 方向键在候选间移动（不是翻页）：移动后空格提交的是光标处的候选
+        let mut st = EngineState::with_page_size(3);
+        let d = TestSource {
+            map: std::collections::HashMap::from([("shi", vec!["是", "时", "事", "使", "市"])]),
+        };
+        st.handle_key(0x73, &d, false); // s
+        st.handle_key(0x68, &d, false); // h
+        st.handle_key(0x69, &d, false); // i
+        assert_eq!(st.cursor_abs(), 0);
+
+        // 右/下：下一个候选
+        st.handle_key(keysym::RIGHT, &d, false);
+        assert_eq!(st.cursor_abs(), 1);
+        st.handle_key(keysym::DOWN, &d, false);
+        assert_eq!(st.cursor_abs(), 2);
+        // 跨页：page_size=3，第 4 个候选在第 2 页
+        st.handle_key(keysym::DOWN, &d, false);
+        assert_eq!((st.page(), st.cursor_abs()), (1, 3));
+        // 左/上：退回上一页末尾
+        st.handle_key(keysym::LEFT, &d, false);
+        assert_eq!((st.page(), st.cursor_abs()), (0, 2));
+        // 末尾不越界
+        for _ in 0..10 {
+            st.handle_key(keysym::RIGHT, &d, false);
+        }
+        assert_eq!(st.cursor_abs(), 4, "不得越过最后一个候选");
+        // 开头不越界
+        for _ in 0..10 {
+            st.handle_key(keysym::LEFT, &d, false);
+        }
+        assert_eq!((st.page(), st.cursor_abs()), (0, 0));
+
+        // 移到第 2 个候选后空格：提交的是「时」
+        st.handle_key(keysym::RIGHT, &d, false);
+        match st.handle_key(keysym::SPACE, &d, false) {
+            Action::Commit { text, .. } => assert_eq!(text, "时"),
+            other => panic!("expected commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paging_keys_reset_cursor_into_page() {
+        // Page_Down/Page_Up 仍然是翻页，且光标要落在新页内
+        let mut st = EngineState::with_page_size(2);
+        let d = TestSource {
+            map: std::collections::HashMap::from([("shi", vec!["是", "时", "事", "使"])]),
+        };
+        st.handle_key(0x73, &d, false);
+        st.handle_key(0x68, &d, false);
+        st.handle_key(0x69, &d, false);
+        st.handle_key(keysym::RIGHT, &d, false); // 光标到页内第 2 个
+        st.handle_key(keysym::PAGE_DOWN, &d, false);
+        assert_eq!((st.page(), st.cursor_abs()), (1, 2), "翻页后光标落到新页首");
+        st.handle_key(keysym::PAGE_UP, &d, false);
+        assert_eq!((st.page(), st.cursor_abs()), (0, 0));
     }
 
     #[test]

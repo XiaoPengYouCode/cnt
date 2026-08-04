@@ -4,7 +4,7 @@
 //!
 //! 用法：
 //!   cargo run -p cnt-test-client
-//! 然后在 stdin 输入按键名（a-z、space、enter、backspace、esc、1-9、up、down、pageup、pagedown），
+//! 然后在 stdin 输入按键名（a-z、space、enter、backspace、esc、1-9、left/right/up/down、pageup、pagedown），
 //! 每行一个按键，空行退出。
 
 use std::io::{self, BufRead};
@@ -27,7 +27,9 @@ fn keysym(name: &str) -> Option<u32> {
         "enter" | "return" => Some(0xff0d),
         "backspace" => Some(0xff08),
         "esc" | "escape" => Some(0xff1b),
+        "left" => Some(0xff51),
         "up" => Some(0xff52),
+        "right" => Some(0xff53),
         "down" => Some(0xff54),
         "pageup" => Some(0xff55),
         "pagedown" => Some(0xff56),
@@ -142,7 +144,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sig_task = spawn_signal_printer(conn.clone());
 
     // 从 stdin 读取按键并发送
-    println!("type keys (a-z, space, enter, backspace, esc, 1-9, up/down/pageup/pagedown); empty line to quit");
+    println!(
+        "type keys (a-z, space, enter, backspace, esc, 1-9, left/right/up/down, pageup/pagedown); empty line to quit"
+    );
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
