@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# cnt 输入法安装脚本
+# cnt 输入法安装/升级脚本
 #
-# 安装为「第三个输入法」，与英文输入（xkb 布局）和 Rime 互不冲突：
-# - 二进制 → ~/.local/bin/cnt-daemon            （用户级）
-# - 数据   → ~/.local/share/cnt/                （daemon 默认数据目录）
-# - 配置   → ~/.config/cnt/config.toml          （可选，用户级）
-# - 组件   → /usr/share/ibus/component/cnt.xml  （sudo，唯一特权操作）
+# 安装为「第三个输入法」，与英文输入和 Rime 互不冲突：
+# - 主程序  → ~/.local/bin/cnt-daemon
+# - 数据    → ~/.local/share/cnt/
+# - 组件    → /usr/share/ibus/component/cnt.xml（唯一需要管理员密码的步骤）
 #
-# 关键机制：组件 XML 告诉 ibus「存在一个叫 cnt 的引擎，用这个命令启动它」。
-# ibus 只在用户显式选中 cnt 时才启动 cnt-daemon，不会自启、不抢 Rime。
-# 注：ibus 1.5.x 的用户目录组件扫描是 #if 0 注释掉的（见 ibusregistry.c），
-#     因此 XML 必须装到系统目录。
+# 升级时平滑替换：先切换到其他输入法 → 停掉旧版 → 放入新版 → 切回，
+# 全程不重启输入法服务（重启瞬间系统可能恢复输入源失败，表现为输入法挂掉）。
+#
+# 卸载：
+#   sudo rm /usr/share/ibus/component/cnt.xml && rm -rf ~/.local/bin/cnt-daemon ~/.local/share/cnt && ibus restart
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -20,46 +20,45 @@ DATA_DIR="${HOME}/.local/share/cnt"
 COMPONENT_DIR="/usr/share/ibus/component"
 EXEC="${BIN_DIR}/cnt-daemon"
 
-echo "[1/5] 构建 release 版（发布构建：trace 全局关闭，span 编译期零开销）..."
-# fastrace 的 enable 是编译期开关，且依赖 feature 在构建图内全局合并：
-# 不带 flag 即全局关闭（发布构建，零开销）；诊断/bench 构建用
-# `cargo build --release --features \"fastrace/enable\"` 全局开启。
+# ── 输出样式（homebrew 风格：彩色 + emoji）────────────────────
+_C_RST='\033[0m'; _C_BLD='\033[1m'; _C_DIM='\033[2m'
+_C_CYN='\033[36m'; _C_GRN='\033[32m'; _C_YEL='\033[33m'; _C_RED='\033[31m'
+step() { printf "${_C_BLD}${_C_CYN}==>${_C_RST} ${_C_BLD}%s${_C_RST}\n" "$*"; }
+info() { printf "  ${_C_DIM}%s${_C_RST}\n" "$*"; }
+ok()   { printf "  ${_C_GRN}✔${_C_RST} %s\n" "$*"; }
+warn() { printf "  ${_C_YEL}⚠${_C_RST} %s\n" "$*"; }
+err()  { printf "  ${_C_RED}✘${_C_RST} %s\n" "$*" >&2; }
+
+step "编译程序（首次需要几分钟，请稍候）..."
+# 发布构建：不带 --features 即全局关闭 fastrace（编译期零开销）。
 cargo build --release -p cnt-daemon
 
-# 平滑激活 cnt 引擎：ibus spawn 引擎进程存在握手竞态（首次 spawn 常超时），
-# 失败则间隔重试，最多 3 次。
+# 激活 cnt 输入法：首次启动偶尔会超时，自动重试最多 3 次。
 activate_cnt() {
     for _ in 1 2 3; do
         if ibus engine cnt 2>/dev/null; then
-            echo "  已激活 cnt 引擎"
+            ok "cnt 输入法已激活"
             return 0
         fi
-        echo "  引擎激活失败，3s 后重试..."
+        info "正在启动 cnt 输入法，稍候自动重试..."
         sleep 3
     done
-    echo "  警告：多次尝试仍无法激活 cnt 引擎" >&2
+    warn "多次尝试仍未激活 cnt 输入法"
     return 1
 }
 
-echo "[2/5] 安装二进制 -> ${BIN_DIR}"
+step "安装主程序"
 mkdir -p "${BIN_DIR}"
-# 升级路径：平滑替换，无 restart、无 kill。顺序为 切走→停→删→放→启：
-# - 若 cnt 正被使用，先切走（销毁活动引擎），避免替换/退出阶段 gnome-shell
-#   的 setEngine 撞上引擎消失（此前两次会话卡死即源于此）
-# - SIGINT 让旧 daemon 走 ctrl_c 优雅退出（flush 用户库）；实测 ibus 引擎进程
-#   不随引擎切换回收，必须先停，rm 才无占用
-# - rm + cp 而非 mv：cargo 对 target/release 二进制建硬链接（与 deps/ 同 inode），
-#   mv 覆盖已部署路径会报 "same file"；cp 产生独立副本无此问题
-# - 切回 cnt（带重试；首次安装时组件未注册会失败，由 [5/6] 的 restart 兜底）
+# 升级时平滑替换：先切走（若正在使用）→ 停旧版 → 删旧文件 → 放新版 → 切回。
 CUR=$(ibus engine 2>/dev/null || true)
 if [ "${CUR}" = "cnt" ]; then
-    echo "  当前引擎是 cnt，先切走（xkb）..."
+    info "正在切换到英文输入法（几秒后自动切回）..."
     ibus engine xkb:us::eng || true
     sleep 1
 fi
 OLD=$(pgrep -f "${BIN_DIR}/cnt-daemon" | head -1 || true)
 if [ -n "${OLD}" ]; then
-    echo "  让旧 daemon (${OLD}) 优雅退出（SIGINT）..."
+    info "正在退出旧版本（输入习惯不会丢失）..."
     kill -INT "${OLD}"
     sleep 2
 fi
@@ -67,16 +66,16 @@ rm -f "${BIN_DIR}/cnt-daemon"
 cp target/release/cnt-daemon "${BIN_DIR}/cnt-daemon"
 activate_cnt || true
 
-echo "[3/5] 安装数据 -> ${DATA_DIR}"
+step "安装词库和语言模型数据"
 mkdir -p "${DATA_DIR}"
 if [ ! -f data/cnt.dict ] || [ ! -f data/lm.cntl ]; then
-    echo "错误：data/cnt.dict 或 data/lm.cntl 不存在，请先按 README 生成词库和语言模型。" >&2
+    err "缺少词库文件（data/cnt.dict / data/lm.cntl），请先按 README 生成。"
     exit 1
 fi
 cp data/cnt.dict "${DATA_DIR}/dict.cntd"
 cp data/lm.cntl "${DATA_DIR}/lm.cntl"
 
-echo "[4/5] 写入组件 XML（内容已一致时自动跳过 sudo）..."
+step "注册输入法组件（如需修改，会要求管理员密码）"
 XML=$(cat <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <!-- filename: cnt.xml -->
@@ -106,33 +105,27 @@ EOF
 )
 if [ -f "${COMPONENT_DIR}/cnt.xml" ] \
     && cmp -s "${COMPONENT_DIR}/cnt.xml" <(printf '%s\n' "${XML}"); then
-    echo "  ${COMPONENT_DIR}/cnt.xml 已存在且内容一致，跳过 sudo"
+    ok "组件已是最新，无需修改"
 else
     sudo install -m 644 /dev/stdin "${COMPONENT_DIR}/cnt.xml" <<< "${XML}"
 fi
 
-echo "[5/6] 让组件生效..."
-# 升级场景：组件 XML 已被 ibus 加载，[2/5] 已平滑激活新引擎，无需 restart。
-# 首次安装（或激活失败）：restart 让 ibus 加载新组件 XML，再激活。
-# （ibus restart 是“原子弹”：restart 瞬间 gnome-shell 会立即恢复上次输入源并
-#   setEngine，若引擎尚未注册就绪则失败且不重试——输入法会话表现为“挂掉”。
-#   因此升级一律避免 restart，只有首装才用它。）
+step "确认输入法可用"
+# 升级场景已激活；首次安装需重启输入法服务让新组件生效。
 if ibus engine 2>/dev/null | grep -q "cnt"; then
-    echo "  cnt 引擎已激活，跳过 restart"
+    ok "cnt 输入法已激活，无需重启输入法服务"
 else
-    echo "  首次安装/激活失败兜底：ibus restart"
+    info "首次安装：正在重启输入法服务（几秒后自动恢复）..."
     ibus restart
     sleep 2
     activate_cnt || true
 fi
 
-echo "[6/6] 把 cnt 加入桌面输入源..."
-# 关键：ibus 引擎注册 ≠ 桌面切换器显示。GNOME 的 Super+Space 切换器显示的是
-# org.gnome.desktop.input-sources sources，需要显式把 ('ibus', 'cnt') 加进去。
+step "添加到系统输入法列表"
+# GNOME 的输入法切换器（Super+Space）显示的是系统输入源列表，需显式加入。
 if [ "${XDG_CURRENT_DESKTOP:-}" != "${XDG_CURRENT_DESKTOP#*GNOME}" ]; then
     SOURCES=$(gsettings get org.gnome.desktop.input-sources sources)
     if ! echo "$SOURCES" | grep -q "'cnt'"; then
-        # 去掉首尾 []，追加 ('ibus', 'cnt')
         INNER="${SOURCES#\[}"; INNER="${INNER%\]}"
         if [ -n "$INNER" ]; then
             NEW="[${INNER}, ('ibus', 'cnt')]"
@@ -140,19 +133,16 @@ if [ "${XDG_CURRENT_DESKTOP:-}" != "${XDG_CURRENT_DESKTOP#*GNOME}" ]; then
             NEW="[('ibus', 'cnt')]"
         fi
         gsettings set org.gnome.desktop.input-sources sources "$NEW"
-        echo "已把 ('ibus', 'cnt') 加入 GNOME 输入源（切换器立即可见）"
+        ok "已添加到输入法列表"
     else
-        echo "cnt 已在输入源列表中，跳过"
+        ok "已在输入法列表中"
     fi
 else
-    echo "非 GNOME 会话：请手动在输入法设置中添加 cnt 引擎"
+    info "非 GNOME 桌面：请到系统设置 → 输入法 手动添加 cnt"
 fi
 
 echo
-echo "完成！现在输入法切换器（Super+Space / 面板）里应有三个输入法："
-echo "  1. 英文（xkb 布局）"
-echo "  2. Rime"
-echo "  3. Cnt 拼音 (Rust) ← 新安装"
+printf "${_C_BLD}${_C_GRN}  🎉 Cnt 拼音输入法安装完成！${_C_RST}\n"
 echo
-echo "手动卸载："
-echo "  sudo rm /usr/share/ibus/component/cnt.xml && rm -rf ~/.local/bin/cnt-daemon ~/.local/share/cnt && ibus restart"
+echo "     按 Super+Space（或右上角面板）切换到 Cnt，即可开始输入。"
+echo "     以后升级：再次运行 ./scripts/install.sh 即可。"
