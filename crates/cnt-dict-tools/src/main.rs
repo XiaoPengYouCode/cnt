@@ -147,6 +147,23 @@ fn main() {
             }
             cmd_build_lm(&args[2], &args[3])
         }
+        "bench" => {
+            if args.len() < 4 {
+                usage();
+                std::process::exit(2);
+            }
+            // bench <dict> <lm> [--user <user.dict>] <n>
+            let mut rest = &args[4..];
+            let user = if rest.first().map(String::as_str) == Some("--user") && rest.len() >= 2 {
+                let u = rest[1].clone();
+                rest = &rest[2..];
+                Some(u)
+            } else {
+                None
+            };
+            let n: usize = rest.first().map_or(50, |s| s.parse().unwrap_or(50));
+            cmd_bench(&args[2], &args[3], user.as_deref(), n)
+        }
         "decode" => {
             if args.len() < 4 {
                 usage();
@@ -525,6 +542,170 @@ fn cmd_decode(
             println!("  {}. {}", i + 1, cand.text);
         }
     }
+    let _ = std::fs::remove_file(&tmp_user);
+    Ok(())
+}
+
+/// 单个 span 名的耗时聚合（ns）。
+#[derive(Default)]
+struct BenchAgg {
+    count: u64,
+    total_ns: u64,
+    min_ns: u64,
+    max_ns: u64,
+}
+
+/// fastrace 聚合统计（Arc<Mutex> 共享：后台上报线程写，bench 主线程 flush 后读）。
+#[derive(Default)]
+struct BenchStats {
+    by_name: std::collections::HashMap<String, BenchAgg>,
+    expand_total: u64,
+}
+
+/// fastrace 聚合 reporter：按 span 名汇总 duration，flush 后由 bench 打印阶段分布表。
+/// `ConsoleReporter` 逐条 Debug 输出在批量解码下不可读，聚合表更适合性能判断。
+struct AggregateReporter {
+    stats: std::sync::Arc<std::sync::Mutex<BenchStats>>,
+}
+
+impl fastrace::collector::Reporter for AggregateReporter {
+    fn report(&mut self, spans: Vec<fastrace::collector::SpanRecord>) {
+        let mut st = self.stats.lock().unwrap();
+        for s in spans {
+            let e = st.by_name.entry(s.name.to_string()).or_default();
+            e.count += 1;
+            e.total_ns += s.duration_ns;
+            e.max_ns = e.max_ns.max(s.duration_ns);
+            e.min_ns = if e.min_ns == 0 || s.duration_ns < e.min_ns {
+                s.duration_ns
+            } else {
+                e.min_ns
+            };
+            for ev in s.events {
+                if ev.name == "expand" {
+                    for (k, v) in &ev.properties {
+                        if k == "count" {
+                            st.expand_total += v.parse::<u64>().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `u64` 纳秒计数远小于 2^53，转 `f64` 无损。
+#[allow(clippy::cast_precision_loss)]
+fn ns_to_us(ns: u64) -> f64 {
+    ns as f64 / 1000.0
+}
+
+/// 性能基准：对一组常见拼音反复解码，报告每次候选生成的延迟统计。
+fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) -> CliResult {
+    use cnt_decode::Decoder;
+    use cnt_input::CandidateSource;
+    use cnt_dict::PinyinModel;
+    use cnt_lm::CntLm;
+    use std::time::Instant;
+
+    let tmp_user = std::env::temp_dir().join(format!("cnt-decode-{}.dict", std::process::id()));
+    let user_str = user_path.unwrap_or_else(|| tmp_user.to_str().unwrap());
+    let model = std::sync::Arc::new(PinyinModel::open(dict_path, user_str)?);
+    let lm = std::sync::Arc::new(CntLm::open(lm_path)?);
+    let decoder = Decoder::new(model, Some(lm), true);
+
+    // fastrace：聚合 reporter 输出每次解码的 span 树（lattice/beam/completions 阶段耗时）
+    // 到 stdout；每样例第 1 轮完整上报，其余轮 cancel 避免统计重复。
+    let agg = std::sync::Arc::new(std::sync::Mutex::new(BenchStats::default()));
+    fastrace::set_reporter(
+        AggregateReporter { stats: agg.clone() },
+        fastrace::collector::Config::default(),
+    );
+
+    // 常见输入样例（覆盖单音节/多音节/补全/模糊音路径）
+    let samples = [
+        "ni", "nihao", "womenzaigongzuo", "xianzai", "diyige", "sihou", "chijiuhu",
+        "zhongguoren", "momingqimiao", "shijie", "womendoushizhongguoren", "xiexieni",
+        "jintian", "diannao", "shurufa", "nuli", "leng", "le",
+    ];
+
+    // 预热（加载页缓存等）
+    for _ in 0..3 {
+        for s in samples {
+            decoder.candidates(s);
+        }
+    }
+
+    let mut latencies = Vec::with_capacity(samples.len() * n);
+    let mut total_keys = 0usize;
+    for round in 0..n {
+        for s in samples {
+            // fastrace root span：每轮一棵树；仅第 1 轮上报，其余 cancel。
+            let root = fastrace::Span::root(
+                format!("decode:{s}"),
+                fastrace::collector::SpanContext::random(),
+            );
+            let _guard = root.set_local_parent();
+            let t = Instant::now();
+            let cands = decoder.candidates(s);
+            latencies.push(t.elapsed());
+            total_keys += cands.len();
+            if round != 0 {
+                root.cancel();
+            }
+        }
+    }
+    fastrace::flush();
+
+    latencies.sort();
+    let count = latencies.len();
+    let avg = latencies.iter().sum::<std::time::Duration>() / u32::try_from(count).unwrap();
+    let p50 = latencies[count / 2];
+    let p90 = latencies[count * 9 / 10];
+    let p99 = latencies[count * 99 / 100];
+    let max = latencies[count - 1];
+    println!(
+        "{} 次解码（{} 个样例 × {n} 轮），共 {total_keys} 个候选",
+        count, samples.len()
+    );
+    println!("平均 {avg:?}  中位 {p50:?}  90% {p90:?}  99% {p99:?}  最差 {max:?}");
+
+    // fastrace 阶段分布表（每样例第 1 轮，即 18 棵树）
+    {
+        // guard 仅在打印段持有（块作用域结束时释放）
+        let stats = agg.lock().unwrap();
+        println!();
+        println!("fastrace 阶段分解（每样例首轮 span 树聚合）：");
+        let mut names: Vec<&String> = stats.by_name.keys().collect();
+        names.sort_by(|a, b| {
+            let rank = |n: &str| {
+                if n.starts_with("decode:") {
+                    0
+                } else {
+                    match n {
+                        "candidates" => 1,
+                        "beam" => 2,
+                        "lattice" => 3,
+                        "completions" => 4,
+                        _ => 5,
+                    }
+                }
+            };
+            rank(a).cmp(&rank(b)).then(a.cmp(b))
+        });
+        for name in names {
+            let a = &stats.by_name[name];
+            let avg = ns_to_us(a.total_ns / a.count.max(1));
+            let min = ns_to_us(a.min_ns);
+            let max = ns_to_us(a.max_ns);
+            println!("  {name:<32} n={:<3} avg={avg:>8.1}µs  min={min:>7.1}µs  max={max:>8.1}µs", a.count);
+        }
+        if stats.expand_total > 0 {
+            println!("  expand(事件)                    n={:<3} 总展开次数 {}", stats.by_name.len(), stats.expand_total);
+        }
+        drop(stats); // 显式提前释放 guard（clippy: temporary_with_significant_drop）
+    }
+
     let _ = std::fs::remove_file(&tmp_user);
     Ok(())
 }

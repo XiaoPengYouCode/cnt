@@ -6,13 +6,15 @@
 //! ```
 //! bigram 缺失时用 Katz backoff：`logP(wᵢ) + backoff(wᵢ₋₁)`。
 
-use std::sync::Arc;
+use std::sync::Arc; // 同时用于 Decoder 与 Hyp 段
 
 use cnt_dict::PinyinModel;
 use cnt_lm::CntLm;
 use cnt_input::{Candidate, CandidateSource, LearnedWord};
+use fastrace::local::LocalSpan;
+use fastrace::{Event, Span};
 
-use crate::syllable::SyllableTable;
+use crate::syllable::{SyllableEdge, SyllableTable};
 
 /// beam 宽度：同时保留的假设数。
 const BEAM: usize = 8;
@@ -39,14 +41,31 @@ const USER_BOOST_LOG: f32 = 0.2;
 /// 让 32 次选择的 boost 不至于压过整个分数空间）。
 const USER_BOOST_CAP: u32 = 10;
 
+/// 单个 key 的缓存值：key 的 Arc + 候选词列表（词 Arc、词频、LM 词表下标）
+type CachedWords = (Arc<str>, Vec<(Arc<str>, u32, Option<u32>)>);
+/// 候选词缓存：`key` → `CachedWords`
+type WordCache = std::collections::HashMap<String, CachedWords>;
+
+/// 一条格的展开上下文（参数聚合，避免 expand 签名过长）。
+struct EdgeCtx<'a> {
+    end: usize,
+    fuzzy: bool,
+    key: &'a Arc<str>,
+}
+
 /// beam search 中的一条部分假设。
+///
+/// `segments`/`last` 用 `Arc<str>`：expand 时克隆只增引用计数、不拷贝堆数据
+/// （原先 `Vec<LearnedWord>` + `String` 每次 expand 要 10+ 次堆分配，
+/// 平均每 decode 451 次 expand —— 这是 beam 循环慢的主因）。
 #[derive(Clone)]
 struct Hyp {
     pos: usize,
-    last: Option<String>,
+    /// 上一个词的 (词, LM 词表下标)；下标用于快速 bigram 查询
+    last: Option<(Arc<str>, Option<u32>)>,
     score: f32,
-    /// 已选的学习段（拼音 + 词）
-    segments: Vec<LearnedWord>,
+    /// 已选的学习段（拼音, 词），Arc 克隆廉价
+    segments: Vec<(Arc<str>, Arc<str>)>,
 }
 
 /// 整句解码器：词库 + 语言模型 + 音节表。
@@ -97,7 +116,11 @@ impl Decoder {
     ///
     /// 分数同一空间（log10）：用户学过的补全词（持久化）能压过次读音拼接的
     /// 垃圾候选（持久和）；而 le 的补全（冷）分数低于精确读音（了），排在后面。
+    ///
+    /// fastrace 埋点：有 local parent（daemon/bench 设置了 root span）时记录
+    /// `candidates` span；无 context 时 `enter_with_local_parent` 为 noop，零开销。
     fn candidates_merged(&self, pinyin: &str) -> Vec<Candidate> {
+        let _span = Span::enter_with_local_parent("candidates");
         let mut scored: Vec<(Candidate, f32)> = self.decode(pinyin);
         if let Some(lm) = &self.lm {
             scored.extend(self.completions(pinyin, lm));
@@ -127,6 +150,7 @@ impl Decoder {
     /// 尾音节补全：末音节残缺（`chijiuh` → `h→hua`）或可延长（`chijiuhu` → `hu→hua`）时，
     /// 补出完整词候选（带分数；用户学过的词如 持久化 用 `USER_WORD_BASE` + 调频）。
     fn completions(&self, pinyin: &str, lm: &CntLm) -> Vec<(Candidate, f32)> {
+        let _span = Span::enter_with_local_parent("completions");
         if pinyin.len() < 2 {
             return Vec::new();
         }
@@ -189,15 +213,116 @@ impl Decoder {
         out
     }
 
+    /// beam search 主循环：在音节格上反复展开 + 束剪枝，返回完整句子假设
+    /// （按分数降序、已去重截断）。
+    ///
+    /// 展开次数以 fastrace 事件（`expand`）记录在 `beam` span 上，供阶段
+    /// 工作量分解（无 context 时 noop 零开销）。
+    fn beam_search(
+        &self,
+        pinyin: &str,
+        lattice: &[Vec<SyllableEdge>],
+        reachable: &[bool],
+        lm: &CntLm,
+    ) -> Vec<Hyp> {
+        let mut hyps = vec![Hyp {
+            pos: 0,
+            last: None,
+            score: 0.0,
+            segments: Vec::new(),
+        }];
+        // 完整句子：已消费全部输入的假设直接进 done（如 打字/时候/莫名其妙 在
+        // 第一轮就完整），它们是与「半截探索」并列的答案，不能被 beam 剪掉。
+        let mut done: Vec<Hyp> = Vec::new();
+        // 按 key 缓存候选词（decode 内同一 key 会被多条路径重复查询）
+        let mut word_cache: WordCache = std::collections::HashMap::new();
+
+        let _beam_span = Span::enter_with_local_parent("beam");
+        let mut n_expand = 0usize;
+        for _ in 0..pinyin.len() {
+
+            let mut next: Vec<Hyp> = Vec::new();
+            for h in &hyps {
+                if h.pos >= lattice.len() {
+                    done.push(h.clone());
+                    continue;
+                }
+                for edge in &lattice[h.pos] {
+                    // 单音节词
+                    let (key_arc, words) = self.cached_words(&mut word_cache, edge.syl, lm);
+                    n_expand += words.len();
+                    self.expand(
+                        h,
+                        &EdgeCtx { end: edge.end, fuzzy: edge.fuzzy, key: key_arc },
+                        words,
+                        &mut next,
+                        lm,
+                    );
+                    // 多音节词：贪心拼接后续最长音节成完整 key（如 gong-zuo → 工作）
+                    let mut key = String::from(edge.syl);
+                    let mut cur_end = edge.end;
+                    let mut fuzzy = edge.fuzzy;
+                    for _ in 1..MAX_WORD_SYLLABLES {
+                        let Some(next_edge) =
+                            lattice.get(cur_end).and_then(|edges| edges.first())
+                        else {
+                            break;
+                        };
+                        key.push_str(next_edge.syl);
+                        cur_end = next_edge.end;
+                        fuzzy |= next_edge.fuzzy;
+                        let (key_arc, words) = self.cached_words(&mut word_cache, &key, lm);
+                        n_expand += words.len();
+                        self.expand(
+                            h,
+                            &EdgeCtx { end: cur_end, fuzzy, key: key_arc },
+                            words,
+                            &mut next,
+                            lm,
+                        );
+                    }
+                }
+            }
+            // 束剪枝：先丢死路 + 分离完整假设，再对部分假设取前 BEAM。
+            // 用 select_nth_unstable（O(N) 分区）替代全排序（O(N log N)）——
+            // 每轮展开可能产生数百个假设，全排序是 beam 循环的主要开销。
+            next.retain(|h| reachable[h.pos]); // 丢弃走不到末尾的死路
+            let (complete, partial): (Vec<Hyp>, Vec<Hyp>) =
+                next.into_iter().partition(|h| h.pos >= lattice.len());
+            done.extend(complete);
+            hyps = partial;
+            if hyps.len() > BEAM {
+                hyps.select_nth_unstable_by(BEAM, |a, b| b.score.total_cmp(&a.score));
+                hyps.truncate(BEAM);
+            }
+            if hyps.is_empty() {
+                break;
+            }
+        }
+        // 展开次数作为 beam span 的属性（fastrace 事件，无 context 时 noop）
+        LocalSpan::add_event(Event::new("expand").with_property(|| ("count", n_expand.to_string())));
+
+        done.sort_by(|a, b| b.score.total_cmp(&a.score));
+        // 去重：同一句文本可能来自「多音节词」和「单字拼合」两条路径，保留最高分
+        let mut seen = std::collections::HashSet::new();
+        done.retain(|h| seen.insert(join_segments(&h.segments)));
+        done.truncate(TOP_SENTENCES);
+        done
+    }
+
     /// beam search 解码：Top-K 句子候选（带分数）。
     fn decode(&self, pinyin: &str) -> Vec<(Candidate, f32)> {
         let Some(lm) = &self.lm else {
             return Vec::new();
         };
-        let lattice = if self.fuzzy {
-            self.syllables.lattice_fuzzy(pinyin)
-        } else {
-            self.syllables.lattice(pinyin)
+        // fastrace：lattice 构建（模糊音节格）
+        let lattice = {
+            let _span = Span::enter_with_local_parent("lattice");
+            if self.fuzzy {
+                self.syllables.lattice_fuzzy(pinyin)
+            } else {
+                self.syllables.lattice(pinyin)
+            }
         };
         if lattice.len() < 2 {
             return Vec::new(); // 单音节退化，交给词候选
@@ -212,71 +337,19 @@ impl Decoder {
             reachable[i] = lattice[i].iter().any(|e| reachable[e.end]);
         }
 
-        let mut hyps = vec![Hyp {
-            pos: 0,
-            last: None,
-            score: 0.0,
-            segments: Vec::new(),
-        }];
-        // 完整句子：已消费全部输入的假设直接进 done（如 打字/时候/莫名其妙 在
-        // 第一轮就完整），它们是与「半截探索」并列的答案，不能被 beam 剪掉。
-        let mut done: Vec<Hyp> = Vec::new();
-
-        for _ in 0..pinyin.len() {
-
-            let mut next: Vec<Hyp> = Vec::new();
-            for h in &hyps {
-                if h.pos >= lattice.len() {
-                    done.push(h.clone());
-                    continue;
-                }
-                for edge in &lattice[h.pos] {
-                    // 单音节词
-                    self.expand(h, edge.end, edge.syl, edge.fuzzy, &mut next, lm);
-                    // 多音节词：贪心拼接后续最长音节成完整 key（如 gong-zuo → 工作）
-                    let mut key = String::from(edge.syl);
-                    let mut cur_end = edge.end;
-                    let mut fuzzy = edge.fuzzy;
-                    for _ in 1..MAX_WORD_SYLLABLES {
-                        let Some(next_edge) =
-                            lattice.get(cur_end).and_then(|edges| edges.first())
-                        else {
-                            break;
-                        };
-                        key.push_str(next_edge.syl);
-                        cur_end = next_edge.end;
-                        fuzzy |= next_edge.fuzzy;
-                        self.expand(h, cur_end, &key, fuzzy, &mut next, lm);
-                    }
-                }
-            }
-            // 束剪枝：先按分数排序 + 去死路，再把「完整假设」分离进 done，
-            // 只对「部分假设」按 beam 剪枝 —— 完整句子（打字/时候/莫名其妙）
-            // 是与探索并列的答案，绝不能因单字候选分高而被剪掉。
-            next.sort_by(|a, b| b.score.total_cmp(&a.score));
-            next.retain(|h| reachable[h.pos]); // 丢弃走不到末尾的死路
-            let (complete, partial): (Vec<Hyp>, Vec<Hyp>) =
-                next.into_iter().partition(|h| h.pos >= lattice.len());
-            done.extend(complete);
-            hyps = partial;
-            hyps.truncate(BEAM);
-            if hyps.is_empty() {
-                break;
-            }
-        }
-
-        done.sort_by(|a, b| b.score.total_cmp(&a.score));
-        // 去重：同一句文本可能来自「多音节词」和「单字拼合」两条路径，保留最高分
-        let mut seen = std::collections::HashSet::new();
-        done.retain(|h| seen.insert(join_segments(&h.segments)));
-        done.truncate(TOP_SENTENCES);
-        done.into_iter()
+        self.beam_search(pinyin, &lattice, &reachable, lm)
+            .into_iter()
             .map(|h| {
                 let score = h.score;
+                let learned = h
+                    .segments
+                    .iter()
+                    .map(|(p, w)| LearnedWord::new(p.to_string(), w.to_string()))
+                    .collect();
                 (
                     Candidate {
                         text: join_segments(&h.segments),
-                        learned: h.segments,
+                        learned,
                     },
                     score,
                 )
@@ -284,36 +357,63 @@ impl Decoder {
             .collect()
     }
 
+    /// 按 key 缓存候选词（decode 内同一 key 会被多条路径重复查询，避免重复计算）。
+    fn cached_words<'a>(
+        &self,
+        cache: &'a mut WordCache,
+        key: &str,
+        lm: &CntLm,
+    ) -> &'a CachedWords {
+        if !cache.contains_key(key) {
+            let words = self.words_for(key);
+            let arcs: Vec<(Arc<str>, u32, Option<u32>)> = words
+                .into_iter()
+                .map(|(w, f)| {
+                    let idx = lm.word_index(&w);
+                    (Arc::<str>::from(w), f, idx)
+                })
+                .collect();
+            cache.insert(key.to_string(), (Arc::<str>::from(key), arcs));
+        }
+        &cache[key]
+    }
+
     /// 把一个 (结束位置, 词键, 是否模糊) 的候选词展开进 beam。
+    /// `ctx.key`/`words` 来自缓存，`segments` 克隆只增 Arc 引用计数，零堆拷贝。
     fn expand(
         &self,
         h: &Hyp,
-        end: usize,
-        key: &str,
-        fuzzy: bool,
+        ctx: &EdgeCtx<'_>,
+        words: &[(Arc<str>, u32, Option<u32>)],
         next: &mut Vec<Hyp>,
         lm: &CntLm,
     ) {
-        for (word, freq) in self.words_for(key) {
+        let penalty = if ctx.fuzzy { FUZZY_PENALTY } else { 0.0 };
+        for (word_arc, freq, word_idx) in words {
             let mut nh = h.clone();
             // ARPA bigram 是条件概率 log P(w2|w1)：首词用读音感知的基础分，
             // 后续词用条件概率（bigram 或 Katz backoff），用户调频加成始终加。
             // 模糊读音加惩罚：回退读音不能与精确读音平等竞争（否则 dazi 会出「他只」）。
-            let boost = self.boost(key, &word);
-            let penalty = if fuzzy { FUZZY_PENALTY } else { 0.0 };
-            let step = h.last.as_ref().map_or_else(
-                || reading_base(&word, freq, lm) + boost + penalty,
-                |prev| {
-                    lm.bigram(prev, &word)
-                        .unwrap_or_else(|| backoff_score(lm, prev, &word))
+            // 双词都在词表时走下标查询，避免热路径上的字符串二分。
+            let boost = self.boost(ctx.key, word_arc);
+            let step = match (h.last.as_ref(), *word_idx) {
+                (Some((_, Some(prev_idx))), Some(word_idx)) => {
+                    lm.bigram_by_idx(*prev_idx, word_idx)
+                        .unwrap_or_else(|| {
+                            let u2 = lm.unigram_by_idx(word_idx).map_or(UNK_LOGPROB, |(p, _)| p);
+                            let bk = lm.unigram_by_idx(*prev_idx).map_or(0.0, |(_, b)| b);
+                            u2 + bk
+                        })
                         + boost
                         + penalty
-                },
-            );
+                }
+                (Some((prev, _)), _) => backoff_score(lm, prev, word_arc) + boost + penalty,
+                _ => reading_base(word_arc, *freq, lm) + boost + penalty,
+            };
             nh.score += step;
-            nh.pos = end;
-            nh.last = Some(word.clone());
-            nh.segments.push(LearnedWord::new(key.to_string(), word));
+            nh.pos = ctx.end;
+            nh.last = Some((word_arc.clone(), *word_idx));
+            nh.segments.push((ctx.key.clone(), word_arc.clone()));
             next.push(nh);
         }
     }
@@ -365,10 +465,10 @@ fn unigram_score(lm: &CntLm, word: &str) -> f32 {
 }
 
 /// 把学习段拼成候选文本。
-fn join_segments(segments: &[LearnedWord]) -> String {
+fn join_segments(segments: &[(Arc<str>, Arc<str>)]) -> String {
     let mut text = String::new();
-    for seg in segments {
-        text.push_str(&seg.word);
+    for (_, word) in segments {
+        text.push_str(word);
     }
     text
 }

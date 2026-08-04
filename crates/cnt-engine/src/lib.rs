@@ -312,27 +312,38 @@ impl Engine {
         }
 
         let action = {
+            // fastrace root span：覆盖按键处理的同步段（含 decode）。
+            // 正常按键（<5ms）cancel 掉不上报，只保留慢按键的 span 树
+            // 用于闪烁/卡顿诊断（daemon 的 ConsoleReporter 输出到 stderr）。
             let root = Span::root("process_key_event", SpanContext::random());
             let _guard = root.set_local_parent();
             log::debug!("keyval=0x{keyval:x} state=0x{state:x}");
 
-            let mut st = self.lock_state();
-            // 半角标点上下文：未组合且前一个字符是数字/英文 → 标点用半角（3，→ 3,）
-            let punct_half_width = if st.is_composing() {
-                false
-            } else {
-                let sur = self
-                    .surrounding
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                sur.as_ref().is_some_and(|(text, cursor)| {
-                    usize::try_from((*cursor - 1).max(0))
-                        .ok()
-                        .and_then(|idx| text.as_bytes().get(idx))
-                        .is_some_and(u8::is_ascii_alphanumeric)
-                })
+            let act = {
+                let mut st = self.lock_state();
+                // 半角标点上下文：未组合且前一个字符是数字/英文 → 标点用半角（3，→ 3,）
+                let punct_half_width = if st.is_composing() {
+                    false
+                } else {
+                    let sur = self
+                        .surrounding
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    sur.as_ref().is_some_and(|(text, cursor)| {
+                        usize::try_from((*cursor - 1).max(0))
+                            .ok()
+                            .and_then(|idx| text.as_bytes().get(idx))
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                    })
+                };
+                st.handle_key(keyval, &*self.decoder, punct_half_width)
             };
-            st.handle_key(keyval, &*self.decoder, punct_half_width)
+            // 同步段结束：释放 thread-local local parent，避免跨 await 污染
+            drop(_guard);
+            if root.elapsed() < Some(std::time::Duration::from_millis(5)) {
+                root.cancel();
+            }
+            act
         };
 
         match action {

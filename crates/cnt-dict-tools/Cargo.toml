@@ -10,6 +10,7 @@ cnt-dict.workspace = true
 cnt-lm.workspace = true
 cnt-decode.workspace = true
 cnt-input.workspace = true
+fastrace.workspace = true
 
 [lints]
 workspace = true

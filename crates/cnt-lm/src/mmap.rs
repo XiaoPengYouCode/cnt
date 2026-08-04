@@ -161,16 +161,23 @@ impl CntLm {
         Some((w.logprob, w.backoff))
     }
 
-    /// bigram 条件概率 `log P(w2 | w1)`。
+    /// 按词表下标取 unigram 概率 `(log10 概率, backoff)`。
     ///
     /// # Panics
-    /// 仅当词表大小超过 `u32` 上限时（已被 `MAX_WORDS` 封顶，不可能）。
+    /// 下标超过词表大小（仅当传入非法下标时）。
     #[must_use]
-    pub fn bigram(&self, w1: &str, w2: &str) -> Option<f32> {
-        let (Some(i1), Some(i2)) = (self.word_index(w1), self.word_index(w2)) else {
-            return None;
-        };
-        // bigram 表按 (w1, w2) 排序，二分
+    pub fn unigram_by_idx(&self, idx: u32) -> Option<(f32, f32)> {
+        let i = usize::try_from(idx).expect("idx fits usize");
+        let w = self.word_entry(i);
+        Some((w.logprob, w.backoff))
+    }
+
+    /// 按下标取 bigram 条件概率 `log P(w2 | w1)`（二分，避免字符串查找）。
+    ///
+    /// # Panics
+    /// 仅当 mmap 内部损坏导致大下标越界切片时（打开时已校验范围，不可能）。
+    #[must_use]
+    pub fn bigram_by_idx(&self, w1: u32, w2: u32) -> Option<f32> {
         let mut lo = 0usize;
         let mut hi = self.bigram_count;
         while lo < hi {
@@ -178,7 +185,7 @@ impl CntLm {
             let off = self.bigram_off + mid * BIGRAM_ENTRY_SIZE;
             let b = &self.mmap[off..off + BIGRAM_ENTRY_SIZE];
             let e = BigramEntry::read(b).expect("bigram range validated at open");
-            if (e.w1, e.w2) < (i1, i2) {
+            if (e.w1, e.w2) < (w1, w2) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -190,11 +197,23 @@ impl CntLm {
         let off = self.bigram_off + lo * BIGRAM_ENTRY_SIZE;
         let e = BigramEntry::read(&self.mmap[off..off + BIGRAM_ENTRY_SIZE])
             .expect("bigram range validated at open");
-        if (e.w1, e.w2) == (i1, i2) {
+        if (e.w1, e.w2) == (w1, w2) {
             Some(e.logprob)
         } else {
             None
         }
+    }
+
+    /// bigram 条件概率 `log P(w2 | w1)`。
+    ///
+    /// # Panics
+    /// 仅当词表大小超过 `u32` 上限时（已被 `MAX_WORDS` 封顶，不可能）。
+    #[must_use]
+    pub fn bigram(&self, w1: &str, w2: &str) -> Option<f32> {
+        let (Some(i1), Some(i2)) = (self.word_index(w1), self.word_index(w2)) else {
+            return None;
+        };
+        self.bigram_by_idx(i1, i2)
     }
 }
 

@@ -34,7 +34,9 @@ struct Entry {
 
 pub struct UserDb {
     path: PathBuf,
-    counts: HashMap<(String, String), Entry>,
+    /// 嵌套结构：`拼音 → 词 → 计数`。
+    /// 查询 `count()` 走两次 `HashMap` 查找，零分配（原先 `(String, String)` 键每次分配两个 `String`）。
+    counts: HashMap<String, HashMap<String, Entry>>,
     dirty: bool,
 }
 
@@ -45,7 +47,7 @@ impl UserDb {
     /// 文件读取失败时返回 IO 错误；格式非法的行会被忽略。
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut counts = HashMap::new();
+        let mut counts: HashMap<String, HashMap<String, Entry>> = HashMap::new();
         let now = now_secs();
         if let Ok(content) = fs::read_to_string(&path) {
             for line in content.lines() {
@@ -66,13 +68,16 @@ impl UserDb {
                     .next()
                     .and_then(|t| t.trim().parse::<i64>().ok())
                     .unwrap_or(now);
-                counts.insert(
-                    (pinyin.to_string(), word.to_string()),
-                    Entry {
-                        count: count.min(MAX_COUNT),
-                        updated_at,
-                    },
-                );
+                counts
+                    .entry(pinyin.to_string())
+                    .or_default()
+                    .insert(
+                        word.to_string(),
+                        Entry {
+                            count: count.min(MAX_COUNT),
+                            updated_at,
+                        },
+                    );
             }
         }
         Ok(Self {
@@ -86,7 +91,8 @@ impl UserDb {
     #[must_use]
     pub fn count(&self, pinyin: &str, word: &str) -> u32 {
         self.counts
-            .get(&(pinyin.to_string(), word.to_string()))
+            .get(pinyin)
+            .and_then(|m| m.get(word))
             .map_or(0, effective_u32)
     }
 
@@ -97,8 +103,10 @@ impl UserDb {
         let mut out: Vec<(String, String, u32)> = self
             .counts
             .iter()
-            .filter(|((p, _), _)| p.starts_with(prefix))
-            .map(|((p, w), e)| (p.clone(), w.clone(), effective_u32(e)))
+            .filter(|(p, _)| p.starts_with(prefix))
+            .flat_map(|(p, m)| {
+                m.iter().map(move |(w, e)| (p.clone(), w.clone(), effective_u32(e)))
+            })
             .collect();
         out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
         out.into_iter().map(|(p, w, _)| (p, w)).collect()
@@ -110,52 +118,60 @@ impl UserDb {
     pub fn words_for_pinyin(&self, pinyin: &str) -> Vec<String> {
         let mut out: Vec<(String, u32)> = self
             .counts
-            .iter()
-            .filter(|((p, _), _)| p == pinyin)
-            .map(|((_, w), e)| (w.clone(), effective_u32(e)))
-            .collect();
+            .get(pinyin)
+            .map(|m| {
+                m.iter()
+                    .map(|(w, e)| (w.clone(), effective_u32(e)))
+                    .collect()
+            })
+            .unwrap_or_default();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out.into_iter().map(|(w, _)| w).collect()
     }
 
     /// 用户选择了候选 (拼音, 词)：计数 +1（先按时间衰减，再封顶 `MAX_COUNT`）。
     pub fn bump(&mut self, pinyin: &str, word: &str) {
-        let key = (pinyin.to_string(), word.to_string());
         let now = now_secs();
-        if let Some(e) = self.counts.get_mut(&key) {
+        // 新词且已达上限：先淘汰（避免持内层借用时调用 evict）
+        let is_new = self.counts.get(pinyin).is_none_or(|m| !m.contains_key(word));
+        if is_new && self.len() >= MAX_USER_ENTRIES {
+            self.evict_lowest();
+            if self.len() >= MAX_USER_ENTRIES {
+                return; // 淘汰后仍满（新词本身是最低的），放弃
+            }
+        }
+        let inner = self.counts.entry(pinyin.to_string()).or_default();
+        if let Some(e) = inner.get_mut(word) {
             // 旧计数先衰减到当前有效值，再 +1
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let effective = effective(e).round() as u32; // 衰减值 ≥ 0
             e.count = effective.saturating_add(1).min(MAX_COUNT);
             e.updated_at = now;
         } else {
-            // 新词：受总条数上限约束，超出时淘汰最低有效计数词条
-            if self.counts.len() >= MAX_USER_ENTRIES {
-                self.evict_lowest();
-                if self.counts.len() >= MAX_USER_ENTRIES {
-                    return; // 淘汰后仍满（新词本身是最低的），放弃
-                }
-            }
-            self.counts.insert(key, Entry { count: 1, updated_at: now });
+            inner.insert(word.to_string(), Entry { count: 1, updated_at: now });
         }
         self.dirty = true;
     }
 
     /// 淘汰有效计数最低的一条（保持上限）。
     fn evict_lowest(&mut self) {
-        let Some((key, _)) = self
-            .counts
-            .iter()
-            .min_by(|(_, a), (_, b)| {
-                effective(a)
-                    .total_cmp(&effective(b))
-                    .then_with(|| a.updated_at.cmp(&b.updated_at))
-            })
-            .map(|(k, v)| (k.clone(), *v))
-        else {
-            return;
-        };
-        self.counts.remove(&key);
+        let mut best: Option<(String, String, f32)> = None;
+        for (p, m) in &self.counts {
+            for (w, e) in m {
+                let eff = effective(e);
+                if best.as_ref().is_none_or(|(_, _, b)| eff < *b) {
+                    best = Some((p.clone(), w.clone(), eff));
+                }
+            }
+        }
+        if let Some((p, w, _)) = best
+            && let Some(m) = self.counts.get_mut(&p)
+        {
+            m.remove(&w);
+            if m.is_empty() {
+                self.counts.remove(&p);
+            }
+        }
     }
 
     /// 持久化（仅在有改动时写盘；临时文件 + rename 原子替换）。
@@ -173,8 +189,10 @@ impl UserDb {
         {
             let f = BufWriter::new(File::create(&tmp)?);
             let mut w = f;
-            for ((pinyin, word), e) in &self.counts {
-                writeln!(w, "{pinyin}\t{word}\t{}\t{}", e.count, e.updated_at)?;
+            for (pinyin, m) in &self.counts {
+                for (word, e) in m {
+                    writeln!(w, "{pinyin}\t{word}\t{}\t{}", e.count, e.updated_at)?;
+                }
             }
             w.flush()?;
         }
@@ -186,7 +204,7 @@ impl UserDb {
     /// 用户词条总数。
     #[must_use]
     pub fn len(&self) -> usize {
-        self.counts.len()
+        self.counts.values().map(HashMap::len).sum()
     }
 
     /// 用户词条是否为空。
