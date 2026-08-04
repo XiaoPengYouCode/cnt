@@ -318,22 +318,20 @@ impl EngineState {
         }
 
         match keyval {
-            // 空格 / 回车：提交光标处候选（无候选时提交原始拼音）
+            // 空格：提交光标处候选；回车：把拼音原文当英文直接提交（不上屏候选、
+            // 不产生学习数据）。两者都会清空组合。
             keysym::SPACE | keysym::RETURN => {
                 let buf = self.buffer.clone();
-                if let Some(cand) = self.selected().cloned() {
-                    self.clear();
-                    Action::Commit {
-                        text: cand.text,
-                        learned: cand.learned,
-                    }
+                let (text, learned) = if keyval == keysym::SPACE {
+                    self.selected().cloned().map_or_else(
+                        || (buf, Vec::new()),
+                        |c| (c.text, c.learned),
+                    )
                 } else {
-                    self.clear();
-                    Action::Commit {
-                        text: buf,
-                        learned: Vec::new(),
-                    }
-                }
+                    (buf, Vec::new()) // 回车：拼音原文提交
+                };
+                self.clear();
+                Action::Commit { text, learned }
             }
 
             // 退格
@@ -522,6 +520,39 @@ mod tests {
             Action::Commit { text, learned } => {
                 assert_eq!(text, "你");
                 assert_eq!(learned, vec![LearnedWord::new("ni".to_string(), "你".to_string())]);
+            }
+            other => panic!("expected commit, got {other:?}"),
+        }
+        assert!(!st.is_composing());
+    }
+
+    #[test]
+    fn enter_commits_raw_pinyin_as_english() {
+        let mut st = EngineState::new();
+        let d = source();
+        st.handle_key(0x6e, &d, false); // n
+        st.handle_key(0x69, &d, false); // i
+        assert_eq!(st.candidates()[0].text, "你");
+        // Enter 应提交拼音原文（不上屏候选），且不产生学习数据
+        match st.handle_key(keysym::RETURN, &d, false) {
+            Action::Commit { text, learned } => {
+                assert_eq!(text, "ni");
+                assert!(learned.is_empty());
+            }
+            other => panic!("expected commit, got {other:?}"),
+        }
+        assert!(!st.is_composing());
+    }
+
+    #[test]
+    fn enter_commits_partial_pinyin() {
+        let mut st = EngineState::new();
+        let d = source();
+        st.handle_key(0x6e, &d, false); // n（无候选的未完成拼音）
+        match st.handle_key(keysym::RETURN, &d, false) {
+            Action::Commit { text, learned } => {
+                assert_eq!(text, "n");
+                assert!(learned.is_empty());
             }
             other => panic!("expected commit, got {other:?}"),
         }
