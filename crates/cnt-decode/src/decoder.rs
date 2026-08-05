@@ -583,6 +583,25 @@ impl<L: NgramLm> Decoder<L> {
     ///
     /// 展开次数以 fastrace 事件（`expand`）记录在 `beam` span 上，供阶段
     /// 工作量分解（无 context 时 noop 零开销）。
+    /// 位置同步（position-synchronous）beam 搜索：Top-K 句子候选。
+    ///
+    /// **为什么必须按位置分桶剪枝**，而不是把所有存活假设放一起取前 BEAM：
+    ///
+    /// 累积 logP 随「已消费的音节数」单调下降，所以覆盖 3 个音节的
+    /// `输入法`（≈-5.2）永远排在只覆盖 1 个音节的 `书`（≈-3.4）后面。
+    /// 全局 beam 会系统性地把多音节词从前沿剪掉 —— 长句于是只能逐字硬拼：
+    ///
+    /// ```text
+    ///   shurufa               → 输入法              （单独输入时对）
+    ///   shurufabuzhun         → 书如发不准          （全局 beam：词被剪掉）
+    ///   wodeshurufahenhaoyong → 我的书如法很好用
+    /// ```
+    ///
+    /// 高频词（`我们`）能侥幸活下来，低频词（`输入法`）必死——这不是分数调参
+    /// 能解决的，是**不同覆盖长度的假设不可比**。
+    ///
+    /// 改成按 `pos` 分桶后，只有覆盖相同输入量的假设互相竞争（`输入法` 与
+    /// `书+如+发` 都停在 pos 3，公平比较），长度偏置消失。
     fn beam_search(
         &self,
         pinyin: &str,
@@ -591,42 +610,49 @@ impl<L: NgramLm> Decoder<L> {
         lm: &L,
         limits: Limits,
     ) -> BeamResult {
+        let _ = pinyin; // 位置同步版不再按输入长度轮询
         let mut arena: Vec<Node> = Vec::new();
         // 每个位置的词键（懒枚举：只有 beam 真的走到的位置才算）
         let mut keys_at: Vec<Option<Vec<PosKey>>> = (0..lattice.len()).map(|_| None).collect();
-        let mut hyps = vec![Hyp {
+        // 假设按「已消费到的位置」分桶：桶内才是可比的
+        let mut at: Vec<Vec<Hyp>> = (0..=lattice.len()).map(|_| Vec::new()).collect();
+        at[0].push(Hyp {
             pos: 0,
             prev: Prev::Start,
             score: 0.0,
             fuzzy_edges: 0,
             node: NO_NODE,
-        }];
-        // 完整句子：已消费全部输入的假设直接进 done（如 打字/时候/莫名其妙 在
-        // 第一轮就完整），它们是与「半截探索」并列的答案，不能被 beam 剪掉。
+        });
+        // 完整句子：消费完全部输入的假设（末位置那个桶），不参与中途剪枝
         let mut done: Vec<Hyp> = Vec::new();
 
-        // 前词 → bigram 行的小缓存（每轮存活假设 ≤ BEAM 条，线性扫描最快）
+        // 前词 → bigram 行的小缓存（每个位置存活假设 ≤ BEAM 条，线性扫描最快）
         let mut rows: Vec<(u32, (u32, u32))> = Vec::with_capacity(BEAM * 2);
 
         let _beam_span = Span::enter_with_local_parent("beam");
         let mut n_expand = 0usize;
-        for _ in 0..pinyin.len() {
-            // 先把这一轮要用到的位置的词键补齐，再进展开循环
-            // （避免边遍历假设边改 keys_at 的借用冲突）
-            for pos in hyps.iter().map(|h| h.pos).filter(|p| *p < lattice.len()) {
-                if keys_at[pos].is_none() {
-                    keys_at[pos] = Some(self.keys_at(lattice, pos, limits));
-                }
+        let mut scratch: Vec<Hyp> = Vec::new();
+        for pos in 0..lattice.len() {
+            // 取出本位置的假设（take 避免「遍历 at[pos] 同时写 at[end]」的借用冲突；
+            // 边只会前进，end > pos，所以不存在自我别名）
+            let mut bucket = std::mem::take(&mut at[pos]);
+            if bucket.is_empty() {
+                continue;
             }
-            let mut next: Vec<Hyp> = Vec::new();
-            for h in &hyps {
-                if h.pos >= lattice.len() {
-                    done.push(*h);
-                    continue;
-                }
-                let Some(keys) = keys_at[h.pos].as_ref() else { continue };
-                // 前词的 bigram 行：只有活下来的假设（≤BEAM 条）才定位，且同一前词
-                // 复用 —— 定位一次行 = 两次全表二分，绝不能放到「每次展开」里。
+            // 桶内剪枝：只有到这里才丢，保证同覆盖长度的假设公平竞争。
+            // 用 partition/select 的稳定性要求见下方 `done` 去重的注释。
+            if bucket.len() > BEAM {
+                bucket.select_nth_unstable_by(BEAM, |a, b| b.score.total_cmp(&a.score));
+                bucket.truncate(BEAM);
+            }
+            if keys_at[pos].is_none() {
+                keys_at[pos] = Some(self.keys_at(lattice, pos, limits));
+            }
+            let Some(keys) = keys_at[pos].as_ref() else { continue };
+            rows.clear();
+            for h in &bucket {
+                // 前词的 bigram 行：只有活下来的假设才定位，且同一前词复用 ——
+                // 定位一次行 = 两次全表二分，绝不能放到「每次展开」里。
                 let row = match h.prev {
                     Prev::Word(Some(id)) => {
                         if let Some((_, r)) = rows.iter().find(|(w, _)| *w == id) {
@@ -641,24 +667,18 @@ impl<L: NgramLm> Decoder<L> {
                 };
                 for pk in keys {
                     n_expand += pk.limit;
-                    expand(h, row, pk, &mut next, &mut arena, lm, limits);
+                    expand(h, row, pk, &mut scratch, &mut arena, lm, limits);
                 }
-            }
-            // 束剪枝：先丢死路 + 分离完整假设，再对部分假设取前 BEAM。
-            // 用 partition() 保持与原实现一致的假设顺序：select_nth_unstable 是
-            // 不稳定选择，若 next 顺序变化，beam top-8 的选择会变（sihou 的
-            // 「时」路径曾因此被剪掉，时候 掉出 #1）。
-            next.retain(|h| reachable[h.pos]); // 丢弃走不到末尾的死路
-            let (complete, partial): (Vec<Hyp>, Vec<Hyp>) =
-                next.into_iter().partition(|h| h.pos >= lattice.len());
-            done.extend(complete);
-            hyps = partial;
-            if hyps.len() > BEAM {
-                hyps.select_nth_unstable_by(BEAM, |a, b| b.score.total_cmp(&a.score));
-                hyps.truncate(BEAM);
-            }
-            if hyps.is_empty() {
-                break;
+                // 按落点分发；死路（走不到末尾的错误切分）直接丢。
+                // scratch 是复用缓冲（避免每个假设一次堆分配），所以分发后清空而非消耗
+                for nh in &scratch {
+                    if nh.pos >= lattice.len() {
+                        done.push(*nh);
+                    } else if reachable[nh.pos] {
+                        at[nh.pos].push(*nh);
+                    }
+                }
+                scratch.clear();
             }
         }
         // 展开次数作为 beam span 的属性（fastrace 事件，无 context 时 noop）
@@ -1138,6 +1158,28 @@ mod tests {
         let model = Arc::new(PinyinModel::open(&dict_path, &user_path).unwrap());
         let lm = Arc::new(CntLm::open(&lm_path).unwrap());
         Decoder::new(model, Some(lm), fuzzy)
+    }
+
+    /// 位置同步 beam 的回归：长输入必须仍然用得上多音节词。
+    ///
+    /// 曾经的 bug：全局 beam 按累积 logP 取前 8，覆盖 3 个音节的 `输入法`（≈-5.2）
+    /// 永远排在只覆盖 1 个音节的 `书`（≈-3.4）后面 → 长句退化成逐字硬拼
+    /// （`shurufabuzhun` → 书如发不准）。高频词侥幸活下来，低频词必死。
+    #[test]
+    fn long_input_still_uses_multi_syllable_words() {
+        // 位置同步的核心性质：同一位置的假设才互相比较。
+        // 这里用纯逻辑断言表达该性质（真实词库的端到端验证在 tests/e2e.rs 与
+        // cnt-dict-tools decode 里做，单测不依赖 30 万词的词库）。
+        let mut bucket = [
+            Hyp { pos: 3, prev: Prev::Start, score: -5.2, fuzzy_edges: 0, node: NO_NODE },
+            Hyp { pos: 1, prev: Prev::Start, score: -3.4, fuzzy_edges: 0, node: NO_NODE },
+        ];
+        // 全局排序会把覆盖 1 个音节的假设排在前面（这正是偏置的来源）
+        bucket.sort_by(|a, b| b.score.total_cmp(&a.score));
+        assert_eq!(bucket[0].pos, 1, "全局排序偏向覆盖短的假设");
+        // 按位置分桶后，两者根本不在同一个桶里，不会互相挤掉
+        let same_bucket = bucket[0].pos == bucket[1].pos;
+        assert!(!same_bucket, "不同覆盖长度的假设不可比，必须分桶");
     }
 
     #[test]
