@@ -57,8 +57,16 @@ pub enum AsrError {
     Config(String),
 }
 
+/// 一条候选假设：文本 + 声学对数概率（自然对数，越大越好）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hypothesis {
+    pub text: String,
+    /// 声学模型给的对数概率（**自然对数**，CTC 口径）。
+    pub acoustic: f32,
+}
+
 /// 一次识别的结果。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Transcript {
     /// 后处理完成、可直接上屏的文本。
     pub text: String,
@@ -66,6 +74,12 @@ pub struct Transcript {
     pub tokens: Vec<String>,
     /// 模型识别出的语言标签（如 `zh`/`en`），未知时为 None。
     pub language: Option<String>,
+    /// n-best（含 #1，按声学分数降序）。
+    ///
+    /// 语音识别的主要错误是**音对字错**（`瓶颈`→`平境`、`语音`→`原音`），
+    /// 正确答案常常就在第 2、3 名里。只有把备选交出来，语言模型才有翻盘的机会；
+    /// 只给 1-best 等于把纠错的可能性提前丢掉。
+    pub alternatives: Vec<Hypothesis>,
 }
 
 impl Transcript {
@@ -74,6 +88,23 @@ impl Transcript {
     pub const fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
+}
+
+/// 文本打分端口：给一段文本一个语言模型对数概率（log10）。
+///
+/// 用途是**在 n-best 之间比较**，不是绝对概率。声学模型只听得见「音」，
+/// 分不清同音异形；而这条端口背后是中文的 n-gram 统计（`cnt-lm` 的 27 万 unigram
+/// + 480 万 bigram），恰好补上这一块。
+///
+/// 实现要遵守：
+/// - **单位是 log10**（与 `cnt-lm`/`cnt-score` 一致；CTC 的自然对数由调用方换算）；
+/// - 打不了分（模型没装、文本为空）时返回 `None`，调用方保持声学顺序。
+pub trait TextScorer: Send + Sync {
+    /// 文本的语言模型对数概率（log10）；无法打分时 None。
+    fn logp10(&self, text: &str) -> Option<f32>;
+
+    /// 后端名字（日志/诊断用）。
+    fn name(&self) -> &str;
 }
 
 /// 标点恢复端口：光板文本 → 带标点文本。

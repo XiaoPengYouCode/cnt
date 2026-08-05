@@ -15,7 +15,8 @@ crates/
 ├── cnt-decode        拼音切分（标准 410 音节表）+ 整句解码（beam search + 词级格）
 ├── cnt-dict-tools    词库/LM CLI：build / build-lm / decode / info / query
 ├── cnt-input         输入逻辑（纯状态机，无 IO；候选接口 + 热键解析）
-├── cnt-asr           语音端口层（零依赖）：Recognizer / Punctuator 契约 + 文本后处理
+├── cnt-asr           语音端口层（零依赖）：Recognizer / Punctuator / TextScorer 契约 + 文本后处理
+├── cnt-asr-lm        适配器：用 n-gram + 用户词库给 ASR 的 n-best 打分（热词偏置）
 ├── cnt-asr-onnx      识别 + 标点后端（ort/CPU）：自研 fbank/LFR/CMVN/CTC + CT-Transformer 标点
 ├── cnt-audio         麦克风采集（cpal）+ 带窗 sinc 重采样 + 自适应能量 VAD 切句
 ├── cnt-voice         语音编排：按住说话 / 切换式常开，每句一棵 span 树
@@ -305,7 +306,34 @@ vad_margin_db = 10.0                 # 高于噪声底多少 dB 算语音
 | 端口 | 粒度 | 频次 | 分派 | 当前实现 | 缺省退化 |
 |---|---|---|---|---|---|
 | `Recognizer` | 一整段语音 0.3~60 s | 每句 1 次 | `dyn` | `SenseVoice`（Fun-ASR-Nano CTC） | 无（语音功能关闭） |
+| `TextScorer` | n-best 里每条文本 | 每句 ≤8 次 | `dyn` | `LmTextScorer`（`cnt-lm` + 用户词库） | None（保持声学顺序） |
 | `Punctuator` | 一句文本几十字 | 每句 ≤1 次 | `dyn` | `CtPunctuator`（CT-Transformer） | `NoPunct` 直通 |
+
+### n-best 重排：让语言模型纠「音对字错」
+
+CTC 贪心只给 1-best，而语音识别的主要错误恰恰是**音对字错**——正确答案通常
+就躺在第 2、3 名里。所以改用 **CTC prefix beam search** 出 n-best，再用
+`cnt-lm`（27 万 unigram + 480 万 bigram）重排：
+
+```text
+声学 n-best                              融合分 = 声学(log10) + 0.5 × LM(log10)
+  #0 -0.47  开饭时间早上九点至下午五点     ← 声学 #1
+  #1 -1.71  开放时间早上九点至下午五点     ← LM 重排后胜出（正确）
+  #2 -4.15  开饭时间朝上九点至下午五点
+```
+
+三条保守约束（与拼音侧重排同源）：候选 <2 条不重排；#1 领先 #2 超过 1.5 log10
+不重排（声学已确定，插手只会把「说得不常见但确实说了」改成「常见但不是我说的」）；
+融合而非替代。
+
+**热词偏置**：`user.dict` 里的词按 `min(选择次数, 10) × 0.2` 加分——与拼音候选
+排序用的是同一把尺（`cnt_score::policy::user`）。通用声学模型不可能知道你把
+「工站」当常用词，而这份数据正是你自己一次次选出来的，是本地方案独有的信息。
+
+**一道必须有的闸**：未登录字占比 >40% 时 `TextScorer` 返回 `None` 拒绝打分。
+中文 n-gram 给日语句子打分时假名全是未登录字，分数只反映「文本有多长」，
+重排会系统性选最短的那条把句尾吃掉（实测 `…パンを買う` → `…パンを買`）。
+这与拼音侧「不同覆盖长度的假设不可比」是同一类错误：**不可比的东西不要比**。
 
 **为什么标点是独立端口**（而不是识别器的内部细节）：实测三个模型三种情况——
 `Fun-ASR-Nano` 的 CTC 头词表**有**标点 token 但输出光板文本；`SenseVoice-Small`

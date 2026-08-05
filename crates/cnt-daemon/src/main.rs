@@ -95,10 +95,10 @@ fn lm_path() -> PathBuf {
     )
 }
 
-/// 加载词库、用户数据与语言模型，构造解码器。
+/// 加载词库、用户数据与语言模型，构造解码器（返回解码器 + LM 供语音侧复用）。
 ///
 /// 词库是硬依赖（缺失即退出）；语言模型缺失时降级为单字/词候选。
-fn load_decoder() -> Arc<Decoder> {
+fn load_decoder() -> (Arc<Decoder>, Arc<PinyinModel>, Option<Arc<CntLm>>) {
     // 词库 + 用户数据（mmap 二进制词库）
     let dict_path = dict_path();
     let user_path = user_path();
@@ -138,7 +138,32 @@ fn load_decoder() -> Arc<Decoder> {
             None
         }
     };
-    Arc::new(Decoder::new(model, lm, true))
+    (
+        Arc::new(Decoder::new(model.clone(), lm.clone(), true)),
+        model,
+        lm,
+    )
+}
+
+/// 语音的 n-best 重排器：**复用拼音那份 LM 与用户词库**。
+///
+/// 这是本地方案独有的优势：通用声学模型不可能知道你把「工站」当常用词，
+/// 而这份用户数据正是你自己一次次选出来的。两条链路共用同一把尺
+/// （`cnt_score::policy::user`），同一份证据没有理由采信程度不同。
+fn load_rescorer(
+    lm: Option<&Arc<CntLm>>,
+    model: &Arc<PinyinModel>,
+) -> Option<Arc<dyn cnt_asr::TextScorer>> {
+    let lm = lm?;
+    let user_words = model.user_words();
+    let n_user = user_words.len();
+    let scorer = cnt_asr_lm::LmTextScorer::with_user_words(Arc::clone(lm), user_words);
+    log::info!(
+        "voice rescorer: {} ({n_user} user words, {} lm words)",
+        cnt_asr::TextScorer::name(&scorer),
+        lm.word_count()
+    );
+    Some(Arc::new(scorer))
 }
 
 /// 加载语音输入（可选）。
@@ -183,7 +208,10 @@ fn load_punctuator(settings: &cnt_config::VoiceSettings) -> Arc<dyn cnt_asr::Pun
     }
 }
 
-fn load_voice(settings: &cnt_config::VoiceSettings) -> Option<Arc<VoiceRuntime>> {
+fn load_voice(
+    settings: &cnt_config::VoiceSettings,
+    scorer: Option<Arc<dyn cnt_asr::TextScorer>>,
+) -> Option<Arc<VoiceRuntime>> {
     use cnt_asr_onnx::{SenseVoice, SenseVoiceConfig};
     use cnt_audio::vad::VadConfig;
     use cnt_audio::CaptureConfig;
@@ -238,7 +266,7 @@ fn load_voice(settings: &cnt_config::VoiceSettings) -> Option<Arc<VoiceRuntime>>
         ..VoiceConfig::default()
     };
     let punctuator = load_punctuator(settings);
-    match Voice::new(Arc::new(model), punctuator, voice_config) {
+    match Voice::new(Arc::new(model), punctuator, scorer, voice_config) {
         Ok(voice) => Some(Arc::new(VoiceRuntime::new(
             voice,
             &settings.ptt_key,
@@ -255,7 +283,7 @@ fn load_voice(settings: &cnt_config::VoiceSettings) -> Option<Arc<VoiceRuntime>>
 async fn main() -> Result<(), DaemonError> {
     init_observability();
 
-    let decoder = load_decoder();
+    let (decoder, model, lm) = load_decoder();
 
     // 加载配置（TOML，仅候选词数一项）
     let config_path = std::env::var_os("CNT_CONFIG").map_or_else(AppConfig::default_path, PathBuf::from);
@@ -269,7 +297,8 @@ async fn main() -> Result<(), DaemonError> {
     log::info!("config: {} (page_size={})", config_path.display(), config.page_size);
 
     // 语音输入（可选；模型加载在这里同步做一次，失败只是没有语音）
-    let voice = load_voice(&config.voice);
+    let rescorer = load_rescorer(lm.as_ref(), &model);
+    let voice = load_voice(&config.voice, rescorer);
 
     // 1. 找到 IBus 私有总线地址并连接
     let addr = cnt_ibus::find_address()?;

@@ -150,6 +150,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cnt-asr-lm"
+version = "0.1.0"
+dependencies = [
+ "cnt-asr",
+ "cnt-score",
+ "fastrace",
+ "log",
+]
+
+[[package]]
 name = "cnt-asr-onnx"
 version = "0.1.0"
 dependencies = [
@@ -166,8 +176,10 @@ name = "cnt-asr-tools"
 version = "0.1.0"
 dependencies = [
  "cnt-asr",
+ "cnt-asr-lm",
  "cnt-asr-onnx",
  "cnt-audio",
+ "cnt-lm",
  "cnt-voice",
  "fastrace",
  "hound",
@@ -200,6 +212,7 @@ name = "cnt-daemon"
 version = "0.1.0"
 dependencies = [
  "cnt-asr",
+ "cnt-asr-lm",
  "cnt-asr-onnx",
  "cnt-audio",
  "cnt-config",

@@ -40,7 +40,7 @@ use fastrace::local::LocalSpan;
 use fastrace::{Event, Span};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use cnt_asr::{AsrError, Punctuator, Recognizer};
+use cnt_asr::{AsrError, Punctuator, Recognizer, TextScorer};
 use cnt_audio::vad::{Segment, Segmenter, VadConfig};
 use cnt_audio::{samples_to_secs, AudioError, CaptureConfig, Recorder};
 
@@ -48,6 +48,19 @@ use cnt_audio::{samples_to_secs, AudioError, CaptureConfig, Recorder};
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// 音量/时长上报间隔：够跟手，又不会把 D-Bus 刷爆。
 const LEVEL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 语言模型在融合分里的权重（shallow fusion 的 λ）。
+///
+/// 与拼音侧重排的默认 λ 一致（`cnt_score::RescorePolicy`）：融合而不是替代 ——
+/// 声学分仍是主，语言模型只在它拿不定主意时起决定作用。
+const LM_WEIGHT: f32 = 0.5;
+/// 触发重排的声学分差门限（log10）。
+///
+/// #1 比 #2 领先超过这个幅度就不动：声学已经很确定，此时让语言模型插手
+/// 只会把「说得不常见但确实说了」的话改成「常见但不是我说的」。
+const RESCORE_GAP: f32 = 1.5;
+/// 自然对数 → log10（CTC 用自然对数，`cnt-lm` 用 log10，必须统一口径）。
+const LN_TO_LOG10: f32 = std::f32::consts::LOG10_E;
 
 /// 语音输入错误。
 #[derive(Debug, thiserror::Error)]
@@ -161,6 +174,7 @@ pub struct Voice {
     handle: Option<std::thread::JoinHandle<()>>,
     backend: String,
     punct: String,
+    rescorer: String,
     device: String,
 }
 
@@ -173,12 +187,16 @@ impl Voice {
     pub fn new(
         recognizer: Arc<dyn Recognizer>,
         punctuator: Arc<dyn Punctuator>,
+        scorer: Option<Arc<dyn TextScorer>>,
         config: VoiceConfig,
     ) -> Result<Self, VoiceError> {
         let recorder = Recorder::spawn(&config.capture)?;
         let device = recorder.device_name().to_owned();
         let backend = recognizer.name().to_owned();
         let punct = punctuator.name().to_owned();
+        let rescorer = scorer
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |s| s.name().to_owned());
         let active = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         let worker_active = Arc::clone(&active);
@@ -189,6 +207,7 @@ impl Voice {
                     recorder,
                     recognizer,
                     punctuator,
+                    scorer,
                     config,
                     active: worker_active,
                 };
@@ -201,6 +220,7 @@ impl Voice {
             handle: Some(handle),
             backend,
             punct,
+            rescorer,
             device,
         })
     }
@@ -215,6 +235,12 @@ impl Voice {
     #[must_use]
     pub fn punctuator(&self) -> &str {
         &self.punct
+    }
+
+    /// 重排器名（`none` = 未装语言模型）。
+    #[must_use]
+    pub fn rescorer(&self) -> &str {
+        &self.rescorer
     }
 
     /// 输入设备名。
@@ -279,6 +305,8 @@ struct Worker {
     recognizer: Arc<dyn Recognizer>,
     /// 标点恢复（没装模型时是 `NoPunct`，零开销直通）。
     punctuator: Arc<dyn Punctuator>,
+    /// n-best 重排的语言模型（None = 只用声学 1-best）。
+    scorer: Option<Arc<dyn TextScorer>>,
     config: VoiceConfig,
     active: Arc<AtomicBool>,
 }
@@ -433,6 +461,13 @@ impl Worker {
         }
     }
 
+    /// n-best 重排（委托给纯函数 [`rescore_nbest`]，便于单测）。
+    fn rescore(&self, transcript: &mut cnt_asr::Transcript) {
+        if let Some(scorer) = &self.scorer {
+            rescore_nbest(transcript, scorer.as_ref());
+        }
+    }
+
     fn recognize_segment(&self, segment: &Segment, tx: &UnboundedSender<VoiceEvent>) {
         log::debug!(
             "voice: segment at {:.1}s, {:.2}s long{}",
@@ -456,6 +491,10 @@ impl Worker {
                     .with_property(|| ("forced", forced.to_string())),
             );
             let mut out = self.recognizer.transcribe(samples);
+            // n-best 重排：声学分不确定时让语言模型说话（详见 rescore()）
+            if let Ok(t) = &mut out {
+                self.rescore(t);
+            }
             // 标点恢复：**失败就用原文**（端口契约），一句话绝不能因为标点丢掉
             if let Ok(t) = &mut out
                 && !t.text.is_empty()
@@ -503,6 +542,69 @@ impl Worker {
     }
 }
 
+/// n-best 重排：`融合分 = 声学(log10) + λ × 语言模型(log10)`。
+///
+/// 语音识别的主要错误是**音对字错**（`瓶颈`→`平境`、`语音`→`原音`），
+/// 声学模型对这类错误无能为力——它听到的音确实是那个音。而中文 n-gram
+/// 恰好能分辨哪串字更像一句话。
+///
+/// 三条保守约束（与拼音侧的重排策略同源）：
+///
+/// 1. 只有 ≥2 条候选才重排（1-best 无从比较）；
+/// 2. #1 领先 #2 超过 [`RESCORE_GAP`] 就不动 —— 声学已经确定，
+///    此时插手只会把「说得不常见但确实说了」改成「常见但不是我说的」；
+/// 3. 融合而非替代（λ = [`LM_WEIGHT`]），声学分始终是主。
+///
+/// 纯函数：不碰麦克风、不碰模型，可以直接单测。
+pub fn rescore_nbest(transcript: &mut cnt_asr::Transcript, scorer: &dyn TextScorer) {
+    if transcript.alternatives.len() < 2 {
+        return;
+    }
+    let _span = Span::enter_with_local_parent("voice_rescore");
+
+    // 声学分换成 log10，与语言模型同口径
+    let acoustic: Vec<f32> = transcript
+        .alternatives
+        .iter()
+        .map(|h| h.acoustic * LN_TO_LOG10)
+        .collect();
+    let gap = acoustic[0] - acoustic[1];
+    if gap > RESCORE_GAP {
+        log::debug!("voice: acoustic is confident (gap {gap:.2}), skipping rescore");
+        return;
+    }
+
+    let mut best = (0usize, f32::NEG_INFINITY);
+    for (i, hyp) in transcript.alternatives.iter().enumerate() {
+        let Some(lm) = scorer.logp10(&hyp.text) else {
+            continue;
+        };
+        let fused = LM_WEIGHT.mul_add(lm, acoustic[i]);
+        log::debug!(
+            "voice: nbest[{i}] {:?} acoustic={a:.2} lm={lm:.2} fused={fused:.2}",
+            hyp.text,
+            a = acoustic[i]
+        );
+        if fused > best.1 {
+            best = (i, fused);
+        }
+    }
+    if best.0 != 0 {
+        let picked = transcript.alternatives[best.0].text.clone();
+        log::info!(
+            "voice: rescored {:?} → {picked:?} (gap was {gap:.2})",
+            transcript.text
+        );
+        LocalSpan::add_event(
+            Event::new("rescored")
+                .with_property(|| ("from", transcript.text.clone()))
+                .with_property(|| ("to", picked.clone()))
+                .with_property(|| ("model", scorer.name().to_owned())),
+        );
+        transcript.text = picked;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -516,10 +618,15 @@ mod tests {
 
     impl Recognizer for Fake {
         fn transcribe(&self, samples: &[f32]) -> Result<Transcript, AsrError> {
+            let text = format!("{}样本", samples.len());
             Ok(Transcript {
-                text: format!("{}样本", samples.len()),
                 tokens: vec!["x".to_owned()],
                 language: Some("zh".to_owned()),
+                alternatives: vec![cnt_asr::Hypothesis {
+                    text: text.clone(),
+                    acoustic: -1.0,
+                }],
+                text,
             })
         }
         fn name(&self) -> &'static str {
@@ -549,6 +656,74 @@ mod tests {
             r.transcribe(&[0.0; 3]).expect("fake never fails").text,
             "3样本"
         );
+    }
+
+    /// 假打分器：把「正确答案」打高分，用来验证融合与触发条件。
+    struct FakeScorer;
+
+    impl cnt_asr::TextScorer for FakeScorer {
+        fn logp10(&self, text: &str) -> Option<f32> {
+            // 「瓶颈」是通顺的，「平境」不是
+            Some(if text.contains('瓶') { -2.0 } else { -6.0 })
+        }
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    fn transcript(pairs: &[(&str, f32)]) -> Transcript {
+        let alts: Vec<cnt_asr::Hypothesis> = pairs
+            .iter()
+            .map(|(t, a)| cnt_asr::Hypothesis {
+                text: (*t).to_owned(),
+                acoustic: *a,
+            })
+            .collect();
+        Transcript {
+            text: alts[0].text.clone(),
+            tokens: Vec::new(),
+            language: None,
+            alternatives: alts,
+        }
+    }
+
+    #[test]
+    fn rescore_flips_homophone_when_acoustic_is_unsure() {
+        // 声学分接近（gap 0.2 log10）→ 语言模型说话
+        let mut t = transcript(&[("平境在哪里", -10.0), ("瓶颈在哪里", -10.5)]);
+        super::rescore_nbest(&mut t, &FakeScorer);
+        assert_eq!(t.text, "瓶颈在哪里");
+    }
+
+    #[test]
+    fn rescore_keeps_acoustic_when_confident() {
+        // 声学 #1 大幅领先（自然对数差 5 ≈ log10 差 2.17 > 1.5）→ 不许改
+        let mut t = transcript(&[("平境在哪里", -10.0), ("瓶颈在哪里", -15.0)]);
+        super::rescore_nbest(&mut t, &FakeScorer);
+        assert_eq!(t.text, "平境在哪里", "声学确定时不该被语言模型翻掉");
+    }
+
+    #[test]
+    fn rescore_needs_at_least_two_candidates() {
+        let mut t = transcript(&[("平境", -10.0)]);
+        super::rescore_nbest(&mut t, &FakeScorer);
+        assert_eq!(t.text, "平境");
+    }
+
+    #[test]
+    fn rescore_ignores_unscorable_candidates() {
+        struct NoScore;
+        impl cnt_asr::TextScorer for NoScore {
+            fn logp10(&self, _text: &str) -> Option<f32> {
+                None
+            }
+            fn name(&self) -> &'static str {
+                "noscore"
+            }
+        }
+        let mut t = transcript(&[("平境", -10.0), ("瓶颈", -10.1)]);
+        super::rescore_nbest(&mut t, &NoScore);
+        assert_eq!(t.text, "平境", "打不了分就保持声学顺序");
     }
 
     #[test]

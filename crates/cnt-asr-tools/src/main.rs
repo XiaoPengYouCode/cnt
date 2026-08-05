@@ -107,6 +107,8 @@ fn init_logging() {
 // ---------------------------------------------------------------------------
 
 /// 从参数里摘出 `--flag value` 与 `--flag`，剩下的是位置参数。
+// CLI 的开关就是一堆独立布尔，聚合成子结构只会让调用处更啰嗦
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     positional: Vec<String>,
     lang: String,
@@ -117,6 +119,12 @@ struct Args {
     punct: Option<String>,
     /// 关掉标点恢复。
     no_punct: bool,
+    /// 语言模型路径（给出则对 n-best 做重排）。
+    lm: Option<String>,
+    /// 用户词库路径（配合 --lm 做热词偏置）。
+    user: Option<String>,
+    /// 打印 n-best 明细。
+    verbose: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, CliError> {
@@ -128,6 +136,9 @@ fn parse_args(args: &[String]) -> Result<Args, CliError> {
         continuous: false,
         punct: None,
         no_punct: false,
+        lm: None,
+        user: None,
+        verbose: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -146,6 +157,21 @@ fn parse_args(args: &[String]) -> Result<Args, CliError> {
             }
             "--no-itn" => out.itn = false,
             "--no-punct" => out.no_punct = true,
+            "--verbose" | "-v" => out.verbose = true,
+            "--lm" => {
+                out.lm = Some(
+                    it.next()
+                        .ok_or_else(|| CliError::Usage("--lm needs a path".into()))?
+                        .clone(),
+                );
+            }
+            "--user" => {
+                out.user = Some(
+                    it.next()
+                        .ok_or_else(|| CliError::Usage("--user needs a path".into()))?
+                        .clone(),
+                );
+            }
             "--punct" => {
                 out.punct = Some(
                     it.next()
@@ -191,6 +217,24 @@ fn load_punct(acoustic_dir: &str, args: &Args) -> Option<Box<dyn Punctuator>> {
             None
         }
     }
+}
+
+/// 加载 n-best 重排器（`--lm` 给出时）。用户词库可选（`--user`）。
+fn load_rescorer(args: &Args) -> Option<Arc<dyn cnt_asr::TextScorer>> {
+    let path = args.lm.as_ref()?;
+    let lm = match cnt_lm::CntLm::open(path) {
+        Ok(lm) => Arc::new(lm),
+        Err(e) => {
+            eprintln!("（语言模型 {path} 打不开：{e}，不做重排）");
+            return None;
+        }
+    };
+    if args.user.is_some() {
+        // 用户词偏置需要连同词库一起打开（用户计数挂在拼音键下），
+        // 那是 daemon 的职责；CLI 只验证 n-gram 这一半
+        eprintln!("（--user 在 CLI 里不生效：热词偏置由 cnt-daemon 用真实词库提供）");
+    }
+    Some(Arc::new(cnt_asr_lm::LmTextScorer::new(lm)))
 }
 
 fn load_model(dir: &str, args: &Args) -> Result<SenseVoice, CliError> {
@@ -270,6 +314,7 @@ fn cmd_transcribe(args: &[String]) -> CliResult {
     }
     let model = load_model(dir, &args)?;
     let punct = load_punct(dir, &args);
+    let rescorer = load_rescorer(&args);
     for file in files {
         let samples = read_wav(file)?;
         let secs = samples_to_secs(samples.len());
@@ -279,9 +324,21 @@ fn cmd_transcribe(args: &[String]) -> CliResult {
         );
         let guard = root.set_local_parent();
         let t = Instant::now();
-        let result = model.transcribe(&samples)?;
+        let mut result = model.transcribe(&samples)?;
         let elapsed = t.elapsed();
         drop(guard);
+        if args.verbose {
+            for (i, h) in result.alternatives.iter().enumerate() {
+                println!("  nbest[{i}] {:.2}  {}", h.acoustic, h.text);
+            }
+        }
+        if let Some(scorer) = &rescorer {
+            let before = result.text.clone();
+            cnt_voice::rescore_nbest(&mut result, scorer.as_ref());
+            if before != result.text {
+                println!("  重排 {before} → {}", result.text);
+            }
+        }
         println!(
             "{file}: {:.2}s 音频，{:?}（RTF {:.3}）",
             secs,
@@ -440,7 +497,7 @@ fn cmd_live(args: &[String]) -> CliResult {
     // live 也走标点：和引擎里的链路一致，才能拿它当预演
     let punct: Arc<dyn Punctuator> = load_punct(dir, &args)
         .map_or_else(|| Arc::new(cnt_asr::NoPunct) as Arc<dyn Punctuator>, Arc::from);
-    let voice = Voice::new(Arc::new(model), punct, VoiceConfig::default())?;
+    let voice = Voice::new(Arc::new(model), punct, load_rescorer(&args), VoiceConfig::default())?;
     eprintln!(
         "⚠ 即将打开麦克风（{}，{secs:.1}s；设备：{}）",
         mode.as_str(),

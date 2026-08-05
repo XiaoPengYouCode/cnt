@@ -1,0 +1,16 @@
+[package]
+name = "cnt-asr-lm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cnt: n-gram + user-lexicon text scorer for ASR n-best rescoring"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cnt-asr.workspace = true
+cnt-score.workspace = true
+log.workspace = true
+fastrace.workspace = true

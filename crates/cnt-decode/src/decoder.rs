@@ -103,11 +103,6 @@ const SECONDARY_BASE: f32 = -6.0;
 const USER_WORD_BASE: f32 = -5.0;
 /// 判定「次读音」的频率上限（词库次读音 freq=1，主读音 ≥1e4）。
 const SECONDARY_FREQ_CAP: u32 = 100;
-/// 用户调频加成：每选一次候选的 log10 权重。
-const USER_BOOST_LOG: f32 = 0.2;
-/// 调频封顶次数：超过后不再增长（防止 了/个 这类高频字无限刷分，
-/// 让 32 次选择的 boost 不至于压过整个分数空间）。
-const USER_BOOST_CAP: u32 = 10;
 
 /// 一个词键下的候选词。
 ///
@@ -905,10 +900,9 @@ impl<L: NgramLm> Decoder<L> {
         out
     }
 
-    /// 用户调频加成：每选一次候选的 log10 权重（封顶 `USER_BOOST_CAP` 次）。
-    #[allow(clippy::cast_precision_loss)] // 用户计数 ≤ 100，u32→f32 无损
+    /// 用户调频加成（口径与语音侧共用：`cnt_score::policy::user`）。
     fn boost(&self, syllable: &str, word: &str) -> f32 {
-        self.model.user_count(syllable, word).min(USER_BOOST_CAP) as f32 * USER_BOOST_LOG
+        cnt_score::policy::user::boost(self.model.user_count(syllable, word))
     }
 
 }

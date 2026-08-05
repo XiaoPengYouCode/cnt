@@ -234,6 +234,132 @@ pub fn greedy_decode(logits: &[f32], vocab: usize, blank: usize) -> Vec<usize> {
     out
 }
 
+
+/// CTC prefix beam search 的束宽（候选前缀数）。
+///
+/// 8 条足够：CTC 的峰值很尖锐，真正有竞争的前缀通常只有 2~3 条；
+/// 束宽的作用是**让第 2、3 名浮出水面**给语言模型重排，不是靠它自己提准。
+pub const PREFIX_BEAM: usize = 8;
+/// 每帧只看概率最高的这么多个 token（词表 6 万，全展开纯属浪费）。
+const TOPK_PER_FRAME: usize = 8;
+
+/// 一条 CTC 假设：token id 序列 + 声学对数概率（自然对数）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CtcHyp {
+    pub ids: Vec<usize>,
+    pub logp: f32,
+}
+
+/// CTC prefix beam search：返回按声学分数降序的 n-best。
+///
+/// 与贪心的区别不在 1-best（CTC 峰值尖锐，两者的 #1 几乎总是一样），
+/// 而在于**它能给出第 2、3 名**——「音对字错」的正确答案往往就在那里，
+/// 交给语言模型重排才有翻盘的机会。贪心连备选都没有，LM 无从下手。
+///
+/// 实现是标准的 prefix beam search：每条前缀维护「以 blank 结尾」与
+/// 「以非 blank 结尾」两个概率，扩展时区分三种情况（blank / 重复上一个 token /
+/// 新 token），从而正确处理 CTC 的折叠语义。
+#[must_use]
+pub fn prefix_beam_search(logits: &[f32], vocab: usize, blank: usize, beam: usize) -> Vec<CtcHyp> {
+    let _span = fastrace::Span::enter_with_local_parent("ctc_beam");
+    if vocab == 0 || logits.len() < vocab {
+        return Vec::new();
+    }
+    // (前缀, 以 blank 结尾的 logP, 以非 blank 结尾的 logP)
+    let mut beams: Vec<(Vec<usize>, f32, f32)> = vec![(Vec::new(), 0.0, f32::NEG_INFINITY)];
+    let mut scratch: Vec<(usize, f32)> = Vec::with_capacity(TOPK_PER_FRAME);
+    let mut next: Vec<(Vec<usize>, f32, f32)> = Vec::new();
+
+    for frame in logits.chunks_exact(vocab) {
+        // 该帧的 log-softmax（只对 top-K 求值，但归一化用全量 logsumexp）
+        top_k_log_probs(frame, TOPK_PER_FRAME, &mut scratch);
+        next.clear();
+        for (prefix, pb, pnb) in &beams {
+            let total = log_add(*pb, *pnb);
+            let last = prefix.last().copied();
+            for (token, logp) in &scratch {
+                if *token == blank {
+                    // blank：前缀不变，落到「以 blank 结尾」
+                    push_beam(&mut next, prefix, total + logp, f32::NEG_INFINITY);
+                } else if Some(*token) == last {
+                    // 与上一个 token 相同：
+                    //  - 接在「非 blank 结尾」后面 → CTC 折叠，前缀不变
+                    push_beam(&mut next, prefix, f32::NEG_INFINITY, pnb + logp);
+                    //  - 接在「blank 结尾」后面 → 是新的一个 token，前缀延长
+                    let mut extended = prefix.clone();
+                    extended.push(*token);
+                    push_beam(&mut next, &extended, f32::NEG_INFINITY, pb + logp);
+                } else {
+                    let mut extended = prefix.clone();
+                    extended.push(*token);
+                    push_beam(&mut next, &extended, f32::NEG_INFINITY, total + logp);
+                }
+            }
+        }
+        // 按总概率剪枝
+        next.sort_by(|a, b| log_add(b.1, b.2).total_cmp(&log_add(a.1, a.2)));
+        next.truncate(beam.max(1));
+        beams.clear();
+        beams.append(&mut next);
+    }
+
+    let mut out: Vec<CtcHyp> = beams
+        .into_iter()
+        .map(|(ids, pb, pnb)| CtcHyp {
+            ids,
+            logp: log_add(pb, pnb),
+        })
+        .collect();
+    out.sort_by(|a, b| b.logp.total_cmp(&a.logp));
+    out
+}
+
+/// 累加到已有前缀上（前缀相同则做 log-sum-exp 合并）。
+fn push_beam(out: &mut Vec<(Vec<usize>, f32, f32)>, prefix: &[usize], pb: f32, pnb: f32) {
+    if let Some(slot) = out.iter_mut().find(|(p, _, _)| p.as_slice() == prefix) {
+        slot.1 = log_add(slot.1, pb);
+        slot.2 = log_add(slot.2, pnb);
+    } else {
+        out.push((prefix.to_vec(), pb, pnb));
+    }
+}
+
+/// 一帧里概率最高的 K 个 token 的对数概率（log-softmax）。
+///
+/// 归一化必须用**全量** logsumexp（6 万类），否则各帧的分数不可比、
+/// beam 的比较就失去意义。
+fn top_k_log_probs(frame: &[f32], k: usize, out: &mut Vec<(usize, f32)>) {
+    out.clear();
+    let max = frame.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = frame.iter().map(|v| (*v - max).exp()).sum();
+    let log_norm = max + sum.ln();
+    for (i, v) in frame.iter().enumerate() {
+        let logp = *v - log_norm;
+        if out.len() < k {
+            out.push((i, logp));
+            if out.len() == k {
+                out.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+        } else if logp > out[k - 1].1 {
+            out[k - 1] = (i, logp);
+            out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        }
+    }
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+}
+
+/// `log(exp(a) + exp(b))`，数值稳定版。
+fn log_add(a: f32, b: f32) -> f32 {
+    if a == f32::NEG_INFINITY {
+        return b;
+    }
+    if b == f32::NEG_INFINITY {
+        return a;
+    }
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    hi + (lo - hi).exp().ln_1p()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{greedy_decode, Tokens};
@@ -263,6 +389,58 @@ mod tests {
             logits.extend(frame(vocab, hot));
         }
         assert_eq!(greedy_decode(&logits, vocab, 3), vec![0, 1]);
+    }
+
+    #[test]
+    fn prefix_beam_matches_greedy_on_peaky_output() {
+        // CTC 峰值尖锐时，beam 的 #1 应与贪心一致
+        let vocab = 5;
+        let mut logits = Vec::new();
+        for hot in [0, 2, 2, 0, 2, 3, 3, 0] {
+            logits.extend(frame(vocab, hot));
+        }
+        let greedy = greedy_decode(&logits, vocab, 0);
+        let beam = super::prefix_beam_search(&logits, vocab, 0, 8);
+        assert!(!beam.is_empty());
+        assert_eq!(beam[0].ids, greedy, "尖锐输出上 beam 的 #1 必须等于贪心");
+    }
+
+    #[test]
+    fn prefix_beam_yields_alternatives() {
+        // 两个 token 概率接近的帧 → 应该出现第 2 名（这正是 LM 重排的原料）
+        let vocab = 4;
+        let mut logits = Vec::new();
+        logits.extend(vec![0.0, 5.0, 4.8, 0.0]); // token1 与 token2 势均力敌
+        logits.extend(frame(vocab, 0)); // blank
+        let beam = super::prefix_beam_search(&logits, vocab, 0, 8);
+        assert!(beam.len() >= 2, "势均力敌时必须给出备选：{beam:?}");
+        assert_eq!(beam[0].ids, vec![1]);
+        assert_eq!(beam[1].ids, vec![2]);
+        assert!(beam[0].logp > beam[1].logp);
+    }
+
+    #[test]
+    fn prefix_beam_collapses_repeats_like_ctc() {
+        // 同一 token 连续两帧（中间无 blank）→ 折叠成一个
+        let vocab = 3;
+        let mut logits = Vec::new();
+        logits.extend(frame(vocab, 1));
+        logits.extend(frame(vocab, 1));
+        let beam = super::prefix_beam_search(&logits, vocab, 0, 8);
+        assert_eq!(beam[0].ids, vec![1]);
+        // 中间插一个 blank → 变成两个
+        let mut logits2 = Vec::new();
+        logits2.extend(frame(vocab, 1));
+        logits2.extend(frame(vocab, 0));
+        logits2.extend(frame(vocab, 1));
+        let beam2 = super::prefix_beam_search(&logits2, vocab, 0, 8);
+        assert_eq!(beam2[0].ids, vec![1, 1]);
+    }
+
+    #[test]
+    fn prefix_beam_handles_degenerate_input() {
+        assert!(super::prefix_beam_search(&[], 5, 0, 8).is_empty());
+        assert!(super::prefix_beam_search(&[1.0, 2.0], 0, 0, 8).is_empty());
     }
 
     #[test]

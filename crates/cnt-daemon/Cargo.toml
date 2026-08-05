@@ -16,6 +16,7 @@ cnt-config.workspace = true
 cnt-decode.workspace = true
 cnt-engine.workspace = true
 cnt-asr.workspace = true
+cnt-asr-lm.workspace = true
 cnt-asr-onnx.workspace = true
 cnt-audio.workspace = true
 cnt-voice.workspace = true

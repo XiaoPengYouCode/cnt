@@ -235,7 +235,7 @@ impl Punctuator for CtPunctuator {
         }
         let ids: Vec<i32> = words
             .iter()
-            .map(|w| *self.vocab.get(*w).unwrap_or(&self.unk))
+            .map(|w| *self.vocab.get(w.text).unwrap_or(&self.unk))
             .collect();
 
         // 分段推理 + 窗口回溯（详见模块文档）
@@ -293,50 +293,64 @@ impl Punctuator for CtPunctuator {
     }
 }
 
-/// 把文本切成模型认识的「词」：CJK 逐字，拉丁按空白/字母边界成词。
+/// 一个切出来的词，以及它在原文里**前面是否有空白**。
+///
+/// 记住空白是契约要求的：端口承诺「只加标点、不改字」，而空格属于原文。
+/// 早先的实现把空白丢掉、只在两个拉丁词之间补回来，结果韩语（分词书写）
+/// 的空格被全部吃掉：`조금만 생각을 하면서` → `조금만생각을하면서`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Word<'a> {
+    pub text: &'a str,
+    /// 原文中该词之前有空白。
+    pub space_before: bool,
+}
+
+/// 把文本切成模型认识的「词」：CJK 逐字，拉丁按字母数字边界成词。
 ///
 /// 与官方实现同口径（汉字一个 id，英文单词一个 id），否则 id 序列错位、
-/// 标点会落到奇怪的位置。
+/// 标点会落到奇怪的位置。空白不产生词，但会记在下一个词的 `space_before` 上。
 #[must_use]
-pub fn split_words(text: &str) -> Vec<&str> {
+pub fn split_words(text: &str) -> Vec<Word<'_>> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
+    let mut pending_space = false;
     while i < text.len() {
         let Some(c) = text[i..].chars().next() else {
             break;
         };
         let width = c.len_utf8();
         if c.is_whitespace() {
+            pending_space = true;
             i += width;
             continue;
         }
-        if c.is_ascii_alphanumeric() {
+        let (text_slice, next) = if c.is_ascii_alphanumeric() {
             // 拉丁词/数字：吃到非字母数字为止
-            let start = i;
             let mut j = i;
             while j < text.len() && bytes[j].is_ascii_alphanumeric() {
                 j += 1;
             }
-            out.push(&text[start..j]);
-            i = j;
+            (&text[i..j], j)
         } else {
-            out.push(&text[i..i + width]);
-            i += width;
-        }
+            (&text[i..i + width], i + width)
+        };
+        out.push(Word {
+            text: text_slice,
+            space_before: pending_space,
+        });
+        pending_space = false;
+        i = next;
     }
     out
 }
 
-/// 词 + 标点类别 → 文本。
-fn join(words: &[&str], classes: &[usize], puncts: &[String]) -> String {
+/// 词 + 标点类别 → 文本。**原文的空白原样保留**（只加标点，不改字、不改空格）。
+fn join(words: &[Word<'_>], classes: &[usize], puncts: &[String]) -> String {
     let mut out = String::with_capacity(words.len() * 4);
-    for (i, word) in words.iter().enumerate() {
-        // 拉丁词之间补空格（汉字之间不补）
-        if !out.is_empty()
-            && word.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-            && out.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
-        {
+    for (i, w) in words.iter().enumerate() {
+        let word = w.text;
+        if w.space_before && !out.is_empty() {
             out.push(' ');
         }
         out.push_str(word);
@@ -377,29 +391,60 @@ fn err<E: std::fmt::Display>(e: E) -> AsrError {
 mod tests {
     use super::{join, split_words};
 
+    fn texts<'a>(words: &[super::Word<'a>]) -> Vec<&'a str> {
+        words.iter().map(|w| w.text).collect()
+    }
+
+    fn w(text: &str, space_before: bool) -> super::Word<'_> {
+        super::Word { text, space_before }
+    }
+
     #[test]
     fn splits_chinese_by_character() {
-        assert_eq!(split_words("你好世界"), vec!["你", "好", "世", "界"]);
+        assert_eq!(texts(&split_words("你好世界")), vec!["你", "好", "世", "界"]);
     }
 
     #[test]
     fn splits_latin_by_word() {
-        assert_eq!(split_words("hello world 123"), vec!["hello", "world", "123"]);
+        assert_eq!(
+            texts(&split_words("hello world 123")),
+            vec!["hello", "world", "123"]
+        );
     }
 
     #[test]
     fn splits_mixed_text() {
         assert_eq!(
-            split_words("我用 RUST 写输入法"),
+            texts(&split_words("我用 RUST 写输入法")),
             vec!["我", "用", "RUST", "写", "输", "入", "法"]
         );
+    }
+
+    #[test]
+    fn records_original_spacing() {
+        let words = split_words("조금만 생각을 하면서");
+        // 韩语是分词书写的，空格必须记下来
+        assert!(!words[0].space_before);
+        let spaced: Vec<bool> = words.iter().map(|w| w.space_before).collect();
+        assert!(spaced.iter().filter(|s| **s).count() >= 2, "{spaced:?}");
     }
 
     #[test]
     fn ignores_whitespace_and_empty() {
         assert!(split_words("").is_empty());
         assert!(split_words("   ").is_empty());
-        assert_eq!(split_words(" 你  好 "), vec!["你", "好"]);
+        assert_eq!(texts(&split_words(" 你  好 ")), vec!["你", "好"]);
+    }
+
+    #[test]
+    fn join_preserves_original_spacing() {
+        // 只加标点，不动空格（端口契约）
+        let puncts = vec!["_".to_owned(), "。".to_owned()];
+        let words = [w("조금만", false), w("생각을", true), w("하면서", true)];
+        assert_eq!(
+            join(&words, &[0, 0, 1], &puncts),
+            "조금만 생각을 하면서。"
+        );
     }
 
     #[test]
@@ -410,27 +455,32 @@ mod tests {
             "。".to_owned(),
             "？".to_owned(),
         ];
-        let words = vec!["今", "天", "天", "气", "不", "错"];
+        let words = [
+            w("今", false),
+            w("天", false),
+            w("天", false),
+            w("气", false),
+            w("不", false),
+            w("错", false),
+        ];
         // 「今天天气」后逗号，末尾句号
-        let classes = vec![0, 0, 0, 1, 0, 2];
-        assert_eq!(join(&words, &classes, &puncts), "今天天气，不错。");
+        assert_eq!(join(&words, &[0, 0, 0, 1, 0, 2], &puncts), "今天天气，不错。");
     }
 
     #[test]
     fn join_keeps_latin_word_spacing() {
         let puncts = vec!["_".to_owned(), "，".to_owned()];
-        let words = vec!["hello", "world", "你", "好"];
-        let classes = vec![0, 1, 0, 0];
-        // 英文词后面的逗号用半角（下一个是汉字，不补空格）
-        assert_eq!(join(&words, &classes, &puncts), "hello world,你好");
+        let words = [w("hello", false), w("world", true), w("你", false), w("好", false)];
+        // 英文词后面的逗号用半角；空格来自原文
+        assert_eq!(join(&words, &[0, 1, 0, 0], &puncts), "hello world,你好");
     }
 
     #[test]
     fn join_uses_halfwidth_after_latin() {
         let puncts = vec!["_".to_owned(), "。".to_owned()];
-        assert_eq!(join(&["hello"], &[1], &puncts), "hello.");
+        assert_eq!(join(&[w("hello", false)], &[1], &puncts), "hello.");
         // 中文语境仍是全角
-        assert_eq!(join(&["好"], &[1], &puncts), "好。");
+        assert_eq!(join(&[w("好", false)], &[1], &puncts), "好。");
     }
 
     /// 本模型真实的类别表：`<unk>` 在 id 0，且它就是「无标点」的默认类。
@@ -445,7 +495,7 @@ mod tests {
     fn unk_class_is_never_written_into_text() {
         // 这是线上踩到的 bug：上屏文本变成「不<unk>不<unk>不」
         let puncts = real_puncts();
-        let words = vec!["不", "不", "不"];
+        let words = [w("不", false), w("不", false), w("不", false)];
         assert_eq!(join(&words, &[0, 0, 0], &puncts), "不不不");
         // `_` 同样不输出
         assert_eq!(join(&words, &[1, 1, 1], &puncts), "不不不");
@@ -475,6 +525,6 @@ mod tests {
     fn join_tolerates_short_class_list() {
         // 类别数组比词短（不该发生）也不 panic
         let puncts = vec!["_".to_owned()];
-        assert_eq!(join(&["你", "好"], &[0], &puncts), "你好");
+        assert_eq!(join(&[w("你", false), w("好", false)], &[0], &puncts), "你好");
     }
 }

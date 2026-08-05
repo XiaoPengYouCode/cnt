@@ -144,6 +144,13 @@ impl UserDb {
         self.keys_with_prefix(prefix).next().is_some()
     }
 
+    /// 全部 (词, 次数)（跨拼音键，可能重复出现同一个词）。
+    pub fn all_words(&self) -> impl Iterator<Item = (String, u32)> + '_ {
+        self.counts
+            .values()
+            .flat_map(|m| m.iter().map(|(w, e)| (w.clone(), e.count)))
+    }
+
     /// 以 `prefix` 开头的键（有序遍历，`BTreeMap::range` 一次定位后顺序扫描）。
     fn keys_with_prefix(
         &self,

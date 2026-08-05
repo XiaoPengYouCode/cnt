@@ -139,6 +139,25 @@ impl PinyinModel {
 
     /// 用户对 (拼音, 词) 的累计选择次数（供解码器做调频加成）。
     #[must_use]
+    /// 全部用户词及其最大选择次数（跨拼音键聚合）。
+    ///
+    /// 给语音侧做热词偏置用：通用声学模型不可能知道用户把哪些词当常用词，
+    /// 而这份数据正是用户自己一次次选出来的。
+    pub fn user_words(&self) -> Vec<(String, u32)> {
+        let mut out: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        {
+            let user = self
+                .user
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (word, count) in user.all_words() {
+                let slot = out.entry(word).or_insert(0);
+                *slot = (*slot).max(count);
+            }
+        }
+        out.into_iter().collect()
+    }
+
     pub fn user_count(&self, pinyin: &str, word: &str) -> u32 {
         self.user
             .lock()

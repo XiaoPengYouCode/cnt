@@ -38,7 +38,7 @@ use ort::value::{Tensor, TensorElementType, Value, ValueType};
 
 use cnt_asr::{AsrError, Recognizer, Transcript, SAMPLE_RATE};
 
-use crate::ctc::{greedy_decode, Tokens};
+use crate::ctc::{prefix_beam_search, Tokens, PREFIX_BEAM};
 use crate::fbank::{Fbank, FbankOptions};
 use crate::frontend::{Cmvn, Lfr};
 
@@ -326,7 +326,7 @@ impl Recognizer for SenseVoice {
             ));
         }
 
-        let (ids, vocab) = {
+        let (hyps, vocab) = {
             let _span = Span::enter_with_local_parent("asr_infer");
             // outputs 借用 session，锁必须活到取完 logits 为止 —— 这正是
             // 「一次推理串行化」的设计意图，不是可以收紧的临时借用。
@@ -345,24 +345,48 @@ impl Recognizer for SenseVoice {
                 .last()
                 .and_then(|d| usize::try_from(*d).ok())
                 .ok_or_else(|| AsrError::Backend(format!("bad logits shape: {shape:?}")))?;
-            (greedy_decode(data, vocab, self.tokens.blank_id()), vocab)
+            (
+                prefix_beam_search(data, vocab, self.tokens.blank_id(), PREFIX_BEAM),
+                vocab,
+            )
         };
 
-        let (text, language) = self.tokens.decode_ids(&ids);
+        // n-best：每条前缀各自拼成文本（去重后保留声学分数）
+        let mut alternatives: Vec<cnt_asr::Hypothesis> = Vec::with_capacity(hyps.len());
+        let mut language = None;
+        for hyp in &hyps {
+            let (text, lang) = self.tokens.decode_ids(&hyp.ids);
+            if text.is_empty() {
+                continue;
+            }
+            if language.is_none() {
+                language = lang;
+            }
+            if alternatives.iter().any(|a| a.text == text) {
+                continue; // 不同 token 路径可能拼出同一文本
+            }
+            alternatives.push(cnt_asr::Hypothesis {
+                text,
+                acoustic: hyp.logp,
+            });
+        }
+        let ids: &[usize] = hyps.first().map_or(&[], |h| h.ids.as_slice());
         LocalSpan::add_event(
             Event::new("decoded")
                 .with_property(|| ("tokens", ids.len().to_string()))
+                .with_property(|| ("nbest", alternatives.len().to_string()))
                 .with_property(|| ("vocab", vocab.to_string())),
         );
-        // tokens 保留可读形式，供 `--verbose` 诊断（乱码时一眼看出是拼装还是识别问题）
+        // tokens 保留可读形式，供诊断（乱码时一眼看出是拼装还是识别问题）
         let tokens = ids
             .iter()
             .filter_map(|id| self.tokens.get(*id))
             .collect::<Vec<_>>();
         Ok(Transcript {
-            text,
+            text: alternatives.first().map(|a| a.text.clone()).unwrap_or_default(),
             tokens,
             language,
+            alternatives,
         })
     }
 

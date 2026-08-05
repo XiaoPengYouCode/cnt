@@ -120,3 +120,24 @@ mod tests {
         assert_eq!(p.window(3), 3);
     }
 }
+
+/// 用户调频加成的口径（**拼音与语音共用同一把尺**）。
+///
+/// 用户词是「这个用户自己确认过的证据」，两条链路都该按同一标准采信：
+/// 拼音侧是候选排序里的加成，语音侧是 n-best 重排里的加成。
+/// 分散成两个常量早晚会漂移，所以放在打分领域里做单一来源。
+pub mod user {
+    /// 每选一次的 log10 权重。
+    pub const BOOST_LOG: f32 = 0.2;
+    /// 封顶次数：超过后不再增长。
+    ///
+    /// 防止「了/个」这类高频字无限刷分——32 次选择的加成不该压过整个分数空间。
+    pub const BOOST_CAP: u32 = 10;
+
+    /// 选择次数 → log10 加成。
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // 计数 ≤ BOOST_CAP，u32→f32 无损
+    pub fn boost(count: u32) -> f32 {
+        count.min(BOOST_CAP) as f32 * BOOST_LOG
+    }
+}
