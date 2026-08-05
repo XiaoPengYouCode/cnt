@@ -1,0 +1,13 @@
+[package]
+name = "cnt-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cnt: ASR port layer (recognizer contract + transcript text assembly)"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true

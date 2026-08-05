@@ -1,19 +1,27 @@
 //! `IBus` 引擎的 D-Bus 服务端实现：
 //! - `Factory`：org.freedesktop.IBus.Factory（路径 /org/freedesktop/IBus/Engine/Factory）
 //! - `Engine`：org.freedesktop.IBus.Engine（路径 /org/freedesktop/IBus/Engine/N）
+//!
+//! 状态与 UI 发送在 [`core::EngineCore`]（可与语音任务共享），本文件只负责
+//! 「协议方法 → 内核调用」的分派，以及按键专属的状态（Shift 单击、语音热键）。
+
+pub mod core;
+pub mod voice;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use fastrace::collector::{SpanContext};
+use fastrace::collector::SpanContext;
 use fastrace::Span;
 use zbus::connection::Connection;
 use zbus::zvariant::OwnedObjectPath;
 
 use cnt_decode::Decoder;
-use cnt_input::{latin_before_cursor, Action, EngineState, LearnedWord};
+use cnt_input::Action;
 
-const ENGINE_IFACE: &str = "org.freedesktop.IBus.Engine";
+pub use crate::core::EngineCore;
+pub use crate::voice::{KeyOutcome, VoiceRuntime};
+
 const FACTORY_PATH: &str = "/org/freedesktop/IBus/Factory";
 
 /// `IBus` 的 modifiers 位定义
@@ -28,7 +36,7 @@ const KEY_SHIFT_R: u32 = 0xffe2;
 /// Shift「单击」判定窗口：按下后该时间内释放且期间未打其他键 → 切换中英
 const SHIFT_TAP_DURATION: std::time::Duration = std::time::Duration::from_millis(350);
 
-/// Shift 单击检测状态（按下时间 + 是否被「借用」打过其他键）。
+/// Shift 键单击检测状态（按下时间 + 是否被「借用」打过其他键）。
 #[derive(Default)]
 struct ShiftTap {
     pressed_at: Option<std::time::Instant>,
@@ -44,16 +52,24 @@ pub struct Factory {
     counter: AtomicU32,
     decoder: Arc<Decoder>,
     page_size: usize,
+    /// 语音运行时（None = 未启用/不可用；此时输入法照常工作）。
+    voice: Option<Arc<VoiceRuntime>>,
 }
 
 impl Factory {
     #[must_use]
-    pub const fn new(conn: Connection, decoder: Arc<Decoder>, page_size: usize) -> Self {
+    pub const fn new(
+        conn: Connection,
+        decoder: Arc<Decoder>,
+        page_size: usize,
+        voice: Option<Arc<VoiceRuntime>>,
+    ) -> Self {
         Self {
             conn,
             counter: AtomicU32::new(1),
             decoder,
             page_size,
+            voice,
         }
     }
 }
@@ -65,7 +81,13 @@ impl Factory {
         log::info!("CreateEngine({name})");
         let n = self.counter.fetch_add(1, Ordering::SeqCst);
         let path = format!("/org/freedesktop/IBus/Engine/{n}");
-        let engine = Engine::new(self.conn.clone(), path.clone(), self.decoder.clone(), self.page_size);
+        let engine = Engine::new(
+            self.conn.clone(),
+            path.clone(),
+            self.decoder.clone(),
+            self.page_size,
+            self.voice.clone(),
+        );
         self.conn
             .object_server()
             .at(path.as_str(), engine)
@@ -80,250 +102,25 @@ impl Factory {
 // ---------------------------------------------------------------------------
 
 pub struct Engine {
-    conn: Connection,
-    path: String,
-    state: Mutex<EngineState>,
-    decoder: Arc<Decoder>,
-    page_size: usize,
+    core: Arc<EngineCore>,
     shift_tap: Mutex<ShiftTap>,
-    /// 应用提供的 surrounding text（文本, 光标**字符**偏移）；应用不支持时为 None。
-    surrounding: Mutex<Option<(String, usize)>>,
-    /// 我们自己刚上屏的最后一个字符（比 surrounding 更新）。
-    ///
-    /// 很多应用不会在每次 `CommitText` 后重发 surrounding text，导致缓存过期：
-    /// 先打英文再打中文，前一字符会一直停在那个英文字母上 → 标点永远半角。
-    /// 所以以自己的上屏为权威，应用下次发 surrounding 时再交回去。
-    last_commit_char: Mutex<Option<char>>,
-}
-
-/// 界面状态快照（所有数据均为 owned，可安全跨 await）
-struct UiState {
-    /// 预编辑文本：已确认的汉字 + 分节显示的未确认拼音（`你好 shi jie`）
-    preedit: String,
-    all_cands: Vec<String>,
-    /// 光标在全部候选中的绝对位置（面板据此计算当前页）
-    cursor_abs: u32,
+    voice: Option<Arc<VoiceRuntime>>,
 }
 
 impl Engine {
-    /// 锁定并取组合状态（毒锁恢复，内部状态永不让锁失败 panic）。
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, EngineState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     #[must_use]
-    pub fn new(conn: Connection, path: String, decoder: Arc<Decoder>, page_size: usize) -> Self {
+    pub fn new(
+        conn: Connection,
+        path: String,
+        decoder: Arc<Decoder>,
+        page_size: usize,
+        voice: Option<Arc<VoiceRuntime>>,
+    ) -> Self {
         Self {
-            conn,
-            path,
-            state: Mutex::new(EngineState::with_page_size(page_size)),
-            decoder,
-            page_size,
+            core: Arc::new(EngineCore::new(conn, path, decoder, page_size)),
             shift_tap: Mutex::new(ShiftTap::default()),
-            surrounding: Mutex::new(None),
-            last_commit_char: Mutex::new(None),
+            voice,
         }
-    }
-
-    /// 取当前状态快照（不持锁跨 await）
-    fn snapshot(&self) -> UiState {
-        let st = self.lock_state();
-        let preedit = render_preedit(st.confirmed_text(), st.preview(), st.buffer(), |py| {
-            self.decoder.display_pinyin(py)
-        });
-        UiState {
-            preedit,
-            all_cands: st.candidates().iter().map(|c| c.text.clone()).collect(),
-            cursor_abs: u32::try_from(st.cursor_abs()).expect("cursor fits u32"),
-        }
-    }
-
-    /// 更新候选窗口与预编辑文本（上屏前的拼音）。
-    async fn update_ui(&self, ui: &UiState) {
-        // 预编辑文本（拼音缓冲区）
-        let (preedit, cursor, visible) = if ui.preedit.is_empty() {
-            (String::new(), 0u32, false)
-        } else {
-            (
-                ui.preedit.clone(),
-                u32::try_from(ui.preedit.chars().count()).expect("preedit fits u32"),
-                true,
-            )
-        };
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                self.path.as_str(),
-                ENGINE_IFACE,
-                "UpdatePreeditText",
-                &(cnt_ibus::text(&preedit), cursor, visible, 1u32), // mode=1 下划线
-            )
-            .await;
-
-        // 候选列表：发送全部候选 + 绝对光标位置。
-        // IBus 面板按 `cursor / page_size * page_size` 计算当前页，
-        // 候选数多于每页时自动显示翻页按钮（点击 → 引擎的 PageDown/PageUp）。
-        let visible = !ui.all_cands.is_empty();
-        let table = cnt_ibus::lookup_table(
-            &ui.all_cands,
-            u32::try_from(self.page_size).expect("page size fits u32"),
-            ui.cursor_abs,
-            visible,
-        );
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                self.path.as_str(),
-                ENGINE_IFACE,
-                "UpdateLookupTable",
-                &(table, visible),
-            )
-            .await;
-    }
-
-    /// 隐藏预编辑文本与候选窗口。
-    async fn hide_ui(&self) {
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                self.path.as_str(),
-                ENGINE_IFACE,
-                "UpdatePreeditText",
-                &(cnt_ibus::text(""), 0u32, false, 0u32),
-            )
-            .await;
-        let table = cnt_ibus::lookup_table(&[], u32::try_from(self.page_size).expect("page size fits u32"), 0, false);
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                self.path.as_str(),
-                ENGINE_IFACE,
-                "UpdateLookupTable",
-                &(table, false),
-            )
-            .await;
-    }
-
-    /// 提交一段文字并清空状态。
-    async fn commit(&self, text: &str) {
-        // 记住自己上屏的最后一个字符：下一个标点的宽度判定以此为准，
-        // 不再依赖应用是否及时重发 surrounding text。
-        *self
-            .last_commit_char
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = text.chars().last();
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                self.path.as_str(),
-                ENGINE_IFACE,
-                "CommitText",
-                &(cnt_ibus::text(text),),
-            )
-            .await;
-        self.lock_state().clear();
-        self.hide_ui().await;
-    }
-
-    /// 丢弃半角判定的上下文（焦点切换/重置：旧位置的前一字符已无意义）。
-    fn forget_context(&self) {
-        *self
-            .last_commit_char
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *self
-            .surrounding
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    }
-
-    /// 转发给应用的可打印 ASCII 键也要计入上下文（数字、英文模式的字母都走转发，
-    /// 应用未必重发 surrounding）。这正是「3, / abc,」要半角的那一类情形。
-    fn note_forwarded_key(&self, keyval: u32) {
-        if let Some(c) = char::from_u32(keyval).filter(char::is_ascii_graphic) {
-            *self
-                .last_commit_char
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(c);
-        }
-    }
-
-    /// 标点半角判定：自己刚上屏的字符优先，否则看应用给的 surrounding text。
-    ///
-    /// 两边都没信息时返回 false（全角）——中文输入法的默认应当是全角。
-    fn punct_half_width(&self) -> bool {
-        let last = *self
-            .last_commit_char
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(c) = last {
-            return c.is_ascii_alphanumeric();
-        }
-        self.surrounding
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|(text, cursor)| latin_before_cursor(text, *cursor))
-    }
-
-    /// 请应用下发光标周围文本（不发这个信号，大多数应用根本不会调 `SetSurroundingText`）。
-    async fn require_surrounding_text(&self) {
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                self.path.as_str(),
-                ENGINE_IFACE,
-                "RequireSurroundingText",
-                &(),
-            )
-            .await;
-    }
-
-    async fn refresh_after_handled(&self) {
-        let ui = self.snapshot();
-        self.update_ui(&ui).await;
-    }
-
-    /// 把用户学习数据写盘（`focus_out`/`disable` 时立即落盘，减少丢失窗口）。
-    fn flush_user(&self) {
-        if let Err(e) = self.decoder.flush_user() {
-            log::error!("flush user data failed: {e}");
-        }
-    }
-
-    /// 提交一段文本并记录学习数据。
-    async fn handle_commit(&self, text: String, learned: Vec<LearnedWord>) {
-        // 用户通过候选上屏 → 调频 + 新词学习（相邻段拼合成词）
-        if !learned.is_empty() {
-            log::debug!("learn: {} segments", learned.len());
-            self.decoder.learn(&learned);
-        }
-        self.commit(&text).await;
-    }
-
-    /// Shift 单击切换中英模式；若切换前在组合中，先把预编辑上屏。
-    async fn toggle_input_mode(&self) {
-        let commit = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .toggle_mode();
-        if let Some((text, learned)) = commit {
-            log::debug!("mode switch commits preedit: {text}");
-            if !learned.is_empty() {
-                self.decoder.learn(&learned);
-            }
-            self.commit(&text).await;
-        }
-        log::info!("input mode toggled");
     }
 }
 
@@ -347,6 +144,15 @@ impl Engine {
         _keycode: u32,
         state: u32,
     ) -> zbus::fdo::Result<bool> {
+        // 语音热键最先判：PTT 用的是修饰键，必须在下面的「忽略修饰键」之前拦下。
+        if let Some(voice) = &self.voice {
+            match voice.handle_key(&self.core, keyval, state).await {
+                KeyOutcome::Consumed => return Ok(true),
+                KeyOutcome::Forwarded => return Ok(false),
+                KeyOutcome::NotVoice => {}
+            }
+        }
+
         // Shift 键：必须先于通用 release 检查处理 ——
         // 通用检查会把所有 release 事件拦下（含 Shift 释放），导致释放分支永不执行。
         // 用 RELEASE_MASK 区分按下/释放（IBus 的 release 事件带 1<<30 位）。
@@ -369,7 +175,7 @@ impl Engine {
                 tap.used = false; // 每次 shift 事件都重置「借用」标记
             } // 释放锁
             if should_toggle {
-                self.toggle_input_mode().await;
+                self.core.toggle_input_mode().await;
             }
             return Ok(false); // Shift 本身转发给应用（无害）
         }
@@ -396,11 +202,11 @@ impl Engine {
             log::debug!("keyval=0x{keyval:x} state=0x{state:x}");
 
             let act = {
-                let mut st = self.lock_state();
+                let mut st = self.core.lock_state();
                 // 半角标点上下文：未组合且光标前一个字符是数字/英文 → 半角（3，→ 3,）。
                 // 组合中（前面肯定是刚上屏的中文）永远全角。
-                let punct_half_width = !st.is_composing() && self.punct_half_width();
-                st.handle_key(keyval, &*self.decoder, punct_half_width)
+                let punct_half_width = !st.is_composing() && self.core.punct_half_width();
+                st.handle_key(keyval, &**self.core.decoder(), punct_half_width)
             };
             // 同步段结束：释放 thread-local local parent，避免跨 await 污染
             drop(_guard);
@@ -413,21 +219,21 @@ impl Engine {
         match action {
             Action::Forward => {
                 log::debug!("forwarded");
-                self.note_forwarded_key(keyval);
+                self.core.note_forwarded_key(keyval);
                 Ok(false)
             }
             Action::Handled => {
-                self.refresh_after_handled().await;
+                self.core.refresh_after_handled().await;
                 Ok(true)
             }
             Action::Commit { text, learned } => {
-                self.handle_commit(text, learned).await;
+                self.core.handle_commit(text, learned).await;
                 Ok(true)
             }
             Action::CommitAndForward { text, learned } => {
                 // 提交预编辑后把原按键转发给应用（如 Shift+字母 输出大写）
-                self.handle_commit(text, learned).await;
-                self.note_forwarded_key(keyval);
+                self.core.handle_commit(text, learned).await;
+                self.core.note_forwarded_key(keyval);
                 Ok(false)
             }
         }
@@ -435,45 +241,36 @@ impl Engine {
 
     async fn focus_in(&self) {
         // 新的输入上下文：丢掉旧的半角判定依据，并请应用下发光标周围文本
-        self.forget_context();
-        self.require_surrounding_text().await;
+        self.core.forget_context();
+        self.core.require_surrounding_text().await;
     }
 
     async fn focus_in_id(&self, _object_path: &str, _client: &str) {
-        self.forget_context();
-        self.require_surrounding_text().await;
+        self.core.forget_context();
+        self.core.require_surrounding_text().await;
     }
 
     async fn focus_out(&self) {
-        self.lock_state().clear();
-        self.forget_context();
-        self.hide_ui().await;
-        self.flush_user();
+        self.leave().await;
     }
 
     async fn focus_out_id(&self, _object_path: &str) {
-        self.lock_state().clear();
-        self.forget_context();
-        self.hide_ui().await;
-        self.flush_user();
+        self.leave().await;
     }
 
     async fn reset(&self) {
-        self.lock_state().clear();
-        self.forget_context();
-        self.hide_ui().await;
+        self.core.lock_state().clear();
+        self.core.forget_context();
+        self.core.hide_ui().await;
     }
 
     async fn enable(&self) {
-        self.forget_context();
-        self.require_surrounding_text().await;
+        self.core.forget_context();
+        self.core.require_surrounding_text().await;
     }
 
     async fn disable(&self) {
-        self.lock_state().clear();
-        self.forget_context();
-        self.hide_ui().await;
-        self.flush_user();
+        self.leave().await;
     }
 
     fn set_capabilities(&self, _caps: u32) {}
@@ -489,10 +286,7 @@ impl Engine {
     /// 鼠标点击候选（index 为当前页内从 0 开始的下标）
     async fn candidate_clicked(&self, index: u32, _button: u32, _state: u32) {
         let action = {
-            let mut st = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut st = self.core.lock_state();
             let idx = st.page_size() * st.page() + usize::try_from(index).expect("index fits usize");
             st.candidate_at(idx).map_or(Action::Handled, |cand| {
                 st.clear();
@@ -503,31 +297,28 @@ impl Engine {
             })
         };
         if let Action::Commit { text, learned } = action {
-            if !learned.is_empty() {
-                self.decoder.learn(&learned);
-            }
-            self.commit(&text).await;
+            self.core.handle_commit(text, learned).await;
         }
     }
 
     async fn page_up(&self) {
-        self.lock_state().page_up();
-        self.refresh_after_handled().await;
+        self.core.lock_state().page_up();
+        self.core.refresh_after_handled().await;
     }
 
     async fn page_down(&self) {
-        self.lock_state().page_down();
-        self.refresh_after_handled().await;
+        self.core.lock_state().page_down();
+        self.core.refresh_after_handled().await;
     }
 
     async fn cursor_up(&self) {
-        self.lock_state().cursor_up();
-        self.refresh_after_handled().await;
+        self.core.lock_state().cursor_up();
+        self.core.refresh_after_handled().await;
     }
 
     async fn cursor_down(&self) {
-        self.lock_state().cursor_down();
-        self.refresh_after_handled().await;
+        self.core.lock_state().cursor_down();
+        self.core.refresh_after_handled().await;
     }
 
     fn set_surrounding_text(
@@ -551,18 +342,9 @@ impl Engine {
                 let cursor = usize::try_from(cursor_pos).unwrap_or(0);
                 log::debug!(
                     "surrounding: cursor={cursor} char, prev_is_latin={}",
-                    latin_before_cursor(&t, cursor)
+                    cnt_input::latin_before_cursor(&t, cursor)
                 );
-                // 应用的数据是新鲜的（包含光标移动/删除等我们看不到的编辑），
-                // 一旦收到就不再用自己缓的上屏字符。
-                *self
-                    .last_commit_char
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                *self
-                    .surrounding
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((t, cursor));
+                self.core.set_surrounding(t, cursor);
             }
             None => log::debug!("unparseable surrounding text"),
         }
@@ -578,89 +360,21 @@ impl Engine {
     fn panel_extension_register_keys(&self, _data: zbus::zvariant::OwnedValue) {}
 }
 
-/// 拼出预编辑文本：已确认的汉字 + （浏览候选时的内联预览）+ 未覆盖的分节拼音。
-///
-/// - 不浏览候选时是 `你好 shi jie` 形态：用户看得见自己打了什么、怎么切分的；
-/// - 浏览候选时把选中候选内联进来（整句 → `你好世界`；部分候选 → `你好 shi jie`），
-///   空格确认前就能看到结果；
-/// - 汉字与拼音之间留一个空格，界限清楚。
-///
-/// `segment` 是拼音分节函数（由解码器的音节表提供）。纯函数，便于测试边界。
-fn render_preedit(
-    confirmed: &str,
-    preview: Option<(&str, usize)>,
-    buffer: &str,
-    segment: impl Fn(&str) -> String,
-) -> String {
-    let mut out = String::with_capacity(confirmed.len() + buffer.len() + 8);
-    out.push_str(confirmed);
-    let tail = match preview {
-        Some((text, consumed)) => {
-            out.push_str(text);
-            // consumed 来自候选自报的覆盖长度，越界时按全覆盖处理（不 panic）
-            buffer.get(consumed.min(buffer.len())..).unwrap_or("")
+impl Engine {
+    /// 失去焦点 / 被禁用：清状态、落盘、**并关掉麦克风**。
+    ///
+    /// 语音会话绝不能跟着焦点漂到别的窗口去：切走了就停录，
+    /// 这是隐私底线，也避免识别结果上屏到错误的应用里。
+    async fn leave(&self) {
+        if let Some(voice) = &self.voice {
+            voice.cancel();
         }
-        None => buffer,
-    };
-    if !tail.is_empty() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&segment(tail));
+        self.core.lock_state().clear();
+        self.core.forget_context();
+        self.core.hide_ui().await;
+        self.core.flush_user();
     }
-    out
 }
 
 /// 供 cnt-daemon 使用的常量
 pub const FACTORY_OBJ_PATH: &str = FACTORY_PATH;
-
-#[cfg(test)]
-mod tests {
-    use super::render_preedit;
-
-    /// 测试用分节函数：按 3 字母一节切（不依赖真实音节表）
-    fn seg(py: &str) -> String {
-        py.as_bytes()
-            .chunks(3)
-            .map(|c| String::from_utf8_lossy(c).into_owned())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    #[test]
-    fn preedit_shows_segmented_pinyin_by_default() {
-        assert_eq!(render_preedit("", None, "nihaoshi", seg), "nih aos hi");
-        assert_eq!(render_preedit("", None, "", seg), "");
-    }
-
-    #[test]
-    fn preedit_keeps_confirmed_prefix() {
-        // 已确认的汉字 + 剩余拼音，中间一个空格
-        assert_eq!(render_preedit("你好", None, "shijie", seg), "你好 shi jie");
-    }
-
-    #[test]
-    fn preedit_inlines_preview_while_browsing() {
-        // 整句候选：全覆盖 → 只剩汉字
-        assert_eq!(
-            render_preedit("", Some(("你好世界", 11)), "nihaoshijie", seg),
-            "你好世界"
-        );
-        // 部分候选：覆盖 nihao，剩余仍是拼音
-        assert_eq!(
-            render_preedit("", Some(("你好", 5)), "nihaoshijie", seg),
-            "你好 shi jie"
-        );
-        // 已确认段 + 预览 + 剩余
-        assert_eq!(
-            render_preedit("我说", Some(("你好", 5)), "nihaoshijie", seg),
-            "我说你好 shi jie"
-        );
-    }
-
-    #[test]
-    fn preedit_tolerates_out_of_range_coverage() {
-        // 覆盖长度越界（不该发生）也不 panic，按全覆盖处理
-        assert_eq!(render_preedit("", Some(("你好", 99)), "nihao", seg), "你好");
-    }
-}

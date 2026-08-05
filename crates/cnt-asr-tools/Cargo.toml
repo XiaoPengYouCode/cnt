@@ -1,0 +1,22 @@
+[package]
+name = "cnt-asr-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cnt: voice input CLI (offline transcribe / record / live / bench)"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cnt-asr.workspace = true
+cnt-asr-onnx.workspace = true
+cnt-audio.workspace = true
+cnt-voice.workspace = true
+hound.workspace = true
+log.workspace = true
+fastrace.workspace = true
+logforth.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

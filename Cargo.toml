@@ -16,6 +16,11 @@ members = [
     "crates/cnt-engine",
     "crates/cnt-daemon",
     "crates/cnt-test-client",
+    "crates/cnt-asr",
+    "crates/cnt-asr-onnx",
+    "crates/cnt-audio",
+    "crates/cnt-voice",
+    "crates/cnt-asr-tools",
 ]
 
 [workspace.package]
@@ -42,9 +47,32 @@ multiple_crate_versions = "allow"
 [workspace.dependencies]
 # 第三方依赖：精确锁定到 crates.io 最新 stable（2026-08）
 zbus = { version = "=5.18.0", default-features = false, features = ["tokio"] }
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 futures-util = "=0.3.33"
 memmap2 = "=0.9.11"
+
+# 语音输入：ONNX 推理（ort 推荐方式 = 默认 features，download-binaries 拉预编译
+# CPU 库；后续换 NPU 只需打开对应 execution provider feature，调用代码不变）
+#
+# 把默认的 tls-native 换成 tls-rustls：ort 在**构建期**用 HTTPS 下载
+# onnxruntime 预编译库，tls-native 会拉 openssl-sys → 要求系统装 libssl-dev +
+# openssl.pc。为了一次构建期的下载而给用户增加一个系统依赖不划算，
+# rustls 是纯 Rust，开箱即编。（其余 feature 照搬默认值，api-27 含低版本 API。）
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "tls-rustls",
+    "copy-dylibs",
+    "api-27",
+] }
+# 麦克风采集（后端由 cpal 选：Linux 默认 ALSA，PipeWire 通过兼容层）
+cpal = "=0.18.1"
+# fbank 特征用的 FFT（fbank 自研，不引 C++ 特征库）
+rustfft = "=6.4.1"
+# wav 读写（离线转写 / 录音落盘 / 回归样本）
+hound = "=3.5.1"
 
 # 可观测性：log + fastrace（`--features "fastrace/enable"` 全局开启，默认关闭零开销）+ logforth
 log = "=0.4.33"
@@ -69,6 +97,10 @@ cnt-config = { path = "crates/cnt-config" }
 cnt-decode = { path = "crates/cnt-decode" }
 cnt-input = { path = "crates/cnt-input" }
 cnt-engine = { path = "crates/cnt-engine" }
+cnt-asr = { path = "crates/cnt-asr" }
+cnt-asr-onnx = { path = "crates/cnt-asr-onnx" }
+cnt-audio = { path = "crates/cnt-audio" }
+cnt-voice = { path = "crates/cnt-voice" }
 
 [profile.release]
 opt-level = 3

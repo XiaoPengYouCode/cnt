@@ -6,7 +6,7 @@
 
 ```
 crates/
-├── cnt-config        配置：TOML 加载（当前仅候选词数一项）
+├── cnt-config        配置：TOML 加载（候选词数 + 语音输入）
 ├── cnt-ibus          IBus D-Bus 协议：对象序列化 + 私有总线地址发现
 ├── cnt-dict          词库：二进制(.cntd) + mmap 零拷贝读取 + 用户调频/用户词库
 ├── cnt-store         二进制 mmap 存储底座：错误类型/字节读取/区域校验（cnt-dict 与 cnt-lm 共享）
@@ -14,7 +14,12 @@ crates/
 ├── cnt-score         打分端口层（零依赖）：NgramLm 打分接口 + Rescorer 重排契约 + 触发/融合策略
 ├── cnt-decode        拼音切分（标准 410 音节表）+ 整句解码（beam search + 词级格）
 ├── cnt-dict-tools    词库/LM CLI：build / build-lm / decode / info / query
-├── cnt-input         输入逻辑（纯状态机，无 IO；定义候选接口）
+├── cnt-input         输入逻辑（纯状态机，无 IO；候选接口 + 热键解析）
+├── cnt-asr           语音端口层（零依赖）：Recognizer / Punctuator 契约 + 文本后处理
+├── cnt-asr-onnx      识别 + 标点后端（ort/CPU）：自研 fbank/LFR/CMVN/CTC + CT-Transformer 标点
+├── cnt-audio         麦克风采集（cpal）+ 带窗 sinc 重采样 + 自适应能量 VAD 切句
+├── cnt-voice         语音编排：按住说话 / 切换式常开，每句一棵 span 树
+├── cnt-asr-tools     语音 CLI：transcribe / bench（离线）、record / live（开麦克风）
 ├── cnt-engine         IBus Factory/Engine D-Bus 服务端
 ├── cnt-daemon        主程序：加载词库+LM、连接 IBus、注册组件、事件循环
 └── cnt-test-client   开发用测试客户端（模拟应用程序走 IBus 链路）
@@ -27,7 +32,8 @@ crates/
 
 ```
 应用程序 ──► ibus-daemon ──► cnt-daemon（本输入法引擎）
-                 │
+                 │                    │
+                 │                    └─► 麦克风 ─► cnt-audio ─► cnt-asr-onnx（本地推理）
                  └──► ibus-panel（画候选窗，不需要我们写 GUI）
 ```
 
@@ -78,6 +84,8 @@ cargo run -p cnt-test-client
 - `CNT_DICT`：词库路径（默认 `$XDG_DATA_HOME/cnt/dict.cntd`）
 - `CNT_LM`：语言模型路径（默认 `$XDG_DATA_HOME/cnt/lm.cntl`；缺失时降级为单字/词候选）
 - `CNT_USER_DB`：用户数据路径（默认 `$XDG_DATA_HOME/cnt/user.dict`）
+- `CNT_ASR_DIR`：声学模型目录（默认 `$XDG_DATA_HOME/cnt/asr`；缺失时语音自动关闭）
+- `CNT_PUNCT_DIR`：标点模型目录（默认 `$XDG_DATA_HOME/cnt/punct`；缺失时输出无标点）
 
 用户学习数据每 60s 自动写盘（临时文件 + rename 原子替换）。
 
@@ -130,6 +138,9 @@ cargo run -p cnt-test-client
 | `Esc` | 丢弃整个组合（含已确认段） |
 | `回车` | 把未确认的拼音原文当英文提交 |
 | `Shift` 单击 | 中/英模式切换 |
+| 按住 `右 Alt` | 语音输入：按住说话，松手识别上屏（需开启 `[voice]`） |
+| `Ctrl+Shift+空格` | 语音输入：切换式常开听写（VAD 自动切句） |
+| 录音中 `Esc` | 放弃这次语音，一个字都不上屏 |
 
 ### 增量确认（Rime 式）
 
@@ -234,13 +245,29 @@ cnt 把这个边界固定成端口（dependency inversion，方向永远是「�
 
 ### 配置（cnt-config）
 
-TOML 配置文件：`~/.config/cnt/config.toml`（`CNT_CONFIG` 环境变量可覆盖路径），
-当前仅一项：
+TOML 配置文件：`~/.config/cnt/config.toml`（`CNT_CONFIG` 环境变量可覆盖路径）：
 
 ```toml
-# 每页候选词数（范围 5~30，默认 10）
+# 每页候选词数（范围 5~16，默认 10）
 page_size = 10
+
+# 语音输入（默认关：模型不随程序分发，得先装）
+[voice]
+enabled = true
+model_dir = "~/.local/share/cnt/asr"
+language = "auto"                    # auto/zh/en/ja/ko/yue
+itn = true                           # 数字规整 + 标点
+threads = 4
+device = ""                          # 麦克风设备名子串，空 = 系统默认
+ptt_key = "Alt_R"                    # 按住说话（右 Alt）
+toggle_key = "Control+Shift+space"   # 切换式常开
+max_seconds = 60.0                   # PTT 单次最长录音
+trailing_silence_ms = 700            # 常开：停顿多久算一句结束
+vad_margin_db = 10.0                 # 高于噪声底多少 dB 算语音
 ```
+
+逐项解析而不是整体反序列化：**单项写错不影响其他项**（输入法不能因为一个写错的
+热键就不能打字），越界值夹紧到合法区间。
 
 ### 模糊音（cnt-decode）
 
@@ -251,7 +278,191 @@ page_size = 10
 
 标准词表格式：`拼音<TAB>词<TAB>频率`，`#` 开头为注释。
 
+## 语音输入
+
+**纯本地**：模型在自己机器上跑，音频只在内存里流动，不上传、不落盘
+（除非你显式用 `cnt-asr-tools record`）。麦克风只在会话期间打开，
+会话一结束（松手 / 关常开 / 窗口失焦 / 按 Esc）立刻关设备。
+
+### 领域模型与端口
+
+四件事变化速率完全不同，所以拆成四个 crate；变化最快的两件（识别模型、标点模型）
+被固定成**端口**，其余代码只依赖契约：
+
+```text
+  cnt-audio            cnt-asr（端口层，零依赖）           cnt-voice        cnt-engine
+ ┌──────────┐     ┌──────────────────────────────┐    ┌────────────┐   ┌──────────┐
+ │ cpal 采集 │────►│ trait Recognizer             │◄───│  会话编排   │──►│ 预编辑   │
+ │ sinc 重采样│     │ trait Punctuator             │    │  PTT/常开   │   │ CommitText│
+ │ 能量 VAD  │     │ text: 字节级BPE拼装/标点归一  │    │  span 树    │   │ 热键     │
+ └──────────┘     └──────────────┬───────────────┘    └────────────┘   └──────────┘
+                                 │ 实现
+                        cnt-asr-onnx（ort / CPU，将来 NPU）
+                        ├─ SenseVoice   : fbank → LFR → CMVN → CTC 贪心
+                        └─ CtPunctuator : 词 id → 6 类标点
+```
+
+| 端口 | 粒度 | 频次 | 分派 | 当前实现 | 缺省退化 |
+|---|---|---|---|---|---|
+| `Recognizer` | 一整段语音 0.3~60 s | 每句 1 次 | `dyn` | `SenseVoice`（Fun-ASR-Nano CTC） | 无（语音功能关闭） |
+| `Punctuator` | 一句文本几十字 | 每句 ≤1 次 | `dyn` | `CtPunctuator`（CT-Transformer） | `NoPunct` 直通 |
+
+**为什么标点是独立端口**（而不是识别器的内部细节）：实测三个模型三种情况——
+`Fun-ASR-Nano` 的 CTC 头词表**有**标点 token 但输出光板文本；`SenseVoice-Small`
+自带标点；`FireRedASR2` 全家词表根本没有标点。也就是说「会不会标点」是声学模型的
+**偶然属性**，而「上屏文本必须有句读」是输入法的**固有需求**。拆开之后，换声学模型
+不用重做标点，换标点模型不碰声学。这也是 `FunASR` 官方 pipeline 的做法。
+
+端口契约里有两条硬规则，实现必须守：
+
+- **标点只加符号、不改字**——用户看到「我说的不是这个」比没标点更糟；
+- **任何一段失败都退回上一级结果**（标点失败用原文、识别失败不上屏），
+  一句话绝不能因为增强环节出错而丢掉。
+
+### 交互方案
+
+| 模式 | 触发 | 切句 | 适用 |
+|---|---|---|---|
+| **按住说话**（默认 `Alt_R`，即右 Alt） | 按住录音，松手识别 | 由你的手决定 | 短句，确定性最高 |
+| **切换式常开**（默认 `Control+Shift+space`） | 按一下开/关 | VAD 自动切句，逐句上屏 | 长段口述 |
+
+```text
+       ┌─────────────── Esc（放弃，一个字都不上屏）───────────────┐
+       ▼                                                          │
+    [空闲] ──按住 ptt──► [录音中 🎤] ──松手──► [识别中] ──► 上屏 ──┘
+       │                     ▲   │
+       └──toggle──► [常开 🎤]─┘   └──VAD 切出一句──► 识别 ──► 上屏（会话继续）
+```
+
+设计要点，每条都对应一个具体的失败场景：
+
+- **PTT 默认用右 Alt 而不是字母键**：按住期间该键对应用必须无副作用，
+  字母键会一直往应用里灌字符。该事件**照常转发**给应用，Alt 行为不变。
+  （不用右 Ctrl 是因为很多新键盘把它换成了 Copilot 键；`ptt_key` 可配成
+  `Alt_R`/`Control_R`/`Menu`/`F13`~`F24` 等任意 keysym。）
+- **Esc 取消**：说错了、被人打断、误触——必须有作废出口，否则唯一选择是
+  让错的内容上屏再删。
+- **开始语音前先把拼音预编辑上屏**：打了半句拼音又想说话时，半截拼音既不能丢，
+  也不能和语音结果混在一起。
+- **窗口失焦 / 输入法被禁用 → 立刻停录**：麦克风不跟着焦点漂，
+  这既是隐私底线，也避免结果上屏到错误的应用。
+- **按键路径上不做任何等待**：识别的几百毫秒全在 `cnt-voice` 的 OS 线程里，
+  引擎只 spawn 一个事件泵。IBus 的按键是串行的，卡住就会丢键。
+- **PTT 有最长录音上限**（默认 60 s）：按键卡住不会变成无限录音。
+- 常开模式下键盘照常可用；语音结果按句上屏，不干扰正在打的拼音。
+
+### IME 显示方案
+
+非流式模型**没有中间结果**，所以界面必须用别的东西证明「它在听」，
+否则用户会反复松手重按（以为没生效）。预编辑区的规格：
+
+| 状态 | 预编辑显示 | 候选窗 |
+|---|---|---|
+| 录音中（PTT） | `🎤 说话中 2.3s ▂▃▄▅▁` | 隐藏 |
+| 录音中（常开） | `🎤 常开听写 12.7s ▂▃▁▁▁` | 隐藏 |
+| 识别中 | `🎤 识别中…` | 隐藏 |
+| 取消 | `🎤 已取消`（随即清除） | 隐藏 |
+| 组合中同时录音 | `🎤 说话中 1.2s ▂▃▄▁▁ 你好 shi jie` | 正常拼音候选 |
+
+- **时长 + 音量条每 200 ms 刷一次**（`VoiceEvent::Level`）：音量条全空
+  等于告诉你「没听到声音」——麦克风选错了、被静音了，一眼就能发现，
+  不用等到识别出空结果才怀疑。
+- **语音结果直接 `CommitText`，不进候选窗**：一整句话放进候选列表没有意义
+  （候选是「同音异形的选择」，语音结果只有一条）。要改就改已上屏的文本。
+- 语音提示与拼音预编辑**共存**：提示在前、拼音在后，中间一个空格。
+- 出错（麦克风被占用、模型报错）只记日志并清掉提示，**不弹窗、不阻塞打字**。
+
+### 模型
+
+```bash
+bash scripts/fetch-asr-model.sh   # 声学 188 MB → data/asr，标点 65 MB → data/punct
+./scripts/install.sh              # 一起装到 ~/.local/share/cnt/{asr,punct}
+```
+
+| | 模型 | 体积 | 结构 |
+|---|---|---|---|
+| 声学 | `Fun-ASR-Nano-2512` 的 CTC 导出（通义，Apache-2.0） | 251 MB | 单次前向 CTC |
+| 标点 | `CT-Transformer ct-punc` zh-en（`FunASR`） | 73 MB | 文本级 transformer |
+
+选型是按条件筛的（本地 CPU RTF ≤ 0.3 / 常驻 ≤ 500 MB / 必须有标点 /
+ONNX 单次前向），Fun-ASR-Nano 在**工业**测试集上是开源第一：平均 WER 16.72，
+优于 FireRedASR2 (22.63)、Paraformer v2 (23.49)、GLM-ASR-Nano (26.13)、
+Whisper-large-v3 (33.39)，逼近闭源 Seed-ASR (15.95)；方言 28.18 对 FireRedASR2 的 52.82。
+落选原因：`FireRedASR2` 全家词表无标点无数字（实测确认）；`Qwen3-ASR-0.6B` /
+`GLM-ASR-Nano` / `Fun-ASR-Nano` 全量版都是自回归且 >800 MB。
+
+前端（fbank / LFR / CMVN / CTC / base64 字节级 BPE 拼装）**全部自研**，不引 C++ 特征库；
+模型契约不靠假设，用 `cnt-asr-tools info` 探查后按声明动态适配：
+
+```
+$ cnt-asr-tools info data/asr
+输入： x  Float32 [1,-1,560]        ← 只有一个（SenseVoice-Small 有四个）
+输出： logits Float32 [-1,-1,60515]
+metadata: blank_id=60514  lfr_window_size=7  lfr_window_shift=6
+          normalize_samples=0  model_type=sense_voice_ctc
+词表：60515，base64 字节级 BPE，blank=60514
+```
+
+浮点输入 = 特征，其余整型输入按名字识别（`len`/`lang`/`itn`），blank 从 `<blk>` 取，
+词表编码自动识别明文/base64。**换模型第一步是打印事实，不是猜**——
+「输入名对上了但语义不对」会得到「能跑但输出乱码」，那是最费时间的失败。
+
+### 实测（Intel Core Ultra 5 336H，4 线程，release）
+
+```
+zh.wav   5.59s → 235ms (RTF 0.042)  开饭时间，早上九点至下午五点。
+en.wav   7.15s → 318ms (RTF 0.044)  the tribal chiefin called for the boy and ... food.
+ja.wav   7.20s → 307ms (RTF 0.043)  うちの中学は弁当制で持っていけない場合は五十円の学校販売のパンを買う
+yue.wav  5.15s → 245ms (RTF 0.048)  呢几个字都表达唔到我想讲嘅意思。
+两句拼接 11.78s → 484ms + 标点 7ms   开放时间早上九点至下午五点。开放时间，早上九点至下午五点。
+
+bench（20 轮）：平均 232.6ms  中位 233.0ms  90% 239.0ms  最差 243.1ms
+fastrace 阶段分解：
+  asr_frontend  1846µs（0.8%）  ← fbank 1820 / lfr 25 / cmvn 0.1
+  asr_infer   228001µs（99%）   ← 其中 ctc_decode 16803µs（60515 维 argmax，可优化）
+  punctuate     2900µs
+```
+
+3 秒的短句约 125 ms，「松手到上屏 < 300 ms」的预算很宽裕。
+
+### CLI（开发/诊断）
+
+原则：**能不开麦克风就不开麦克风**。
+
+```bash
+# 离线（wav 进、文本出，不碰麦克风）
+cargo run --release -p cnt-asr-tools -- info       data/asr
+cargo run --release -p cnt-asr-tools -- transcribe data/asr a.wav [--punct data/punct] [--no-punct]
+cargo run --release -p cnt-asr-tools -- bench      data/asr a.wav 20
+
+# 需要麦克风（会在 stderr 明确提示）
+cargo run --release -p cnt-asr-tools -- record     out.wav 3
+cargo run --release -p cnt-asr-tools -- live       data/asr 5 [--continuous]
+```
+
+`bench` 输出延迟分位数 + RTF + fastrace 阶段聚合表，口径与 `cnt-dict-tools bench` 一致。
+`live` 走的是和引擎完全相同的链路（含标点），可以当交互预演。
+
+### 可观测性
+
+每句话一棵 root span `voice_utterance`，子 span 覆盖前端/推理/解码/标点，
+属性带音频时长、耗时与 **RTF**（推理耗时 / 音频时长）——这是语音链路唯一有意义的
+性能指标：<1 才可能跟得上说话，PTT 体验上要求 <0.3。重采样与 VAD 也各自埋了 span
+（无上层 context 时零开销，采集回调里也能安全埋）。
+
+
 ## 安装（作为第三个输入法，与英文 / Rime 互不冲突）
+
+构建依赖（一次性）：麦克风采集走 ALSA（cpal → alsa-sys → libasound），
+需要 **dev** 包里的头文件与 `alsa.pc`（系统默认只装运行时库，编译会失败）：
+
+```bash
+sudo apt install libasound2-dev      # Debian/Ubuntu
+# Fedora: sudo dnf install alsa-lib-devel   /   Arch: sudo pacman -S alsa-lib
+```
+
+PipeWire 自带 ALSA 兼容层，所以走 ALSA 在 PipeWire 系统上照样录音，不需额外后端。
+`scripts/install.sh` 会先检查这个依赖，缺就自动装。
 
 ```bash
 # 1. 先按上文生成 data/cnt.dict 和 data/lm.cntl
@@ -345,4 +556,10 @@ cargo test
 ```
 
 覆盖：二进制格式读写、mmap 精确/前缀查询、打分排序、用户调频持久化、
-按键状态机（选词/翻页/退格/转交）。
+按键状态机（选词/翻页/退格/转交）、热键解析；
+语音侧：重采样（直流增益/分块一致性）、VAD 切句（停顿不断句/短噪声丢弃/超长强切）、
+fbank（帧数口径/窗/mel 滤波器）、LFR 边界（左右 padding）、CMVN、CTC 贪心去重、
+token 拼装与中英混排标点归一。
+
+语音部分的单测**不需要模型也不需要麦克风**（端口层用假识别器，前端用合成信号），
+`cargo test` 在 CI 里能直接跑。

@@ -1,0 +1,17 @@
+[package]
+name = "cnt-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cnt: microphone capture, resampling and voice activity detection"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cnt-asr.workspace = true
+cpal.workspace = true
+log.workspace = true
+fastrace.workspace = true
+thiserror.workspace = true

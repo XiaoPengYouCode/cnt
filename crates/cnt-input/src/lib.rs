@@ -4,6 +4,10 @@
 //! 每个候选携带可学习信息（句子 = 多个 (拼音, 词) 对），
 //! 上层在提交时据此记录用户调频。
 
+pub mod hotkey;
+
+pub use hotkey::Hotkey;
+
 /// 默认每页候选数（可用配置覆盖）
 pub const PAGE_SIZE: usize = 10;
 
@@ -332,6 +336,14 @@ impl EngineState {
             InputMode::Chinese => InputMode::English,
             InputMode::English => InputMode::Chinese,
         };
+        self.take_composing()
+    }
+
+    /// 把当前组合中的内容取出来（用于「打断组合」的场合：中英切换、开始语音输入）。
+    ///
+    /// 有选中的候选就用它，否则原样吐出拼音串——**不能直接丢**：
+    /// 用户已经打了字，任何情况下让它凭空消失都是数据丢失。
+    pub fn take_composing(&mut self) -> Option<(String, Vec<LearnedWord>)> {
         if !self.is_composing() {
             return None;
         }

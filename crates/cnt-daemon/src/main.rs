@@ -10,7 +10,7 @@ use zbus::connection::Builder;
 use cnt_config::Config as AppConfig;
 use cnt_decode::Decoder;
 use cnt_dict::{PinyinModel, DEFAULT_DICT_FILE, DEFAULT_USER_FILE};
-use cnt_engine::Factory;
+use cnt_engine::{Factory, VoiceRuntime};
 use cnt_lm::CntLm;
 use cnt_store::StoreError;
 
@@ -20,6 +20,10 @@ const ENGINE_DESCRIPTION: &str = "一个简单的简体中文拼音输入法（R
 const COMPONENT_NAME: &str = "org.freedesktop.IBus.Cnt";
 /// 默认语言模型文件名（用户数据目录下）。
 const DEFAULT_LM_FILE: &str = "lm.cntl";
+/// 默认语音模型目录（用户数据目录下）。
+const DEFAULT_ASR_DIR: &str = "asr";
+/// 默认标点模型目录（用户数据目录下）。
+const DEFAULT_PUNCT_DIR: &str = "punct";
 
 /// 主程序错误（显式，thiserror）。
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +141,116 @@ fn load_decoder() -> Arc<Decoder> {
     Arc::new(Decoder::new(model, lm, true))
 }
 
+/// 加载语音输入（可选）。
+///
+/// **任何一步失败都只是「没有语音」，绝不能影响拼音输入**——模型没下载、
+/// 没有麦克风、设备被占用都属于正常情况，输入法必须照常可用。
+/// 加载标点模型（可选）。
+///
+/// 缺失/失败都只是「没有标点」——`NoPunct` 直通，语音仍然可用（只是难读）。
+fn load_punctuator(settings: &cnt_config::VoiceSettings) -> Arc<dyn cnt_asr::Punctuator> {
+    use cnt_asr_onnx::punct::CtPunctuator;
+
+    if !settings.punctuation {
+        log::info!("voice: punctuation disabled by config");
+        return Arc::new(cnt_asr::NoPunct);
+    }
+    let dir = std::env::var_os("CNT_PUNCT_DIR").map_or_else(
+        || {
+            settings
+                .punct_dir
+                .clone()
+                .unwrap_or_else(|| data_dir().join(DEFAULT_PUNCT_DIR))
+        },
+        PathBuf::from,
+    );
+    let int8 = dir.join("model.int8.onnx");
+    let model = if int8.exists() { int8 } else { dir.join("model.onnx") };
+    if !model.exists() {
+        log::warn!(
+            "voice: punctuation model not found in {} (run scripts/fetch-asr-model.sh); \
+             output will have no punctuation",
+            dir.display()
+        );
+        return Arc::new(cnt_asr::NoPunct);
+    }
+    match CtPunctuator::open(&model, settings.threads) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            log::error!("voice: cannot load punctuation model: {e}; output will have no punctuation");
+            Arc::new(cnt_asr::NoPunct)
+        }
+    }
+}
+
+fn load_voice(settings: &cnt_config::VoiceSettings) -> Option<Arc<VoiceRuntime>> {
+    use cnt_asr_onnx::{SenseVoice, SenseVoiceConfig};
+    use cnt_audio::vad::VadConfig;
+    use cnt_audio::CaptureConfig;
+    use cnt_voice::{Voice, VoiceConfig};
+
+    if !settings.enabled {
+        log::info!("voice input: disabled (set [voice] enabled = true to turn on)");
+        return None;
+    }
+
+    let dir = std::env::var_os("CNT_ASR_DIR").map_or_else(
+        || {
+            settings
+                .model_dir
+                .clone()
+                .unwrap_or_else(|| data_dir().join(DEFAULT_ASR_DIR))
+        },
+        PathBuf::from,
+    );
+    let mut asr = SenseVoiceConfig::from_dir(&dir);
+    asr.language.clone_from(&settings.language);
+    asr.itn = settings.itn;
+    asr.threads = settings.threads;
+    if !asr.model.exists() || !asr.tokens.exists() {
+        log::warn!(
+            "voice input: model not found in {} (run scripts/fetch-asr-model.sh); voice disabled",
+            dir.display()
+        );
+        return None;
+    }
+
+    let started = std::time::Instant::now();
+    let model = match SenseVoice::open(&asr) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("voice input: cannot load model: {e}; voice disabled");
+            return None;
+        }
+    };
+    log::info!("voice input: model loaded in {:?}", started.elapsed());
+
+    let voice_config = VoiceConfig {
+        capture: CaptureConfig {
+            device: settings.device.clone(),
+        },
+        vad: VadConfig {
+            margin_db: settings.vad_margin_db,
+            trailing_silence_ms: settings.trailing_silence_ms,
+            ..VadConfig::default()
+        },
+        max_seconds: settings.max_seconds,
+        ..VoiceConfig::default()
+    };
+    let punctuator = load_punctuator(settings);
+    match Voice::new(Arc::new(model), punctuator, voice_config) {
+        Ok(voice) => Some(Arc::new(VoiceRuntime::new(
+            voice,
+            &settings.ptt_key,
+            &settings.toggle_key,
+        ))),
+        Err(e) => {
+            log::error!("voice input: cannot open microphone: {e}; voice disabled");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DaemonError> {
     init_observability();
@@ -154,6 +268,9 @@ async fn main() -> Result<(), DaemonError> {
     };
     log::info!("config: {} (page_size={})", config_path.display(), config.page_size);
 
+    // 语音输入（可选；模型加载在这里同步做一次，失败只是没有语音）
+    let voice = load_voice(&config.voice);
+
     // 1. 找到 IBus 私有总线地址并连接
     let addr = cnt_ibus::find_address()?;
     log::info!("connecting to IBus: {addr}");
@@ -165,7 +282,7 @@ async fn main() -> Result<(), DaemonError> {
     conn.object_server()
         .at(
             cnt_engine::FACTORY_OBJ_PATH,
-            Factory::new(conn.clone(), decoder.clone(), config.page_size),
+            Factory::new(conn.clone(), decoder.clone(), config.page_size, voice),
         )
         .await?;
     log::info!("factory served at {}", cnt_engine::FACTORY_OBJ_PATH);

@@ -1,0 +1,18 @@
+[package]
+name = "cnt-asr-onnx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cnt: ONNX (SenseVoice) speech recognition backend for the cnt-asr port"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cnt-asr.workspace = true
+ort.workspace = true
+rustfft.workspace = true
+log.workspace = true
+fastrace.workspace = true
+thiserror.workspace = true

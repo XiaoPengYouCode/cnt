@@ -1,0 +1,18 @@
+[package]
+name = "cnt-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cnt: voice input orchestration (push-to-talk / continuous sessions)"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cnt-asr.workspace = true
+cnt-audio.workspace = true
+tokio.workspace = true
+log.workspace = true
+fastrace.workspace = true
+thiserror.workspace = true
