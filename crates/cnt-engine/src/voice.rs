@@ -26,6 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cnt_input::hotkey::{is_release, mask, Hotkey};
+use fastrace::collector::SpanContext;
+use fastrace::future::FutureExt;
+use fastrace::Span;
 use cnt_voice::{Mode, Voice, VoiceError, VoiceEvent};
 
 use crate::core::EngineCore;
@@ -245,8 +248,19 @@ impl VoiceRuntime {
                         core.set_voice_hint(Some(HINT_RECOGNIZING.to_owned())).await;
                     }
                     VoiceEvent::Text(text) => {
-                        // 常开模式一句一次上屏；提示随后重画（会话还在继续）
-                        core.commit_voice(&text).await;
+                        // 常开模式一句一次上屏；提示随后重画（会话还在继续）。
+                        //
+                        // 这里独立成一棵 root span 而不是接到 cnt-voice 的
+                        // voice_release_to_commit 下面：上屏发生在**引擎的 tokio 任务**里，
+                        // 跨任务连成一棵树需要把 SpanContext 随事件传过来。
+                        // 先量出 D-Bus 这一段到底有多贵，再决定值不值得做那层传递。
+                        let chars = text.chars().count();
+                        core.commit_voice(&text)
+                            .in_span(
+                                Span::root("voice_commit", SpanContext::random())
+                                    .with_property(|| ("chars", chars.to_string())),
+                            )
+                            .await;
                         if runtime.continuous.load(Ordering::SeqCst) {
                             core.set_voice_hint(Some(HINT_LISTENING_CONT.to_owned()))
                                 .await;

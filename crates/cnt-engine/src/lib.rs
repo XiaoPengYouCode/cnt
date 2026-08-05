@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fastrace::collector::SpanContext;
+use fastrace::future::FutureExt;
 use fastrace::Span;
 use zbus::connection::Connection;
 use zbus::zvariant::OwnedObjectPath;
@@ -35,6 +36,10 @@ const KEY_SHIFT_L: u32 = 0xffe1;
 const KEY_SHIFT_R: u32 = 0xffe2;
 /// Shift「单击」判定窗口：按下后该时间内释放且期间未打其他键 → 切换中英
 const SHIFT_TAP_DURATION: std::time::Duration = std::time::Duration::from_millis(350);
+/// 「慢按键」阈值：超过这个时长的按键才上报 span 树（含 UI 刷新）。
+///
+/// 5ms 是人能感觉到的量级下限；正常按键 <1ms，全上报只会淹没有用信息。
+const SLOW_KEY_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Shift 键单击检测状态（按下时间 + 是否被「借用」打过其他键）。
 #[derive(Default)]
@@ -135,9 +140,15 @@ impl Engine {
 impl Engine {
     /// 核心：处理按键事件。返回 true 表示已消费。
     ///
-    /// 每次按键创建一个 root span（fastrace 推荐的短任务模式）：
-    /// span 只覆盖同步处理段（状态机 + 词库查询），保证 future Send；
-    /// await 的 UI 刷新是 fire-and-forget，不纳入 trace。
+    /// 每次按键一棵 root span，**覆盖到 UI 刷新为止**——包括跨进程的 D-Bus
+    /// 信号（`UpdateLookupTable`/`CommitText`）。
+    ///
+    /// 早先这里只覆盖同步段（状态机 + 词库查询），把 await 的 UI 刷新排除在外，
+    /// 结果是：用户抱怨「候选窗闪」「上屏卡」时，span 树里什么都看不到，
+    /// 而且「>5ms 才上报」的阈值也漏掉了慢在 D-Bus 上的按键 ——
+    /// **埋点覆盖不到用户感知的那一段，等于没埋**。
+    /// 异步段用 `in_span` 接进同一棵树（fastrace 的 future 适配器负责跨 await
+    /// 传递 local parent）。
     async fn process_key_event(
         &self,
         keyval: u32,
@@ -193,14 +204,10 @@ impl Engine {
                 .used = true;
         }
 
+        let root = Span::root("process_key_event", SpanContext::random());
         let action = {
-            // fastrace root span：覆盖按键处理的同步段（含 decode）。
-            // 正常按键（<5ms）cancel 掉不上报，只保留慢按键的 span 树
-            // 用于闪烁/卡顿诊断（daemon 的 ConsoleReporter 输出到 stderr）。
-            let root = Span::root("process_key_event", SpanContext::random());
             let _guard = root.set_local_parent();
             log::debug!("keyval=0x{keyval:x} state=0x{state:x}");
-
             let act = {
                 let mut st = self.core.lock_state();
                 // 半角标点上下文：未组合且光标前一个字符是数字/英文 → 半角（3，→ 3,）。
@@ -210,33 +217,46 @@ impl Engine {
             };
             // 同步段结束：释放 thread-local local parent，避免跨 await 污染
             drop(_guard);
-            if root.elapsed() < Some(std::time::Duration::from_millis(5)) {
-                root.cancel();
-            }
             act
         };
 
-        match action {
+        let outcome = match action {
             Action::Forward => {
                 log::debug!("forwarded");
                 self.core.note_forwarded_key(keyval);
                 Ok(false)
             }
             Action::Handled => {
-                self.core.refresh_after_handled().await;
+                self.core
+                    .refresh_after_handled()
+                    .in_span(Span::enter_with_parent("update_ui", &root))
+                    .await;
                 Ok(true)
             }
             Action::Commit { text, learned } => {
-                self.core.handle_commit(text, learned).await;
+                self.core
+                    .handle_commit(text, learned)
+                    .in_span(Span::enter_with_parent("commit", &root))
+                    .await;
                 Ok(true)
             }
             Action::CommitAndForward { text, learned } => {
                 // 提交预编辑后把原按键转发给应用（如 Shift+字母 输出大写）
-                self.core.handle_commit(text, learned).await;
+                self.core
+                    .handle_commit(text, learned)
+                    .in_span(Span::enter_with_parent("commit", &root))
+                    .await;
                 self.core.note_forwarded_key(keyval);
                 Ok(false)
             }
+        };
+
+        // 正常按键（<5ms，含 UI 刷新）cancel 掉不上报，只保留慢按键的 span 树
+        // 用于闪烁/卡顿诊断（daemon 的 ConsoleReporter 输出到 stderr）
+        if root.elapsed() < Some(SLOW_KEY_THRESHOLD) {
+            root.cancel();
         }
+        outcome
     }
 
     async fn focus_in(&self) {

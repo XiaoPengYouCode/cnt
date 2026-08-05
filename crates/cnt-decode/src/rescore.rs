@@ -75,11 +75,10 @@ pub fn apply(
         slot.1 = score;
     }
     scored[..n].sort_by(|a, b| b.1.total_cmp(&a.1));
-    LocalSpan::add_event(
-        Event::new("rescored")
-            .with_property(|| ("count", n.to_string()))
-            .with_property(|| ("model", rescorer.name())),
-    );
+    // 工作量（重排了几条）用属性；「发生了一次重排」用事件 —— 两者语义不同，
+    // 见 AGENTS.md 的埋点规范（scripts/check-tracing.sh 会检查）
+    LocalSpan::add_property(|| ("rescored_count", n.to_string()));
+    LocalSpan::add_event(Event::new("rescored").with_property(|| ("model", rescorer.name())));
     true
 }
 

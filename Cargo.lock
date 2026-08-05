@@ -317,6 +317,7 @@ name = "cnt-test-client"
 version = "0.1.0"
 dependencies = [
  "cnt-ibus",
+ "fastrace",
  "futures-util",
  "tokio",
  "zbus",

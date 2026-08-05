@@ -518,6 +518,8 @@ impl Worker {
         // 常开的中途切句是 voice_segment）。这样一棵树里同时看得到
         // 「用户等了多久」和「时间花在哪一级」。
         // span 必须活到 RTF 算出来之后 —— 它是这棵树上最该有的那个数字。
+        // trace-exception: 需要在 span 结束后补 RTF 属性（要先算完耗时），
+        // LocalSpan 的 add_property 是静态的、只作用于「当前」local span，做不到这点
         let root = Span::enter_with_local_parent("voice_utterance")
             .with_property(|| ("audio_secs", format!("{audio_secs:.2}")))
             .with_property(|| ("forced", forced.to_string()));

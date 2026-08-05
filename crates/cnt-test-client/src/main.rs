@@ -109,6 +109,14 @@ fn spawn_signal_printer(conn: zbus::Connection) -> tokio::task::JoinHandle<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 应用 crate 的第一件事：装 reporter（trace 关闭时是 noop）。
+    // 这个客户端是唯一能测「按键 → 引擎 → D-Bus → 客户端收到信号」**整条往返**
+    // 的地方，没有 reporter 就等于把这条唯一的端到端量具丢掉了。
+    fastrace::set_reporter(
+        fastrace::collector::ConsoleReporter,
+        fastrace::collector::Config::default(),
+    );
+
     let addr = cnt_ibus::find_address()?;
     let conn = Builder::address(addr.as_str())?.build().await?;
 
@@ -158,8 +166,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("unknown key: {line}");
             continue;
         };
-        let handled: bool = conn
-            .call_method(
+        // 每次按键一棵 root span：这里量到的是**客户端视角的往返延迟**
+        // （发出 ProcessKeyEvent → 引擎处理 → 拿到返回值），与引擎内部的
+        // process_key_event span 互为对照：两者的差就是 D-Bus 的开销。
+        let root = fastrace::Span::root(
+            "client_key_roundtrip",
+            fastrace::collector::SpanContext::random(),
+        )
+        .with_property(|| ("key", line.to_owned()));
+        let started = std::time::Instant::now();
+        let handled: bool = {
+            let _guard = root.set_local_parent();
+            conn.call_method(
                 Some(DAEMON),
                 ic_path.as_str(),
                 Some(IC_IFACE),
@@ -168,11 +186,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?
             .body()
-            .deserialize()?;
-        println!(">> {line} (keyval=0x{kv:x}) handled={handled}");
+            .deserialize()?
+        };
+        let elapsed = started.elapsed();
+        root.add_property(|| ("handled", handled.to_string()));
+        drop(root);
+        println!(
+            ">> {line} (keyval=0x{kv:x}) handled={handled} 往返 {:.2}ms",
+            elapsed.as_secs_f32() * 1000.0
+        );
     }
 
     sig_task.abort();
+    fastrace::flush();
     println!("done");
     Ok(())
 }

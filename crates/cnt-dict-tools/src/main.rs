@@ -114,6 +114,14 @@ fn main() {
         usage();
         std::process::exit(2);
     }
+    // 除 bench（自带聚合 reporter）外，其余命令用 ConsoleReporter：
+    // 诊断命令没有 reporter 等于埋了点也看不见（trace 关闭时这行是 noop）
+    if args[1] != "bench" {
+        fastrace::set_reporter(
+            fastrace::collector::ConsoleReporter,
+            fastrace::collector::Config::default(),
+        );
+    }
     let result = match args[1].as_str() {
         "build" => {
             if args.len() != 4 {
@@ -576,7 +584,16 @@ fn cmd_decode(
         if !opts.tsv {
             writeln!(out, "{pinyin}:")?;
         }
+        // 每次解码一棵 root span：decode 是诊断命令，没有 span 树等于瞎子
+        // （`--features "fastrace/enable"` 构建时才有输出）
+        let root = fastrace::Span::root(
+            format!("decode:{pinyin}"),
+            fastrace::collector::SpanContext::random(),
+        );
+        let guard = root.set_local_parent();
         let cands = decoder.candidates_scored(pinyin);
+        drop(guard);
+        drop(root);
         for (i, (cand, score)) in cands.iter().take(opts.top).enumerate() {
             // 拼音键 = 解码器实际走的读音路径（整句为多段，用 '-' 连接）；
             // fuzzy 测试据此区分「精确读音 / 模糊回退 / 尾音节补全」，
@@ -597,6 +614,7 @@ fn cmd_decode(
         }
     }
     out.flush()?;
+    fastrace::flush();
     let _ = std::fs::remove_file(&tmp_user);
     Ok(())
 }
