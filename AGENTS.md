@@ -15,6 +15,12 @@
 - **依赖**：所有依赖统一定义在根 `Cargo.toml` 的 `[workspace.dependencies]`，
   精确锁定版本（`=x.y.z`），各 crate 只写 `xxx.workspace = true`。
 - **词库**：`data/` 不入库，通过 `cnt-dict-tools` 数据管线独立分发。
+  语音模型同理（`data/asr`、`data/punct`，共 ~324 MB，走 `scripts/fetch-asr-model.sh`）。
+- **产物不入库**：性能采样与诊断产物（`perf.data`、`perf.data.old`、`*.perf`、
+  `flamegraph.svg`）、模型与词库二进制、`target/` 一律不提交。
+  已在 `.gitignore` 里挡住，**但不要用 `git add -A` 碎片式提交**：
+  提交前先 `git status --porcelain -uall` 看清单，并确认没有 >1 MB 的文件
+  （`perf.data` 就是这么溢进去的，后来靠重写历史才拿出来）。
 
 ## 可观测性（埋点基础设施）
 
