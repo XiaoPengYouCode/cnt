@@ -63,15 +63,11 @@
   **`Span` 还是 `LocalSpan`**：默认 `LocalSpan`（fastrace 为单线程子 span 优化的类型）。
   只有两种情况用 `Span`：① 需要 `Span::root` 开一棵树；② 需要在 span 结束后补属性
   （如算完 RTF 再挂上去）或跨 await 传递（配 `FutureExt::in_span`）。
+  破例处在代码里写清理由 —— 让下一个读到的人知道这不是疏忽。
 
   **跨 await 的异步段**用 `Span::enter_with_parent(name, &root)` + `FutureExt::in_span`
   接进同一棵树；不要图省事让它掉出 trace。跨**任务/线程**时先用独立 root 量出数量级，
   确认值得再做 `SpanContext` 传递。
-
-  **自查**：`bash scripts/check-tracing.sh`（规范的可执行版本，违规退出码 1）。
-  它检查：库 crate 不用重 `Span`（例外须在上方 3 行内写 `// trace-exception: 原因`）、
-  库里不出现 reporter/flush、应用 crate 有 reporter+flush、工作量指标没塞进 `Event`。
-  **改完埋点跑一次**，和 `cargo clippy` 一样属于提交前的例行检查。
 
   **落地顺序**（新功能一律照这个来）：
   1. 先问「用户感知的那个数字是什么」→ 建端到端 root span，**含最后一步 IO**；
