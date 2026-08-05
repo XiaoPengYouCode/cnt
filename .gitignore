@@ -1,2 +1,8 @@
 /target
 /data/
+
+# 性能采样产物（perf record / flamegraph），一律不入库
+perf.data
+perf.data.old
+*.perf
+flamegraph.svg
