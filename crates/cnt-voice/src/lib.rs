@@ -384,6 +384,11 @@ impl Worker {
                 }
                 Mode::Continuous => {
                     for segment in segmenter.push(&chunk) {
+                        // 常开模式：每切出一句就是一次完整的「听到→上屏」，
+                        // 各自一棵 root（会话可能持续几分钟，不能等它结束才上报）
+                        let seg_root = Span::root("voice_segment", SpanContext::random())
+                            .with_property(|| ("start_secs", format!("{:.1}", segment.start_secs)));
+                        let _guard = seg_root.set_local_parent();
                         self.recognize_segment(&segment, tx);
                     }
                 }
@@ -408,8 +413,26 @@ impl Worker {
             self.active.store(false, Ordering::SeqCst);
             return;
         }
-        let _ = tx.send(VoiceEvent::Recognizing);
-        self.finish(mode, &mut ptt_buffer, &tail, &mut segmenter, tx);
+        // ★ 用户真正感受到的延迟：**松手到上屏**。
+        //
+        // 此前只埋了 transcribe 的耗时，但那不是体验——从松手到文字出现之间还有
+        // 排空音频、标点、重排、事件传递。少埋这一段，就会出现「span 树看着很快、
+        // 人却觉得慢」的经典盲区。PTT 的预算是 300ms，管的是这个数字。
+        let commit = Span::root("voice_release_to_commit", SpanContext::random())
+            .with_property(|| ("mode", mode.as_str().to_owned()))
+            .with_property(|| ("cancelled", "false".to_owned()));
+        let released = Instant::now();
+        {
+            let _guard = commit.set_local_parent();
+            let _ = tx.send(VoiceEvent::Recognizing);
+            self.finish(mode, &mut ptt_buffer, &tail, &mut segmenter, tx);
+        }
+        commit.add_property(|| ("elapsed_ms", format!("{:.1}", released.elapsed().as_secs_f32() * 1000.0)));
+        drop(commit);
+        log::info!(
+            "voice: release→commit {:.0}ms",
+            released.elapsed().as_secs_f32() * 1000.0
+        );
 
         log::info!("voice: session ended after {:.1}s", started.elapsed().as_secs_f32());
         let _ = tx.send(VoiceEvent::Stopped);
@@ -450,7 +473,16 @@ impl Worker {
                 if let Some(segment) = segmenter.flush() {
                     self.recognize_segment(&segment, tx);
                 }
+                // 会话级 span：VAD 的判定质量只能在「一整段会话」的尺度上看
+                // （切了几句、丢了几段、噪声底跑到哪去了），逐句 span 看不出来
                 let stats = segmenter.stats();
+                let session = Span::root("voice_session", SpanContext::random())
+                    .with_property(|| ("segments", stats.segments.to_string()))
+                    .with_property(|| ("dropped", stats.dropped.to_string()))
+                    .with_property(|| ("frames", stats.frames.to_string()))
+                    .with_property(|| ("speech_frames", stats.speech_frames.to_string()))
+                    .with_property(|| ("noise_floor_db", format!("{:.1}", stats.noise_floor_db)));
+                drop(session);
                 log::info!(
                     "voice: continuous session done: {} segments, {} dropped, noise floor {:.1} dBFS",
                     stats.segments,
@@ -482,17 +514,19 @@ impl Worker {
     fn recognize(&self, samples: &[f32], forced: bool, tx: &UnboundedSender<VoiceEvent>) {
         let audio_secs = samples_to_secs(samples.len());
         let started = Instant::now();
+        // 每句一个 span，挂在**外层 root** 下（PTT 是 voice_release_to_commit，
+        // 常开的中途切句是 voice_segment）。这样一棵树里同时看得到
+        // 「用户等了多久」和「时间花在哪一级」。
+        // span 必须活到 RTF 算出来之后 —— 它是这棵树上最该有的那个数字。
+        let root = Span::enter_with_local_parent("voice_utterance")
+            .with_property(|| ("audio_secs", format!("{audio_secs:.2}")))
+            .with_property(|| ("forced", forced.to_string()));
         let result = {
-            let root = Span::root("voice_utterance", SpanContext::random());
             let _guard = root.set_local_parent();
-            LocalSpan::add_event(
-                Event::new("segment")
-                    .with_property(|| ("audio_secs", format!("{audio_secs:.2}")))
-                    .with_property(|| ("forced", forced.to_string())),
-            );
             let mut out = self.recognizer.transcribe(samples);
-            // n-best 重排：声学分不确定时让语言模型说话（详见 rescore()）
+            // n-best 重排：声学分不确定时让语言模型说话（详见 rescore_nbest）
             if let Ok(t) = &mut out {
+                LocalSpan::add_property(|| ("nbest", t.alternatives.len().to_string()));
                 self.rescore(t);
             }
             // 标点恢复：**失败就用原文**（端口契约），一句话绝不能因为标点丢掉
@@ -505,11 +539,10 @@ impl Worker {
                 }
             }
             if let Ok(t) = &out {
-                LocalSpan::add_event(
-                    Event::new("result")
-                        .with_property(|| ("chars", t.text.chars().count().to_string()))
-                        .with_property(|| ("lang", t.language.clone().unwrap_or_default())),
-                );
+                LocalSpan::add_property(|| ("chars", t.text.chars().count().to_string()));
+                LocalSpan::add_property(|| {
+                    ("lang", t.language.clone().unwrap_or_else(|| "?".to_owned()))
+                });
             }
             out
         };
@@ -521,6 +554,10 @@ impl Worker {
         } else {
             0.0
         };
+        // RTF 挂到 root 上：它是语音链路唯一有意义的性能指标，
+        // 必须能在 span 树里直接看到，而不是只在日志里
+        root.add_property(|| ("rtf", format!("{rtf:.3}")));
+        drop(root);
         match result {
             Ok(t) if t.is_empty() => {
                 log::info!("voice: empty result ({audio_secs:.2}s audio, {elapsed:.2}s, rtf {rtf:.2})");
@@ -560,7 +597,7 @@ pub fn rescore_nbest(transcript: &mut cnt_asr::Transcript, scorer: &dyn TextScor
     if transcript.alternatives.len() < 2 {
         return;
     }
-    let _span = Span::enter_with_local_parent("voice_rescore");
+    let _span = LocalSpan::enter_with_local_parent("voice_rescore");
 
     // 声学分换成 log10，与语言模型同口径
     let acoustic: Vec<f32> = transcript

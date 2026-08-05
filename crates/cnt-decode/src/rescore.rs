@@ -11,7 +11,7 @@
 use cnt_input::Candidate;
 use cnt_score::{RescorePolicy, Rescorer, Segment, SentenceHyp};
 use fastrace::local::LocalSpan;
-use fastrace::{Event, Span};
+use fastrace::Event;
 
 /// 对 `scored`（按分数降序）就地应用重排。返回是否真的重排了。
 pub fn apply(
@@ -23,7 +23,7 @@ pub fn apply(
     if n < 2 {
         return false;
     }
-    let _span = Span::enter_with_local_parent("rescore");
+    let _span = LocalSpan::enter_with_local_parent("rescore");
 
     // 借用期：构造 hyps（segments 先落地成 owned Vec，hyps 借用它）
     let segments: Vec<Vec<Segment<'_>>> = scored[..n]

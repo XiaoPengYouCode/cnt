@@ -438,20 +438,26 @@ metadata: blank_id=60514  lfr_window_size=7  lfr_window_shift=6
 ### 实测（Intel Core Ultra 5 336H，4 线程，release）
 
 ```
-zh.wav   5.59s → 235ms (RTF 0.042)  开饭时间，早上九点至下午五点。
-en.wav   7.15s → 318ms (RTF 0.044)  the tribal chiefin called for the boy and ... food.
-ja.wav   7.20s → 307ms (RTF 0.043)  うちの中学は弁当制で持っていけない場合は五十円の学校販売のパンを買う
-yue.wav  5.15s → 245ms (RTF 0.048)  呢几个字都表达唔到我想讲嘅意思。
-两句拼接 11.78s → 484ms + 标点 7ms   开放时间早上九点至下午五点。开放时间，早上九点至下午五点。
+bench（zh.wav 5.59s，8 轮 × 3 次交替）：平均 88~92ms（RTF 0.016）
 
-bench（20 轮）：平均 232.6ms  中位 233.0ms  90% 239.0ms  最差 243.1ms
-fastrace 阶段分解：
-  asr_frontend  1846µs（0.8%）  ← fbank 1820 / lfr 25 / cmvn 0.1
-  asr_infer   228001µs（99%）   ← 其中 ctc_decode 16803µs（60515 维 argmax，可优化）
-  punctuate     2900µs
+fastrace 阶段分解（span 属性直接可读）：
+  asr_transcribe   84933µs  [samples=89472 frames=93 tokens=13 nbest=8 vocab=60515]
+    asr_frontend     650µs（0.8%）   ← fbank 638 / lfr 12 / cmvn 0.03
+    asr_infer      84265µs（99%）    ← encoder
+      ctc_beam      4959µs（6%）     ← prefix beam search
+  punctuate         ~3000µs
 ```
 
-3 秒的短句约 125 ms，「松手到上屏 < 300 ms」的预算很宽裕。
+3 秒的短句约 50 ms，「松手到上屏 < 300 ms」的预算很宽裕。
+
+> **n-best 是免费的**：CTC prefix beam search 起初比贪心慢 22%（+20ms），
+> 原因是逐帧做了全量 softmax 归一化（6 万类 × 93 帧 ≈ 560 万次 `exp()`）。
+> 但归一化常数对所有假设**完全相同**，而我们只用到假设之间的排序与分差——
+> 常数会消掉。去掉之后 `ctc_beam` 20.1ms → 4.9ms，与贪心持平
+> （交替测量：贪心 88/93/93ms，beam+重排 92/90/88ms）。
+>
+> 早先 README 记录的「232ms」是**降频状态**下测的，不是代码变慢——
+> 这正是 AGENTS.md 要求「交替跑新旧二进制」的原因。
 
 ### CLI（开发/诊断）
 

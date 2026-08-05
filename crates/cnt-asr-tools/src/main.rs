@@ -435,8 +435,14 @@ fn cmd_bench(args: &[String]) -> CliResult {
     names.sort_by_key(|n| stage_rank(n));
     for name in names {
         let a = &table.by_name[name];
+        let props = if a.props.is_empty() {
+            String::new()
+        } else {
+            let kv: Vec<String> = a.props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            format!("  [{}]", kv.join(" "))
+        };
         println!(
-            "  {name:<20} n={:<3} avg={:>9.1}µs  min={:>9.1}µs  max={:>9.1}µs",
+            "  {name:<20} n={:<3} avg={:>9.1}µs  min={:>9.1}µs  max={:>9.1}µs{props}",
             a.count,
             ns_to_us(a.total_ns / a.count.max(1)),
             ns_to_us(a.min_ns),
@@ -607,6 +613,8 @@ struct SpanAgg {
     total_ns: u64,
     min_ns: u64,
     max_ns: u64,
+    /// span 属性（工作量指标：frames / nbest / rtf …），保留首次出现的值。
+    props: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -636,6 +644,13 @@ impl fastrace::collector::Reporter for AggregateReporter {
             } else {
                 e.min_ns
             };
+            if e.props.is_empty() && !s.properties.is_empty() {
+                e.props = s
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+            }
         }
     }
 }

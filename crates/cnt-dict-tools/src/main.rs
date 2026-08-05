@@ -608,6 +608,8 @@ struct BenchAgg {
     total_ns: u64,
     min_ns: u64,
     max_ns: u64,
+    /// span 属性（工作量指标，如 beam 的 expand 次数）。
+    props: Vec<(String, String)>,
 }
 
 /// fastrace 聚合统计（Arc<Mutex> 共享：后台上报线程写，bench 主线程 flush 后读）。
@@ -636,15 +638,21 @@ impl fastrace::collector::Reporter for AggregateReporter {
             } else {
                 e.min_ns
             };
-            for ev in s.events {
-                if ev.name == "expand" {
-                    for (k, v) in &ev.properties {
-                        if k == "count" {
-                            st.expand_total += v.parse::<u64>().unwrap_or(0);
-                        }
-                    }
-                }
+            // 工作量指标现在是 span 属性（不再是事件），见 AGENTS.md 埋点约定
+            if e.props.is_empty() && !s.properties.is_empty() {
+                e.props = s
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
             }
+            let expand: u64 = s
+                .properties
+                .iter()
+                .find(|(k, _)| k == "expand")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(0);
+            st.expand_total += expand;
         }
     }
 }
@@ -674,6 +682,52 @@ fn measure_cold(
     }
     out.sort_unstable();
     out
+}
+
+/// 打印 fastrace 阶段分解表（每样例首轮 span 树的聚合）。
+///
+/// 工作量指标以 **span 属性**形式一并打出（`expand=…`），见 AGENTS.md 的埋点约定。
+fn print_stage_table(agg: &std::sync::Arc<std::sync::Mutex<BenchStats>>) {
+    let stats = agg.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    println!();
+    println!("fastrace 阶段分解（每样例首轮 span 树聚合）：");
+    let mut names: Vec<&String> = stats.by_name.keys().collect();
+    names.sort_by(|a, b| stage_rank(a).cmp(&stage_rank(b)).then(a.cmp(b)));
+    for name in names {
+        let a = &stats.by_name[name];
+        let avg = ns_to_us(a.total_ns / a.count.max(1));
+        let min = ns_to_us(a.min_ns);
+        let max = ns_to_us(a.max_ns);
+        let props = if a.props.is_empty() {
+            String::new()
+        } else {
+            let kv: Vec<String> = a.props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            format!("  [{}]", kv.join(" "))
+        };
+        println!(
+            "  {name:<28} n={:<3} avg={avg:>8.1}µs  min={min:>7.1}µs  max={max:>8.1}µs{props}",
+            a.count
+        );
+    }
+    if stats.expand_total > 0 {
+        println!("  展开次数合计（beam 属性）      {}", stats.expand_total);
+    }
+    drop(stats);
+}
+
+/// 阶段在表里的排序（按链路顺序，读起来像一条流水线）。
+fn stage_rank(name: &str) -> usize {
+    if name.starts_with("decode:") {
+        return 0;
+    }
+    match name {
+        "candidates" => 1,
+        "beam" => 2,
+        "keys_at" => 3,
+        "lattice" => 4,
+        "completions" => 5,
+        _ => 6,
+    }
 }
 
 fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) -> CliResult {
@@ -757,41 +811,7 @@ fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) 
         cold[cold.len() - 1]
     );
 
-    // fastrace 阶段分布表（每样例第 1 轮，即 18 棵树）
-    {
-        // guard 仅在打印段持有（块作用域结束时释放）
-        let stats = agg.lock().unwrap();
-        println!();
-        println!("fastrace 阶段分解（每样例首轮 span 树聚合）：");
-        let mut names: Vec<&String> = stats.by_name.keys().collect();
-        names.sort_by(|a, b| {
-            let rank = |n: &str| {
-                if n.starts_with("decode:") {
-                    0
-                } else {
-                    match n {
-                        "candidates" => 1,
-                        "beam" => 2,
-                        "lattice" => 3,
-                        "completions" => 4,
-                        _ => 5,
-                    }
-                }
-            };
-            rank(a).cmp(&rank(b)).then(a.cmp(b))
-        });
-        for name in names {
-            let a = &stats.by_name[name];
-            let avg = ns_to_us(a.total_ns / a.count.max(1));
-            let min = ns_to_us(a.min_ns);
-            let max = ns_to_us(a.max_ns);
-            println!("  {name:<32} n={:<3} avg={avg:>8.1}µs  min={min:>7.1}µs  max={max:>8.1}µs", a.count);
-        }
-        if stats.expand_total > 0 {
-            println!("  expand(事件)                    n={:<3} 总展开次数 {}", stats.by_name.len(), stats.expand_total);
-        }
-        drop(stats); // 显式提前释放 guard（clippy: temporary_with_significant_drop）
-    }
+    print_stage_table(&agg);
 
     let _ = std::fs::remove_file(&tmp_user);
     Ok(())

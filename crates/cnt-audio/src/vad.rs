@@ -169,7 +169,7 @@ impl Segmenter {
 
     /// 喂一段样本，返回本次完成的句子（可能 0～多句）。
     pub fn push(&mut self, samples: &[f32]) -> Vec<Segment> {
-        let _span = fastrace::Span::enter_with_local_parent("vad_push");
+        let _span = fastrace::local::LocalSpan::enter_with_local_parent("vad_push");
         let mut done = Vec::new();
         self.pending.extend_from_slice(samples);
         let full = self.pending.len() / FRAME_SAMPLES;

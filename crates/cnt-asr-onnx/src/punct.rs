@@ -32,7 +32,7 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use cnt_asr::{AsrError, Punctuator};
-use fastrace::Span;
+use fastrace::local::LocalSpan;
 use ort::session::Session;
 use ort::value::{Tensor, TensorElementType, ValueType};
 
@@ -84,7 +84,7 @@ impl CtPunctuator {
     /// # Errors
     /// 模型打不开、metadata 缺少 `tokens`/`punctuations` 时返回错误。
     pub fn open(model: impl AsRef<Path>, threads: usize) -> Result<Self, AsrError> {
-        let _span = Span::enter_with_local_parent("punct_open");
+        let _span = LocalSpan::enter_with_local_parent("punct_open");
         let model = model.as_ref();
         let mut builder = Session::builder().map_err(err)?;
         if threads > 0 {
@@ -228,7 +228,7 @@ impl CtPunctuator {
 
 impl Punctuator for CtPunctuator {
     fn restore(&self, text: &str) -> Result<String, AsrError> {
-        let _span = Span::enter_with_local_parent("punctuate");
+        let _span = LocalSpan::enter_with_local_parent("punctuate");
         let words = split_words(text);
         if words.is_empty() {
             return Ok(String::new());

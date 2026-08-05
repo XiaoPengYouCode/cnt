@@ -38,7 +38,7 @@ impl Lfr {
     /// 应用 LFR：`frames × dim` → `out_frames × (dim × window)`。
     #[must_use]
     pub fn apply(&self, feats: &[f32], dim: usize) -> Vec<f32> {
-        let _span = fastrace::Span::enter_with_local_parent("lfr");
+        let _span = fastrace::local::LocalSpan::enter_with_local_parent("lfr");
         if dim == 0 || feats.is_empty() {
             return Vec::new();
         }
@@ -99,7 +99,7 @@ impl Cmvn {
 
     /// 原地归一化（维数不匹配时按最短的来，不 panic）。
     pub fn apply(&self, feats: &mut [f32]) {
-        let _span = fastrace::Span::enter_with_local_parent("cmvn");
+        let _span = fastrace::local::LocalSpan::enter_with_local_parent("cmvn");
         if !self.is_valid() {
             return;
         }

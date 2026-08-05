@@ -153,7 +153,7 @@ impl<L: NgramLm + ?Sized> TextScorer for LmTextScorer<L> {
         if text.is_empty() {
             return None;
         }
-        let _span = fastrace::Span::enter_with_local_parent("lm_score_text");
+        let _span = fastrace::local::LocalSpan::enter_with_local_parent("lm_score_text");
         let scored = score_text(self.lm.as_ref(), text);
         let oov = scored.oov_ratio();
         if oov > MAX_OOV_RATIO {

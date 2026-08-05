@@ -32,10 +32,21 @@
   发布构建（install.sh、`cargo build --release -p cnt-daemon`）默认关闭——span 宏编译为
   noop、零开销；诊断/bench 时 `cargo build --release --features "fastrace/enable"`
   全局开启（一条命令影响整个构建图）。
-- **埋点**：库代码用 `Span::enter_with_local_parent("名")` 建子 span——上层无 context 时
-  零开销，热路径放心埋；应用代码建 root span（`Span::root` + `set_local_parent`），
-  退出/批次结束 `fastrace::flush()`。span 名小写下划线，工作量指标用 `Event` 属性
-  （如 `expand(count=…)`）。
+- **埋点**：
+  - **库代码用 `LocalSpan::enter_with_local_parent("名")`**（不是 `Span::…`）——
+    `LocalSpan` 是 fastrace 为「单线程内的子 span」优化的类型，更轻；
+    上层无 context 时零开销，热路径放心埋。
+  - 应用代码建 root span（`Span::root` + `set_local_parent`），退出/批次结束
+    `fastrace::flush()`。span 名小写下划线。
+  - **属性 vs 事件**（按 OpenTelemetry 口径，别混）：
+    - **属性**（`LocalSpan::add_property` / `Span::with_property`）描述这个 span
+      **干了多少活、在什么参数下** —— `frames=93`、`nbest=8`、`expand=8866`、`rtf=0.016`。
+      聚合表能按 span 名直接汇总，是性能分析的主要输入。
+    - **事件**（`Event::new`）只用于「期间发生了某件事」—— 如 `rescored`
+      （语言模型改写了一次结果）。事件不适合承载工作量指标。
+  - **端到端延迟必须单独埋一个 span**：只埋内部各阶段会产生「span 树看着很快、
+    人却觉得慢」的盲区。语音的 `voice_release_to_commit`（松手→上屏）就是为此存在的——
+    它覆盖排空音频、识别、重排、标点、事件传递的全过程，PTT 的 300ms 预算管的是这个数字。
 - **性能对照**：`cnt-dict-tools bench <dict> <lm> --user <u.dict> <rounds>` 输出
   **热/冷** wall-time 分位数（热 = 词键缓存命中 = 连续打字的第 2 键起；冷 = 每次
   清空缓存）+ fastrace 阶段聚合表；改动前后各跑一次对比。

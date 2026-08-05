@@ -213,7 +213,7 @@ fn language_tag(token: &str) -> Option<&str> {
 /// CTC 贪心解码：`logits[T, vocab]` → token id 序列（已去 blank 与重复）。
 #[must_use]
 pub fn greedy_decode(logits: &[f32], vocab: usize, blank: usize) -> Vec<usize> {
-    let _span = fastrace::Span::enter_with_local_parent("ctc_decode");
+    let _span = fastrace::local::LocalSpan::enter_with_local_parent("ctc_decode");
     if vocab == 0 {
         return Vec::new();
     }
@@ -243,10 +243,14 @@ pub const PREFIX_BEAM: usize = 8;
 /// 每帧只看概率最高的这么多个 token（词表 6 万，全展开纯属浪费）。
 const TOPK_PER_FRAME: usize = 8;
 
-/// 一条 CTC 假设：token id 序列 + 声学对数概率（自然对数）。
+/// 一条 CTC 假设：token id 序列 + 声学分数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CtcHyp {
     pub ids: Vec<usize>,
+    /// 声学对数概率（自然对数），**相差一个与假设无关的常数**
+    /// （跳过了逐帧 softmax 归一化，见 `top_k_logits`）。
+    ///
+    /// 只能用于假设之间的比较与分差，不要当作绝对置信度。
     pub logp: f32,
 }
 
@@ -261,7 +265,7 @@ pub struct CtcHyp {
 /// 新 token），从而正确处理 CTC 的折叠语义。
 #[must_use]
 pub fn prefix_beam_search(logits: &[f32], vocab: usize, blank: usize, beam: usize) -> Vec<CtcHyp> {
-    let _span = fastrace::Span::enter_with_local_parent("ctc_beam");
+    let _span = fastrace::local::LocalSpan::enter_with_local_parent("ctc_beam");
     if vocab == 0 || logits.len() < vocab {
         return Vec::new();
     }
@@ -271,8 +275,8 @@ pub fn prefix_beam_search(logits: &[f32], vocab: usize, blank: usize, beam: usiz
     let mut next: Vec<(Vec<usize>, f32, f32)> = Vec::new();
 
     for frame in logits.chunks_exact(vocab) {
-        // 该帧的 log-softmax（只对 top-K 求值，但归一化用全量 logsumexp）
-        top_k_log_probs(frame, TOPK_PER_FRAME, &mut scratch);
+        // 该帧概率最高的若干 token（**不做归一化**，理由见 top_k_logits 的文档）
+        top_k_logits(frame, TOPK_PER_FRAME, &mut scratch);
         next.clear();
         for (prefix, pb, pnb) in &beams {
             let total = log_add(*pb, *pnb);
@@ -324,24 +328,31 @@ fn push_beam(out: &mut Vec<(Vec<usize>, f32, f32)>, prefix: &[usize], pb: f32, p
     }
 }
 
-/// 一帧里概率最高的 K 个 token 的对数概率（log-softmax）。
+/// 一帧里得分最高的 K 个 token（**原始 logits，不做 softmax 归一化**）。
 ///
-/// 归一化必须用**全量** logsumexp（6 万类），否则各帧的分数不可比、
-/// beam 的比较就失去意义。
-fn top_k_log_probs(frame: &[f32], k: usize, out: &mut Vec<(usize, f32)>) {
+/// 为什么可以不归一化：每条假设都恰好穿过全部 T 帧、每帧恰好取一个 token 的分数，
+/// 所以每条假设少掉的归一化常数 `Σ_f log_norm_f` **完全相同**。而我们只用到
+///
+/// - 假设之间的**排序**（beam 剪枝、n-best 排序）
+/// - 假设之间的**分差**（重排的 `RESCORE_GAP` 门限）
+/// - 同一前缀不同路径的 `log_add` 合并（同样相差同一个常数）
+///
+/// 常数在这三种运算下都会消掉，结论不变。
+///
+/// 收益不小：全量 logsumexp 是每帧 6 万次 `exp()`，一段 5.6 秒的话有 93 帧
+/// ≈ 560 万次超越函数调用，实测占 `ctc_beam` 的大半（20.1ms → 见下方注释里的对比）。
+/// 唯一的代价是 `CtcHyp::logp` 不再是绝对概率——所以它的文档写明「相差一个
+/// 与假设无关的常数」，不要拿它当置信度用。
+fn top_k_logits(frame: &[f32], k: usize, out: &mut Vec<(usize, f32)>) {
     out.clear();
-    let max = frame.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = frame.iter().map(|v| (*v - max).exp()).sum();
-    let log_norm = max + sum.ln();
     for (i, v) in frame.iter().enumerate() {
-        let logp = *v - log_norm;
         if out.len() < k {
-            out.push((i, logp));
+            out.push((i, *v));
             if out.len() == k {
                 out.sort_by(|a, b| b.1.total_cmp(&a.1));
             }
-        } else if logp > out[k - 1].1 {
-            out[k - 1] = (i, logp);
+        } else if *v > out[k - 1].1 {
+            out[k - 1] = (i, *v);
             out.sort_by(|a, b| b.1.total_cmp(&a.1));
         }
     }

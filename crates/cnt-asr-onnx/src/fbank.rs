@@ -145,7 +145,7 @@ impl Fbank {
     /// 计算 log-mel 特征，返回 `frames × num_bins` 的行主序展开。
     #[must_use]
     pub fn compute(&self, samples: &[f32]) -> Vec<f32> {
-        let _span = fastrace::Span::enter_with_local_parent("fbank");
+        let _span = fastrace::local::LocalSpan::enter_with_local_parent("fbank");
         let frame_length = self.opts.frame_length();
         let shift = self.opts.frame_shift();
         let frames = self.num_frames(samples.len());

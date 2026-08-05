@@ -32,7 +32,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use fastrace::local::LocalSpan;
-use fastrace::{Event, Span};
 use ort::session::{Session, SessionInputValue};
 use ort::value::{Tensor, TensorElementType, Value, ValueType};
 
@@ -158,7 +157,7 @@ impl SenseVoice {
     /// # Errors
     /// 模型/词表打不开、metadata 不合规或 ORT 初始化失败时返回错误。
     pub fn open(config: &SenseVoiceConfig) -> Result<Self, AsrError> {
-        let _span = Span::enter_with_local_parent("asr_open");
+        let _span = LocalSpan::enter_with_local_parent("asr_open");
         let tokens = Tokens::load(&config.tokens)?;
 
         let mut builder = Session::builder().map_err(ort_err)?;
@@ -255,7 +254,7 @@ impl SenseVoice {
 
     /// 声学前端：样本 → `(特征, 帧数, 维数)`。
     fn features(&self, samples: &[f32]) -> (Vec<f32>, usize, usize) {
-        let _span = Span::enter_with_local_parent("asr_frontend");
+        let _span = LocalSpan::enter_with_local_parent("asr_frontend");
         let dim = self.fbank.num_bins();
         let feats = self.fbank.compute(samples);
         let mut feats = self.lfr.apply(&feats, dim);
@@ -285,19 +284,19 @@ impl Recognizer for SenseVoice {
     // significant_drop_tightening: session 锁必须覆盖 run + 取输出（outputs 借用 session）
     #[allow(clippy::significant_drop_tightening)]
     fn transcribe(&self, samples: &[f32]) -> Result<Transcript, AsrError> {
-        let _span = Span::enter_with_local_parent("asr_transcribe");
+        let _span = LocalSpan::enter_with_local_parent("asr_transcribe");
         if samples.len() < MIN_SAMPLES {
             return Ok(Transcript::default());
         }
-        LocalSpan::add_event(
-            Event::new("audio").with_property(|| ("samples", samples.len().to_string())),
-        );
+        // 工作量指标用**属性**（描述这个 span 干了多少活），不用事件
+        // （事件表示「期间发生了某件事」，见 AGENTS.md 的埋点约定）
+        LocalSpan::add_property(|| ("samples", samples.len().to_string()));
 
         let (feats, frames, dim) = self.features(samples);
         if frames == 0 {
             return Ok(Transcript::default());
         }
-        LocalSpan::add_event(Event::new("features").with_property(|| ("frames", frames.to_string())));
+        LocalSpan::add_property(|| ("frames", frames.to_string()));
 
         let shape = vec![
             1_i64,
@@ -327,7 +326,7 @@ impl Recognizer for SenseVoice {
         }
 
         let (hyps, vocab) = {
-            let _span = Span::enter_with_local_parent("asr_infer");
+            let _span = LocalSpan::enter_with_local_parent("asr_infer");
             // outputs 借用 session，锁必须活到取完 logits 为止 —— 这正是
             // 「一次推理串行化」的设计意图，不是可以收紧的临时借用。
             let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
@@ -371,12 +370,13 @@ impl Recognizer for SenseVoice {
             });
         }
         let ids: &[usize] = hyps.first().map_or(&[], |h| h.ids.as_slice());
-        LocalSpan::add_event(
-            Event::new("decoded")
-                .with_property(|| ("tokens", ids.len().to_string()))
-                .with_property(|| ("nbest", alternatives.len().to_string()))
-                .with_property(|| ("vocab", vocab.to_string())),
-        );
+        LocalSpan::add_properties(|| {
+            [
+                ("tokens", ids.len().to_string()),
+                ("nbest", alternatives.len().to_string()),
+                ("vocab", vocab.to_string()),
+            ]
+        });
         // tokens 保留可读形式，供诊断（乱码时一眼看出是拼装还是识别问题）
         let tokens = ids
             .iter()

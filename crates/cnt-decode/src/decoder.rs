@@ -18,7 +18,6 @@ use cnt_lm::CntLm;
 use cnt_input::{Candidate, CandidateSource, LearnedWord};
 use cnt_score::{NgramLm, RescorePolicy, Rescorer};
 use fastrace::local::LocalSpan;
-use fastrace::{Event, Span};
 
 use crate::syllable::{SyllableEdge, SyllableTable, MAX_FUZZY_COST};
 
@@ -398,7 +397,7 @@ impl<L: NgramLm> Decoder<L> {
     /// 与用户实际看到的候选完全一致（同一 `CandidateSource` 路径）。
     #[must_use]
     pub fn candidates_scored(&self, pinyin: &str) -> Vec<(Candidate, f32)> {
-        let _span = Span::enter_with_local_parent("candidates");
+        let _span = LocalSpan::enter_with_local_parent("candidates");
         let mut scored: Vec<Scored> = self.decode(pinyin);
         // 整个输入作为词键的精确候选（含 LM 未覆盖但词频上万的字：备/碑/辈/悲），
         // 它们与整句候选在同一分数空间里竞争——不再用 -inf 垫底排在补全词后面。
@@ -468,7 +467,7 @@ impl<L: NgramLm> Decoder<L> {
     /// 与整句候选同一空间。曾经这些候选被硬塞 `-inf`「恒排最后」，导致
     /// LM 未覆盖但词频上万的精确字（备/碑）永远排在补全词与模糊音之后。
     fn whole_key_words(&self, pinyin: &str) -> Vec<Scored> {
-        let _span = Span::enter_with_local_parent("whole_key_words");
+        let _span = LocalSpan::enter_with_local_parent("whole_key_words");
         self.model
             .ranked_words(pinyin, WHOLE_KEY_WORDS)
             .into_iter()
@@ -497,7 +496,7 @@ impl<L: NgramLm> Decoder<L> {
     /// 尾音节补全：末音节残缺（`chijiuh` → `h→hua`）或可延长（`chijiuhu` → `hu→hua`）时，
     /// 补出完整词候选（带分数；用户学过的词如 持久化 用 `USER_WORD_BASE` + 调频）。
     fn completions(&self, pinyin: &str, lm: &L) -> Vec<Scored> {
-        let _span = Span::enter_with_local_parent("completions");
+        let _span = LocalSpan::enter_with_local_parent("completions");
         if pinyin.len() < 2 {
             return Vec::new();
         }
@@ -624,7 +623,7 @@ impl<L: NgramLm> Decoder<L> {
         // 前词 → bigram 行的小缓存（每个位置存活假设 ≤ BEAM 条，线性扫描最快）
         let mut rows: Vec<(u32, (u32, u32))> = Vec::with_capacity(BEAM * 2);
 
-        let _beam_span = Span::enter_with_local_parent("beam");
+        let _beam_span = LocalSpan::enter_with_local_parent("beam");
         let mut n_expand = 0usize;
         let mut scratch: Vec<Hyp> = Vec::new();
         for pos in 0..lattice.len() {
@@ -676,8 +675,8 @@ impl<L: NgramLm> Decoder<L> {
                 scratch.clear();
             }
         }
-        // 展开次数作为 beam span 的属性（fastrace 事件，无 context 时 noop）
-        LocalSpan::add_event(Event::new("expand").with_property(|| ("count", n_expand.to_string())));
+        // 展开次数：工作量指标 → **属性**（挂在 beam span 上，聚合表直接可读）
+        LocalSpan::add_property(|| ("expand", n_expand.to_string()));
 
         done.sort_by(|a, b| b.score.total_cmp(&a.score));
         // 去重：同一句文本可能来自「多音节词」和「单字拼合」两条路径，保留最高分
@@ -695,7 +694,7 @@ impl<L: NgramLm> Decoder<L> {
     ///
     /// 与假设无关，因此每个位置只调一次；词库前缀查询用于剪掉不可能成词的链。
     fn keys_at(&self, lattice: &[Vec<SyllableEdge>], pos: usize, limits: Limits) -> Vec<PosKey> {
-        let _span = Span::enter_with_local_parent("keys_at");
+        let _span = LocalSpan::enter_with_local_parent("keys_at");
         let mut out: Vec<PosKey> = Vec::new();
         // 链键拼接的复用缓冲：只有确认成键（前缀命中）时才真的分配 String
         let mut buf = String::new();
@@ -844,7 +843,7 @@ impl<L: NgramLm> Decoder<L> {
         };
         // fastrace：lattice 构建（模糊音节格）
         let lattice = {
-            let _span = Span::enter_with_local_parent("lattice");
+            let _span = LocalSpan::enter_with_local_parent("lattice");
             if self.fuzzy {
                 self.syllables.lattice_fuzzy(pinyin)
             } else {

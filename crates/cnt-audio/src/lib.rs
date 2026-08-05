@@ -384,7 +384,7 @@ impl Pipeline {
     {
         // 采集回调是实时线程：这里只做 downmix + 重采样，没有锁、没有系统调用。
         // fastrace 的 span 在无上层 context 时是零开销的，回调里也能安全埋点。
-        let _span = fastrace::Span::enter_with_local_parent("audio_pipeline");
+        let _span = fastrace::local::LocalSpan::enter_with_local_parent("audio_pipeline");
         self.mono.clear();
         if self.channels == 1 {
             self.mono
