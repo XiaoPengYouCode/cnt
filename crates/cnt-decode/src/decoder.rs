@@ -96,11 +96,19 @@ const OOV_ADJUST_MAX: f32 = 1.0;
 /// -1.5：-0.5 太轻，输入 jian 时 jiang 的高频词（将 -2.82）会压过精确读音的
 /// 见/件/间，单音节候选前排被「猜你还没打完」的词占掉。
 const COMPLETION_PENALTY: f32 = -1.5;
-/// 次读音/极罕见词的基础分（`freq ≤ SECONDARY_FREQ_CAP`）。
+/// 次读音的基础分上限（`freq ≤ SECONDARY_FREQ_CAP` 且**在 LM 词表**）。
+///
+/// 只封顶、不抬升：`min(SECONDARY_BASE, unigram)`。多音字的次读音（的di、和hu）
+/// 在 LM 里查到的是主读音的高概率，直接用会串频，所以封到这一档；而本身就在 LM
+/// 地板的罕见字不该被这一档「抬」上来。
 const SECONDARY_BASE: f32 = -6.0;
 /// 用户词（`freq == 0`，学过的复合词/新词）的基础分。
 const USER_WORD_BASE: f32 = -5.0;
-/// 判定「次读音」的频率上限（词库次读音 freq=1，主读音 ≥1e4）。
+/// 判定「次读音 / 词库长尾」的频率上限（词库次读音 freq=1，主读音 ≥1e4）。
+///
+/// 注意这一档里混着两类词（词库构建把它们都记成 freq=1）：真次读音（的di、和hu，
+/// 在 LM 词表里）与长尾字形（㙢/㝵/㮶 这类 Ext-B 异体字，不在 LM 词表）。
+/// 打分必须区分，见 `reading_base`。
 const SECONDARY_FREQ_CAP: u32 = 100;
 
 /// 一个词键下的候选词。
@@ -908,16 +916,30 @@ impl<L: NgramLm> Decoder<L> {
 
 /// 读音感知的基础分（首词用）：
 /// - 用户词（`freq == 0`）：`USER_WORD_BASE` —— 学过的词应能浮现，不再被 -12 埋没
-/// - 次读音（`freq ≤ SECONDARY_FREQ_CAP`，如 的di、和hu）：`SECONDARY_BASE`
-///   —— 多音字不再串频（否则 fu 会出 和、diyige 会出 的一个）
+/// - 次读音（`freq ≤ SECONDARY_FREQ_CAP` 且在 LM，如 的di、和hu）：封顶到
+///   `SECONDARY_BASE` —— 多音字不再串频（否则 fu 会出 和、diyige 会出 的一个）
+/// - 不在 LM 的词（长尾字形、生僻整词）：`oov_score(freq)`，按词库词频排序
 /// - 主读音：LM unigram（保留细粒度排序：是 > 时 > 事）
+///
+/// 「freq ≤ CAP 一律给 `SECONDARY_BASE`」曾是本文件最贵的一个平带：词库把
+/// 「不在 LM unigram 的读音」全记成 freq=1，于是 㙢/㝵/㮶 这类 Ext-B 字形拿到恒定
+/// -6.000，反而压过走 LM unigram 的 5000 频常用字（扪 -6.115、锝 -6.2…），把
+/// men/de/shuo/fa/zai 的候选 4~10 位整段占掉。判据落在「在不在 LM 词表」上：
+/// 真次读音的字必在 LM（它的主读音是常用词），长尾字形不在。
 fn reading_base<L: NgramLm>(word: &str, freq: u32, lm: &L) -> f32 {
     if freq == 0 {
-        USER_WORD_BASE
-    } else if freq <= SECONDARY_FREQ_CAP {
-        SECONDARY_BASE
+        return USER_WORD_BASE;
+    }
+    lm.unigram(word)
+        .map_or_else(|| oov_score(freq), |(p, _)| secondary_cap(freq, p))
+}
+
+/// 次读音封顶：`freq ≤ SECONDARY_FREQ_CAP` 的词不得继承主读音的 LM 概率。
+const fn secondary_cap(freq: u32, unigram: f32) -> f32 {
+    if freq <= SECONDARY_FREQ_CAP {
+        unigram.min(SECONDARY_BASE)
     } else {
-        lm.unigram(word).map_or_else(|| oov_score(freq), |(p, _)| p)
+        unigram
     }
 }
 
@@ -1033,16 +1055,13 @@ fn expand<L: NgramLm>(
 /// 句首词的读音感知基础分（枚举期算一次，见 `reading_base` 的同款规则）。
 fn first_word_base<L: NgramLm>(freq: u32, lm_id: Option<u32>, lm: &L) -> f32 {
     if freq == 0 {
-        USER_WORD_BASE // 用户词：学过的词应能浮现
-    } else if freq <= SECONDARY_FREQ_CAP {
-        SECONDARY_BASE // 次读音：多音字不串频
-    } else {
-        // 不在 LM 的整词按词频给 OOV 分，而非 UNK（否则必然输给整句拼接）
-        lm_id.map_or_else(
-            || oov_score(freq),
-            |i| lm.unigram_by_id(i).map_or_else(|| oov_score(freq), |(p, _)| p),
-        )
+        return USER_WORD_BASE; // 用户词：学过的词应能浮现
     }
+    // 不在 LM 的词（整词长尾、Ext-B 字形）按词频给 OOV 分，而非 UNK（否则必然
+    // 输给整句拼接），也不给 SECONDARY_BASE 平带（否则压过 LM 里的常用字）。
+    lm_id
+        .and_then(|i| lm.unigram_by_id(i))
+        .map_or_else(|| oov_score(freq), |(p, _)| secondary_cap(freq, p))
 }
 
 /// 从位置 0 的词键里取出「只覆盖输入前一段」的候选。
@@ -1540,6 +1559,44 @@ mod tests {
         assert!(oov_score(u32::MAX) <= OOV_BASE + OOV_ADJUST_MAX);
         assert!(oov_score(0) >= OOV_BASE + OOV_ADJUST_MIN);
         assert!(oov_score(0) > UNK_LOGPROB);
+    }
+
+    /// 回归：`freq ≤ SECONDARY_FREQ_CAP` 的长尾字形不得压过 LM 里的常用字。
+    ///
+    /// 曾经的 bug：freq ≤ CAP 一律给 `SECONDARY_BASE`(-6.0)，而词库把「不在 LM
+    /// unigram 的读音」全记成 freq=1，于是 Ext-B 字形（㙢/㡈）拿恒定 -6.000，
+    /// 反而排在走 LM unigram 的 5000 频常用字（扪 -6.115）前面，把 men/de/shuo
+    /// 的候选 4~10 位整段占掉。
+    #[test]
+    fn rare_glyphs_rank_below_lm_covered_chars() {
+        let d = decoder_with(
+            "rare-glyph",
+            // 常用字在 LM（词库频 5000）；长尾字形不在 LM（词库频 1）
+            &[("men", "扪", 5_000), ("men", "㙢", 1), ("men", "㡈", 1)],
+            &[("扪", -6.115, 0.0)],
+            &[],
+            false,
+        );
+        let cands: Vec<String> =
+            d.candidates("men").into_iter().map(|c| c.text).collect();
+        let pos = |w: &str| cands.iter().position(|c| c == w);
+        assert!(
+            pos("扪") < pos("㙢") && pos("扪") < pos("㡈"),
+            "LM 覆盖的常用字必须排在 freq=1 长尾字形之前: {cands:?}"
+        );
+    }
+
+    /// 回归：真次读音（在 LM 词表里）仍被封顶，不继承主读音的高概率。
+    ///
+    /// 的(di)/和(hu) 的 LM unigram 是主读音的频率（的de ≈ -1.35），直接用会串频。
+    #[test]
+    fn secondary_reading_is_capped_not_boosted() {
+        // 在 LM 且概率很高的次读音：封顶到 SECONDARY_BASE
+        assert!((secondary_cap(1, -1.35) - SECONDARY_BASE).abs() < f32::EPSILON);
+        // 本身就在 LM 地板的罕见字：不因为封顶反被抬升
+        assert!((secondary_cap(1, -7.4) - (-7.4)).abs() < f32::EPSILON);
+        // 主读音（freq > CAP）不受影响
+        assert!((secondary_cap(20_000, -1.35) - (-1.35)).abs() < f32::EPSILON);
     }
 
     #[test]
