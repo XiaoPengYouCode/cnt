@@ -503,9 +503,13 @@ impl<L: NgramLm> Decoder<L> {
 
     /// 尾音节补全：末音节残缺（`chijiuh` → `h→hua`）或可延长（`chijiuhu` → `hu→hua`）时，
     /// 补出完整词候选（带分数；用户学过的词如 持久化 用 `USER_WORD_BASE` + 调频）。
+    ///
+    /// 也覆盖「整串都还不是音节」的开局（`l`/`zh`）：那时残缺尾部就是整个输入，
+    /// base 为空。曾经这里有 `len < 2` 与 `max_pos == 0` 两道早退，纯声母（l/z/w/zh）
+    /// 因此一个候选都不出——它是每个词的第一键，不能空窗。
     fn completions(&self, pinyin: &str, lm: &L) -> Vec<Scored> {
         let _span = LocalSpan::enter_with_local_parent("completions");
-        if pinyin.len() < 2 {
+        if pinyin.is_empty() {
             return Vec::new();
         }
         let lattice = if self.fuzzy {
@@ -526,9 +530,7 @@ impl<L: NgramLm> Decoder<L> {
                 }
             }
         }
-        if max_pos == 0 {
-            return Vec::new(); // 一个音节都切不出来
-        }
+        // max_pos == 0（一个音节都切不出来）不早退：整串当残缺尾部走下面的分支。
 
         // (完整 key 的前缀, 要补全成的更长沙节)
         let mut completions: Vec<(String, String)> = Vec::new();
@@ -1359,6 +1361,30 @@ mod tests {
         let cands = d.candidates("xiangchen");
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts.first(), Some(&"相称"), "精确读音应 #1: {texts:?}");
+    }
+
+    #[test]
+    fn bare_initial_yields_completion_candidates() {
+        // 纯声母（l/z/w/zh）一个音节都切不出来，但它是每个词的第一键：
+        // 必须按补全给出候选，不能空窗（曾被 `len < 2` 与 `max_pos == 0` 两道早退挡住）。
+        let d = decoder_with(
+            "bare_initial",
+            &[("le", "了", 90_000), ("lai", "来", 80_000), ("zhe", "这", 90_000)],
+            &[("了", -2.0, 0.0), ("来", -2.8, 0.0), ("这", -2.1, 0.0)],
+            &[],
+            false,
+        );
+        for (input, want) in [("l", "了"), ("zh", "这")] {
+            let texts: Vec<String> =
+                d.candidates(input).into_iter().map(|c| c.text).collect();
+            assert_eq!(
+                texts.first().map(String::as_str),
+                Some(want),
+                "输入 {input} 应给出补全候选: {texts:?}"
+            );
+        }
+        // 空输入仍然没有候选（别把空窗变成全词库）
+        assert!(d.candidates("").is_empty());
     }
 
     #[test]

@@ -769,11 +769,12 @@ fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) 
         fastrace::collector::Config::default(),
     );
 
-    // 常见输入样例（覆盖单音节/多音节/补全/模糊音路径）
+    // 常见输入样例（覆盖单音节/多音节/补全/模糊音路径；`l`/`zh` = 纯声母，
+    // 每个词的第一键，走「整串都还不是音节」的最宽补全展开）
     let samples = [
         "ni", "nihao", "womenzaigongzuo", "xianzai", "diyige", "sihou", "chijiuhu",
         "zhongguoren", "momingqimiao", "shijie", "womendoushizhongguoren", "xiexieni",
-        "jintian", "diannao", "shurufa", "nuli", "leng", "le",
+        "jintian", "diannao", "shurufa", "nuli", "leng", "le", "l", "zh",
     ];
 
     // 预热（加载页缓存等）
