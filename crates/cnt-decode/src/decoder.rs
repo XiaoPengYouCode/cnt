@@ -124,6 +124,8 @@ struct WordCand {
     /// 用户调频加成：每个 (词键, 词) 只查一次用户库
     /// （此前每次展开都要抢一次用户库的锁 + 两次哈希查找）
     boost: f32,
+    /// 是否为词库长尾字形（见 [`is_dict_tail`]）：参与候选分组硬约束。
+    dict_tail: bool,
 }
 
 /// 某个位置上可展开的一个词键（单音节或多音节整词）及其候选词。
@@ -253,8 +255,9 @@ impl Limits {
 
 /// 一个带分与来源信息的候选（排序阶段的内部表示）。
 ///
-/// `fuzzy_edges` / `completion` 不只是元数据：它们参与**硬约束**（模糊叠加不得 #1、
-/// 补全词不得插到精确候选之前）——这些是分数调参担保不了的，必须结构上保证。
+/// `fuzzy_edges` / `completion` / `dict_tail` 不只是元数据：它们参与**硬约束**
+/// （模糊叠加不得 #1、补全词不得插到精确候选之前、词库长尾不得凭「精确」
+/// 占住前排）——这些是分数调参担保不了的，必须结构上保证。
 struct Scored {
     cand: Candidate,
     score: f32,
@@ -262,6 +265,8 @@ struct Scored {
     fuzzy_edges: u8,
     /// 是否为尾音节补全候选（「猜你还没打完」）
     completion: bool,
+    /// 是否为词库长尾字形的单词候选（见 [`is_dict_tail`]）。
+    dict_tail: bool,
 }
 
 /// beam search 中的一条部分假设（`Copy`，克隆零成本、零分配）。
@@ -275,6 +280,8 @@ struct Hyp {
     score: f32,
     /// 已走过的模糊边数（用于超线性叠加惩罚与「不得占 #1」约束）
     fuzzy_edges: u8,
+    /// 句首词是否为词库长尾字形（单词句子才用得上，见 `Scored::dict_tail`）
+    first_tail: bool,
     /// arena 中的路径节点下标（`NO_NODE` = 空路径）
     node: u32,
 }
@@ -416,12 +423,18 @@ impl<L: NgramLm> Decoder<L> {
         // 排序分三组（组间是硬顺序，组内按分数）：
         // 0 完全覆盖输入的候选（整句/整键词）——你已经打完的读音优先；
         // 1 补全候选（「猜你还没打完」）——不该插到已打完的读音前面
-        //   （输入 jian 时前排不能被 jiang 的词占掉）；
+        //   （输入 jian 时前排不能被 jiang 的词占掉），以及词库长尾字形；
         // 2 部分候选（只覆盖前一段）——修复入口，放在最后，不干扰正常整句选词。
+        //
+        // 长尾字形（LM 不认识 + 词频 ≤ 100，见 `is_dict_tail`）虽然确实覆盖了全部
+        // 输入，但不享受「已打完的读音优先」：否则输入 n 时 ㅕ午/咹（OOV 地板 -9.0）
+        // 会把 你/能/年挤到 6 位后，输入 de 时 彳/得德? 一类异体字占住 4~10 位。
+        // 它们降到补全组，和 你/能 按分数硬碰一次（且不带 COMPLETION_PENALTY，
+        // 真正常用的字仍能赢）。判据与上游打分一致：落在「在不在 LM 词表」上。
         let input_len = pinyin.len();
         let group = |s: &Scored| -> u8 {
             if s.cand.covers_all(input_len) {
-                u8::from(s.completion)
+                u8::from(s.completion || s.dict_tail)
             } else {
                 GROUP_PARTIAL
             }
@@ -452,6 +465,7 @@ impl<L: NgramLm> Decoder<L> {
                     score: s.score,
                     fuzzy_edges: s.fuzzy_edges,
                     completion: s.completion,
+                    dict_tail: s.dict_tail,
                 });
             }
         }
@@ -483,9 +497,12 @@ impl<L: NgramLm> Decoder<L> {
             .map(|(rank, (word, freq))| {
                 // 无 LM 时退化为按词库排名给分（保持词频顺序，仍是有限值可参与排序）
                 #[allow(clippy::cast_precision_loss)] // rank < WHOLE_KEY_WORDS
-                let score = self.lm.as_ref().map_or_else(
-                    || -(rank as f32),
-                    |lm| reading_base(&word, freq, lm.as_ref()) + self.boost(pinyin, &word),
+                let (score, dict_tail) = self.lm.as_ref().map_or_else(
+                    || (-(rank as f32), false),
+                    |lm| {
+                        let (base, tail) = reading_base(&word, freq, lm.as_ref());
+                        (base + self.boost(pinyin, &word), tail)
+                    },
                 );
                 Scored {
                     cand: Candidate::whole(
@@ -496,6 +513,7 @@ impl<L: NgramLm> Decoder<L> {
                     score,
                     fuzzy_edges: 0, // 整键精确匹配
                     completion: false,
+                    dict_tail,
                 }
             })
             .collect()
@@ -555,7 +573,7 @@ impl<L: NgramLm> Decoder<L> {
         for (base, ext) in completions {
             let key = format!("{base}{ext}");
             for (word, freq) in self.model.ranked_words(&key, 4) {
-                let mut score = reading_base(&word, freq, lm) + self.boost(&key, &word);
+                let mut score = reading_base(&word, freq, lm).0 + self.boost(&key, &word);
                 // 补全词（延长音节）减惩罚：精确读音候选优先于补全候选；
                 // 用户词（freq == 0）不动，保证 持久化 这类仍能压过拼接。
                 if freq != 0 {
@@ -573,6 +591,8 @@ impl<L: NgramLm> Decoder<L> {
                     // 用户学过的补全词（持久化）仍按补全处理：它排在精确候选之后，
                     // 但精确候选里没有它的竞争者时依旧是第一梯队。
                     completion: true,
+                    // 补全候选本就在第 1 组，长尾与否不再影响分组
+                    dict_tail: false,
                 });
             }
         }
@@ -625,6 +645,7 @@ impl<L: NgramLm> Decoder<L> {
             prev: Prev::Start,
             score: 0.0,
             fuzzy_edges: 0,
+            first_tail: false,
             node: NO_NODE,
         });
         // 完整句子：消费完全部输入的假设（末位置那个桶），不参与中途剪枝
@@ -785,11 +806,13 @@ impl<L: NgramLm> Decoder<L> {
             .into_iter()
             .map(|(word, freq)| {
                 let lm_id = self.lm.as_ref().and_then(|lm| lm.word_index(&word));
+                let (first_base, dict_tail) = self.lm.as_ref().map_or(
+                    (OOV_BASE, false),
+                    |lm| first_word_base(freq, lm_id, lm.as_ref()),
+                );
                 WordCand {
-                    first_base: self
-                        .lm
-                        .as_ref()
-                        .map_or(OOV_BASE, |lm| first_word_base(freq, lm_id, lm.as_ref())),
+                    first_base,
+                    dict_tail,
                     boost: self.boost(key, &word),
                     word: Arc::from(word),
                     lm_id,
@@ -887,6 +910,9 @@ impl<L: NgramLm> Decoder<L> {
             .map(|h| {
                 // 路径只在这里（top-K 条）复原：热路径不碰字符串
                 let segments = segments_of(&arena, h.node);
+                // 长尾标记只对单词句子有意义：多词拼接是另一回事，不能因为
+                // 句首是个异体字就把整句降组
+                let dict_tail = h.first_tail && segments.len() == 1;
                 Scored {
                     cand: Candidate::whole(
                         segments.iter().map(|(_, w)| &***w).collect::<String>(),
@@ -899,6 +925,7 @@ impl<L: NgramLm> Decoder<L> {
                     score: h.score,
                     fuzzy_edges: h.fuzzy_edges,
                     completion: false,
+                    dict_tail,
                 }
             })
             .collect();
@@ -916,7 +943,7 @@ impl<L: NgramLm> Decoder<L> {
 
 }
 
-/// 读音感知的基础分（首词用）：
+/// 读音感知的基础分（首词用），返回 `(基础分, 是否词库长尾)`：
 /// - 用户词（`freq == 0`）：`USER_WORD_BASE` —— 学过的词应能浮现，不再被 -12 埋没
 /// - 次读音（`freq ≤ SECONDARY_FREQ_CAP` 且在 LM，如 的di、和hu）：封顶到
 ///   `SECONDARY_BASE` —— 多音字不再串频（否则 fu 会出 和、diyige 会出 的一个）
@@ -928,12 +955,24 @@ impl<L: NgramLm> Decoder<L> {
 /// -6.000，反而压过走 LM unigram 的 5000 频常用字（扪 -6.115、锝 -6.2…），把
 /// men/de/shuo/fa/zai 的候选 4~10 位整段占掉。判据落在「在不在 LM 词表」上：
 /// 真次读音的字必在 LM（它的主读音是常用词），长尾字形不在。
-fn reading_base<L: NgramLm>(word: &str, freq: u32, lm: &L) -> f32 {
+fn reading_base<L: NgramLm>(word: &str, freq: u32, lm: &L) -> (f32, bool) {
     if freq == 0 {
-        return USER_WORD_BASE;
+        return (USER_WORD_BASE, false);
     }
-    lm.unigram(word)
-        .map_or_else(|| oov_score(freq), |(p, _)| secondary_cap(freq, p))
+    lm.unigram(word).map_or_else(
+        || (oov_score(freq), is_dict_tail(freq)),
+        |(p, _)| (secondary_cap(freq, p), false),
+    )
+}
+
+/// 词库长尾：**不在 LM 词表**（调用方已确认）且 `freq ≤ SECONDARY_FREQ_CAP`。
+///
+/// 就是 ㅕ午/咹/嘶/筽/兒（繁体）这批：词库里只有一个占位词频（构建时不在
+/// LM unigram 的读音一律记 freq=1）、LM 也不认识。它们仍然是「精确读音」，
+/// 但不该凭「覆盖了全部输入」这条硬约束压在常用补全词（你/能/年）前面
+/// —— 见 `candidates_scored` 的分组注释。
+const fn is_dict_tail(freq: u32) -> bool {
+    freq <= SECONDARY_FREQ_CAP
 }
 
 /// 次读音封顶：`freq ≤ SECONDARY_FREQ_CAP` 的词不得继承主读音的 LM 概率。
@@ -1049,21 +1088,27 @@ fn expand<L: NgramLm>(
             prev: Prev::Word(w.lm_id),
             score: h.score + step,
             fuzzy_edges,
+            // 句首词才定调：后续词的长尾与否不影响分组（只有单词句子用得上这个标记）
+            first_tail: match h.prev {
+                Prev::Start => w.dict_tail,
+                Prev::Word(_) => h.first_tail,
+            },
             node: u32::try_from(arena.len() - 1).unwrap_or(NO_NODE),
         });
     }
 }
 
-/// 句首词的读音感知基础分（枚举期算一次，见 `reading_base` 的同款规则）。
-fn first_word_base<L: NgramLm>(freq: u32, lm_id: Option<u32>, lm: &L) -> f32 {
+/// 句首词的读音感知基础分 + 长尾标记（枚举期算一次，见 `reading_base` 的同款规则）。
+fn first_word_base<L: NgramLm>(freq: u32, lm_id: Option<u32>, lm: &L) -> (f32, bool) {
     if freq == 0 {
-        return USER_WORD_BASE; // 用户词：学过的词应能浮现
+        return (USER_WORD_BASE, false); // 用户词：学过的词应能浮现
     }
     // 不在 LM 的词（整词长尾、Ext-B 字形）按词频给 OOV 分，而非 UNK（否则必然
     // 输给整句拼接），也不给 SECONDARY_BASE 平带（否则压过 LM 里的常用字）。
-    lm_id
-        .and_then(|i| lm.unigram_by_id(i))
-        .map_or_else(|| oov_score(freq), |(p, _)| secondary_cap(freq, p))
+    lm_id.and_then(|i| lm.unigram_by_id(i)).map_or_else(
+        || (oov_score(freq), is_dict_tail(freq)),
+        |(p, _)| (secondary_cap(freq, p), false),
+    )
 }
 
 /// 从位置 0 的词键里取出「只覆盖输入前一段」的候选。
@@ -1088,6 +1133,8 @@ fn partial_candidates(keys: &[PosKey], input_len: usize) -> Vec<Scored> {
                 score: w.first_base + w.boost,
                 fuzzy_edges: 0,
                 completion: false,
+                // 部分候选自成一组（GROUP_PARTIAL），长尾与否不影响分组
+                dict_tail: false,
             });
         }
     }
@@ -1185,8 +1232,8 @@ mod tests {
         // 这里用纯逻辑断言表达该性质（真实词库的端到端验证在 tests/e2e.rs 与
         // cnt-dict-tools decode 里做，单测不依赖 30 万词的词库）。
         let mut bucket = [
-            Hyp { pos: 3, prev: Prev::Start, score: -5.2, fuzzy_edges: 0, node: NO_NODE },
-            Hyp { pos: 1, prev: Prev::Start, score: -3.4, fuzzy_edges: 0, node: NO_NODE },
+            Hyp { pos: 3, prev: Prev::Start, score: -5.2, fuzzy_edges: 0, first_tail: false, node: NO_NODE },
+            Hyp { pos: 1, prev: Prev::Start, score: -3.4, fuzzy_edges: 0, first_tail: false, node: NO_NODE },
         ];
         // 全局排序会把覆盖 1 个音节的假设排在前面（这正是偏置的来源）
         bucket.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -1385,6 +1432,39 @@ mod tests {
         }
         // 空输入仍然没有候选（别把空窗变成全词库）
         assert!(d.candidates("").is_empty());
+    }
+
+    /// 回归：词库长尾字形（LM 不认识、词频 ≤ CAP）不得凭「精确覆盖全输入」
+    /// 的硬分组压在常用补全词前面。
+    ///
+    /// 真实现场：输入 `n` 时 ㅕ午/咹（OOV 地板 -9.0）占掉第 4~5 位，把 你/能/年
+    /// 挤到 6 位后；`m`（嘶）、`o`（噦/筽）、`r`（兒繁体）同病。
+    #[test]
+    fn dict_tail_does_not_outrank_common_completion() {
+        let d = decoder_with(
+            "dict_tail",
+            &[
+                // 精确读音：常用叹词（在 LM）+ 两个长尾字形（不在 LM、词频 1）
+                ("n", "嗯", 50_000),
+                ("n", "ㅕ", 1),
+                ("n", "咹", 1),
+                // 补全候选：常用字
+                ("ni", "你", 90_000),
+                ("neng", "能", 80_000),
+            ],
+            &[("嗯", -4.9, 0.0), ("你", -2.5, 0.0), ("能", -2.7, 0.0)],
+            &[],
+            false,
+        );
+        let texts: Vec<String> = d.candidates("n").into_iter().map(|c| c.text).collect();
+        let pos = |t: &str| texts.iter().position(|x| x == t);
+        assert_eq!(pos("嗯"), Some(0), "LM 认识的精确读音仍然 #1: {texts:?}");
+        for tail in ["ㅕ", "咹"] {
+            assert!(
+                pos("你") < pos(tail) && pos("能") < pos(tail),
+                "常用补全词应排在长尾字形 {tail} 之前: {texts:?}"
+            );
+        }
     }
 
     #[test]

@@ -91,6 +91,10 @@ python3 $S sample --user ~/.local/share/cnt/user.dict   # 复现真实用户场�
 ## 注意事项
 
 - 严重度排序：**读音误配 > 常用词排名靠后 > 低频词未出现**
+- `sample`/`mono` 覆盖不到两类前排问题，改这类东西要手动看 `words <单键>`：
+  纯声母（`l`/`z`/`w`/`zh`，每个词的第一键）与单键前排被地板分字形占位
+  （输入 `n` 时 ㅕ午/咹 压住 你/能）。两者都有 cnt-decode 的单元测试兜着
+  （`bare_initial_yields_completion_candidates`、`dict_tail_does_not_outrank_common_completion`）。
 - 用户库隔离是默认行为，测真实用户场景才传 `--user`
 - 需要 fastrace 阶段数据（定位慢样例）时：
   `cargo build --release --features "fastrace/enable" -p cnt-dict-tools`
