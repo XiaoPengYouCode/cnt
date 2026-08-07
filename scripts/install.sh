@@ -174,8 +174,8 @@ if [ ! -f "${CONFIG_FILE}" ]; then
     cat > "${CONFIG_FILE}" <<EOF
 # cnt 输入法配置
 
-# 每页候选词数（5~16）
-page_size = 10
+# 每页候选词数（5~10；上限 10 = 数字选择键 1-9 加 0）
+page_size = 8
 
 [voice]
 # 语音输入总开关

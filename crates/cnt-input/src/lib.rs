@@ -8,8 +8,14 @@ pub mod hotkey;
 
 pub use hotkey::Hotkey;
 
-/// 默认每页候选数（可用配置覆盖）
-pub const PAGE_SIZE: usize = 10;
+/// 默认每页候选数（可用配置覆盖；与 `cnt_config::DEFAULT_PAGE_SIZE` 一致）
+pub const PAGE_SIZE: usize = 8;
+
+/// 数字选择键最多覆盖的候选数：`1`-`9` 再加 `0`（= 页内第 10 个）。
+///
+/// 超过这个数的候选只能靠方向键走过去 —— 所以配置侧把 `page_size` 的上限
+/// 压在这里，不让候选窗里出现「看得见按不到」的序号。
+pub const MAX_SELECT_KEYS: usize = 10;
 
 /// 一个学习片段：拼音 + 对应的词（单字/词 = 1 段，整句 = 多段）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,11 +201,21 @@ pub mod keysym {
     pub const PAGE_DOWN: u32 = 0xff56;
     pub const A: u32 = 0x61;
     pub const Z: u32 = 0x7a;
+    pub const DIGIT0: u32 = 0x30;
     pub const DIGIT1: u32 = 0x31;
     pub const DIGIT9: u32 = 0x39;
     /// 翻页键（Rime 行为）：- 上一页，= 下一页
     pub const MINUS: u32 = 0x002d;
     pub const EQUAL: u32 = 0x003d;
+}
+
+/// 数字选择键 → 页内序号：`1`-`9` → 0..=8，`0` → 9（候选窗里的第 10 个）。
+const fn select_offset(keyval: u32) -> Option<usize> {
+    match keyval {
+        keysym::DIGIT0 => Some(MAX_SELECT_KEYS - 1),
+        keysym::DIGIT1..=keysym::DIGIT9 => Some((keyval - keysym::DIGIT1) as usize),
+        _ => None,
+    }
 }
 
 /// 输入组合状态（聚合根）：字段私有，行为通过方法暴露。
@@ -472,6 +488,21 @@ impl EngineState {
             return Action::Forward;
         }
 
+        // 数字键选候选：`1`-`9` 选页内第 1-9 个，`0` 选第 10 个（与候选窗标号一致）。
+        // 序号落在本页之外（如 page_size=8 时按 `9`/`0`）就吞掉：既不能跳去选下一页
+        // 的候选（用户按的是「本页第 9 个」），也不能漏成数字插进正在组合的文本里。
+        if let Some(offset) = select_offset(keyval) {
+            if offset >= self.page_size {
+                return Action::Handled;
+            }
+            let idx = self.page * self.page_size + offset;
+            return self
+                .candidates
+                .get(idx)
+                .cloned()
+                .map_or(Action::Handled, |cand| self.take_candidate(cand, source));
+        }
+
         match keyval {
             // 空格：提交光标处候选；回车：把拼音原文当英文直接提交（不上屏候选、
             // 不产生学习数据）。两者都会清空组合。
@@ -530,15 +561,6 @@ impl EngineState {
             keysym::PAGE_DOWN => {
                 self.page_down();
                 Action::Handled
-            }
-
-            // 1-9：选择候选
-            keysym::DIGIT1..=keysym::DIGIT9 => {
-                let idx = self.page * self.page_size + (keyval - keysym::DIGIT1) as usize;
-                self.candidates
-                    .get(idx)
-                    .cloned()
-                    .map_or(Action::Handled, |cand| self.take_candidate(cand, source))
             }
 
             _ => Action::Forward,
@@ -655,6 +677,15 @@ mod tests {
         }
     }
 
+    /// 页内序号 → 选择键（0..=8 → `1`-`9`，9 → `0`）。
+    fn select_key(offset: usize) -> u32 {
+        if offset == 9 {
+            keysym::DIGIT0
+        } else {
+            keysym::DIGIT1 + u32::try_from(offset).expect("页内序号 < 10")
+        }
+    }
+
     fn source() -> TestSource {
         TestSource {
             map: std::collections::HashMap::from([
@@ -753,6 +784,92 @@ mod tests {
             }
             other => panic!("expected commit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn digits_one_to_ten_select_their_candidate() {
+        // page_size=10 时，页内 10 个候选必须个个能用数字键选到：
+        // `1`-`9` 对应 #1-#9，`0` 对应 #10（候选窗里的标号就是 0）。
+        let words = vec![
+            "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一",
+        ];
+        let d = TestSource {
+            map: std::collections::HashMap::from([("shi", words.clone())]),
+        };
+        for (i, want) in words.iter().take(10).enumerate() {
+            let mut st = EngineState::with_page_size(10);
+            for k in "shi".bytes() {
+                st.handle_key(u32::from(k), &d, false);
+            }
+            let key = select_key(i);
+            match st.handle_key(key, &d, false) {
+                Action::Commit { text, learned } => {
+                    assert_eq!(&text, want, "第 {} 个候选选错了", i + 1);
+                    assert_eq!(
+                        learned,
+                        vec![LearnedWord::new("shi".to_string(), (*want).to_string())]
+                    );
+                }
+                other => panic!("第 {} 个候选：expected commit, got {other:?}", i + 1),
+            }
+        }
+    }
+
+    #[test]
+    fn digits_select_within_current_page() {
+        // 第 2 页（page_size=10）：`1` 选 #11、`0` 选 #20 —— 序号是页内的，不是全局的
+        let words: Vec<&'static str> = vec![
+            "a01", "a02", "a03", "a04", "a05", "a06", "a07", "a08", "a09", "a10", "a11", "a12",
+            "a13", "a14", "a15", "a16", "a17", "a18", "a19", "a20",
+        ];
+        let d = TestSource {
+            map: std::collections::HashMap::from([("shi", words)]),
+        };
+        for (offset, want) in [(0usize, "a11"), (9, "a20")] {
+            let mut st = EngineState::with_page_size(10);
+            for k in "shi".bytes() {
+                st.handle_key(u32::from(k), &d, false);
+            }
+            st.handle_key(keysym::PAGE_DOWN, &d, false);
+            assert_eq!(st.page(), 1);
+            match st.handle_key(select_key(offset), &d, false) {
+                Action::Commit { text, .. } => assert_eq!(text, want),
+                other => panic!("expected commit, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn digits_beyond_page_size_are_swallowed() {
+        // page_size=8：`9`/`0` 落在本页之外 —— 既不得跳去选下一页的候选，
+        // 也不得转发成数字插进正在组合的文本里
+        let words = vec![
+            "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+        ];
+        let d = TestSource {
+            map: std::collections::HashMap::from([("shi", words)]),
+        };
+        let mut st = EngineState::with_page_size(8);
+        for k in "shi".bytes() {
+            st.handle_key(u32::from(k), &d, false);
+        }
+        assert_eq!(st.handle_key(keysym::DIGIT9, &d, false), Action::Handled);
+        assert_eq!(st.handle_key(keysym::DIGIT0, &d, false), Action::Handled);
+        assert!(st.is_composing(), "超出本页的序号不得上屏");
+        // 页内最后一个（`8`）仍然能选
+        match st.handle_key(keysym::DIGIT1 + 7, &d, false) {
+            Action::Commit { text, .. } => assert_eq!(text, "八"),
+            other => panic!("expected commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn digit_without_composition_is_forwarded() {
+        // 未组合时数字键还是数字（包括 `0`）
+        let mut st = EngineState::new();
+        let d = source();
+        assert_eq!(st.handle_key(keysym::DIGIT0, &d, false), Action::Forward);
+        assert_eq!(st.handle_key(keysym::DIGIT1, &d, false), Action::Forward);
     }
 
     #[test]

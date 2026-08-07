@@ -3,8 +3,8 @@
 //! 配置文件：`$XDG_CONFIG_HOME/cnt/config.toml`（默认 `~/.config/cnt/config.toml`）：
 //!
 //! ```toml
-//! # 每页候选词数
-//! page_size = 10
+//! # 每页候选词数（5-10；数字键 1-9 加 0 刚好盖到 10 个）
+//! page_size = 8
 //!
 //! # 语音输入（默认关闭：模型不随程序分发）
 //! [voice]
@@ -30,9 +30,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// 默认每页候选数。
-pub const DEFAULT_PAGE_SIZE: usize = 10;
-/// 候选词数允许范围（上限 16：`ibus_lookup_table_new` 断言 `page_size <= 16`）。
-const PAGE_SIZE_RANGE: std::ops::RangeInclusive<usize> = 5..=16;
+pub const DEFAULT_PAGE_SIZE: usize = 8;
+/// 候选词数允许范围。
+///
+/// 上限 10 不是面板限制（`ibus_lookup_table_new` 断言 `page_size <= 16`），而是
+/// 选择键限制：数字键只有 `1`-`9` 加 `0`（= 第 10 个）共 10 个，再大就会出现
+/// 「候选窗里看得见、数字键按不到」的候选（对应 `cnt_input::MAX_SELECT_KEYS`）。
+const PAGE_SIZE_RANGE: std::ops::RangeInclusive<usize> = 5..=10;
 
 /// 应用配置。
 #[derive(Debug, Clone, PartialEq)]
@@ -229,7 +233,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 fn clamp_page_size(n: i64) -> usize {
     let n = n.clamp(
         i64::from(u32::try_from(*PAGE_SIZE_RANGE.start()).unwrap_or(5)),
-        i64::from(u32::try_from(*PAGE_SIZE_RANGE.end()).unwrap_or(30)),
+        i64::from(u32::try_from(*PAGE_SIZE_RANGE.end()).unwrap_or(10)),
     );
     usize::try_from(n).unwrap_or(DEFAULT_PAGE_SIZE)
 }
@@ -259,8 +263,10 @@ mod tests {
     #[test]
     fn clamps_out_of_range() {
         assert_eq!(Config::with_page_size(3).page_size, 5);
-        assert_eq!(Config::with_page_size(999).page_size, 16);
+        assert_eq!(Config::with_page_size(999).page_size, 10);
         assert_eq!(Config::with_page_size(0).page_size, 5);
+        // 默认值必须在允许范围内（否则配置项跟默认行为对不上）
+        assert!(PAGE_SIZE_RANGE.contains(&DEFAULT_PAGE_SIZE));
     }
 
     #[test]
