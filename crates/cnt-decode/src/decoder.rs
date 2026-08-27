@@ -2,9 +2,11 @@
 //!
 //! 打分模型：
 //! ```text
-//! logP(句子) ≈ Σ unigram(wᵢ) + Σ bigram(wᵢ₋₁, wᵢ) + 用户调频加成
+//! logP(句子) ≈ Σ unigram(wᵢ) + Σ bigram(wᵢ₋₁, wᵢ)
+//!              每步再与用户证据做 log-linear 混合（policy::user::mixture）
 //! ```
 //! bigram 缺失时用 Katz backoff：`logP(wᵢ) + backoff(wᵢ₋₁)`。
+//! 用户混合是 libime 口径：用户分概率尺度、逐步 lift 有界，拼接路径的量级由 LM 决定。
 //!
 //! **搜索与打分解耦**：搜索（词图 + beam）在本文件，打分能力来自
 //! `cnt-score` 端口——
@@ -67,8 +69,17 @@ const TOP_SENTENCES_SHORT: usize = 10;
 const WHOLE_KEY_WORDS: usize = 20;
 /// 对外返回的候选总数上限。
 const CANDIDATE_LIMIT: usize = 30;
-/// 候选分组：2 = 部分候选（只覆盖输入前一段）。
-const GROUP_PARTIAL: u8 = 2;
+/// 候选分组：
+/// 0 = 整词覆盖输入（整键词 / beam 单段）——你已经打完的读音优先；
+/// 1 = 拼接路径（仅在「整词覆盖存在」时出现）：多段 beam 句子降级到这组，
+///   不和整词在 group 0 里按分数裸拼（对齐 librime `has_exact_match_phrase` 门控，
+///   但保留可见性：整词全错时用户还能翻到拼接）；
+/// 2 = 补全候选 + 词库长尾字形；
+/// 3 = 部分候选（只覆盖输入前一段）。
+const GROUP_WORD: u8 = 0;
+const GROUP_SENTENCE: u8 = 1;
+const GROUP_COMPLETION: u8 = 2;
+const GROUP_PARTIAL: u8 = 3;
 /// 部分候选（只覆盖输入前一段的词）最多给几个。
 ///
 /// Rime 式增量确认的修复入口：整句错了不必删光重打，选中前一段即可确认，
@@ -121,9 +132,9 @@ struct WordCand {
     lm_id: Option<u32>,
     /// 作为句首词的基础分（用户词/次读音/OOV/LM unigram）
     first_base: f32,
-    /// 用户调频加成：每个 (词键, 词) 只查一次用户库
-    /// （此前每次展开都要抢一次用户库的锁 + 两次哈希查找）
-    boost: f32,
+    /// 有效用户计数（未转正新词计 0）：逐步打分时与 LM 分做 log-linear 混合
+    /// （`cnt_score::policy::user::mixture`）—— 用户分是概率尺度，逐步 lift 有界。
+    count: u32,
     /// 是否为词库长尾字形（见 [`is_dict_tail`]）：参与候选分组硬约束。
     dict_tail: bool,
 }
@@ -267,6 +278,12 @@ struct Scored {
     completion: bool,
     /// 是否为词库长尾字形的单词候选（见 [`is_dict_tail`]）。
     dict_tail: bool,
+    /// 是否为「整词覆盖输入」的候选（`whole_key_words` 输出 / beam 单段假设）。
+    ///
+    /// 与 `completion`/`dict_tail` 一样参与候选分组硬约束：整词覆盖存在时，
+    /// 多段拼接路径降级到独立组（对齐 librime 的 `has_exact_match_phrase` 门控），
+    /// 不和整词在 group 0 里裸拼。
+    is_whole_word: bool,
 }
 
 /// beam search 中的一条部分假设（`Copy`，克隆零成本、零分配）。
@@ -340,17 +357,32 @@ impl<L: NgramLm> Decoder<L> {
         self
     }
 
-    /// 提交学习数据：逐段调频 + 相邻两段拼合成新词（郑+爽 → zhengshuang/郑爽）。
+    /// 提交学习数据：按 librime `UpdateElements` 语义逐段调频 + 相邻两段拼合成新词
+    /// （郑+爽 → zhengshuang/郑爽，低可信度起点，2 次确认转正）。
+    ///
+    /// **段 bump 规则**（对齐 librime `script_translator.cc::UpdateElements`）：
+    /// 单段提交（直接选择 从 / 从事）一律调频；多段提交仅在路径含真多音节词时
+    /// 才给全部段（含单字）调频 —— 纯单字拼接（从+是）是短语级意图，不给单字
+    /// bump，避免 从/是 这类高频字被句子提交无限刷高、盖过 LM。
+    ///
+    /// **新词学习**：相邻两段拼成复合词键；词库没有该词 → 低可信度起点
+    /// （`confirmed=false`，有效计数 ×0.1），第 2 次确认转正（见 `UserDb::bump`）。
     ///
     /// 词键缓存做**精确失效**：只有这次动过的键（各段 + 拼合出的新词键）会被丢弃。
     /// 早先图省事整体清空，代价是每次上屏后的下一句都退回冷路径（实测每键 +26%）——
     /// 调频只影响它自己那个键的候选词表与加成分，没有理由连累其他键。
     pub fn learn(&self, learned: &[LearnedWord]) {
         // 先写模型再失效：反过来的话，并发的解码可能拿旧数据重新填满缓存
-        for seg in learned {
-            self.model.bump(&seg.pinyin, &seg.word);
+        // 多音节词判定：cnt 音节表无儿化，一字一音节，`chars().count() > 1` 即
+        // librime 的 `code.size() > 1`（真多音节词）。
+        let has_multi_syllable_word = learned.iter().any(|s| s.word.chars().count() > 1);
+        if learned.len() <= 1 || has_multi_syllable_word {
+            for seg in learned {
+                self.model.bump(&seg.pinyin, &seg.word);
+            }
         }
         // 新词学习：相邻两段拼成复合词，下次输入完整拼音直接出
+        // （词库没有该词 → 低可信度起点，model.bump 内按词库归属判定）
         let mut compounds: Vec<String> = Vec::new();
         for pair in learned.windows(2) {
             let key = format!("{}{}", pair[0].pinyin, pair[1].pinyin);
@@ -416,15 +448,22 @@ impl<L: NgramLm> Decoder<L> {
         let mut scored: Vec<Scored> = self.decode(pinyin);
         // 整个输入作为词键的精确候选（含 LM 未覆盖但词频上万的字：备/碑/辈/悲），
         // 它们与整句候选在同一分数空间里竞争——不再用 -inf 垫底排在补全词后面。
-        scored.extend(self.whole_key_words(pinyin));
+        let whole = self.whole_key_words(pinyin);
+        // 整词覆盖判据（对齐 librime `has_exact_match_phrase`，但排除词库长尾）：
+        // 存在「非长尾」整词（从事/充实/重拾…）时，多段拼接路径降级到独立组；
+        // 只有长尾整词（冲矢，freq≤100 且不在 LM）不算数 —— 正确候选不该被
+        // 一个词频 1 的异体整词挤下去，那种情况拼接仍留在 group 0。
+        let has_word_coverage = whole.iter().any(|s| !s.dict_tail);
+        scored.extend(whole);
         if let Some(lm) = &self.lm {
             scored.extend(self.completions(pinyin, lm));
         }
-        // 排序分三组（组间是硬顺序，组内按分数）：
-        // 0 完全覆盖输入的候选（整句/整键词）——你已经打完的读音优先；
-        // 1 补全候选（「猜你还没打完」）——不该插到已打完的读音前面
+        // 排序分四组（组间是硬顺序，组内按分数）：
+        // 0 整词覆盖输入的候选（整键词/beam 单段）——你已经打完的读音优先；
+        // 1 拼接路径（整词覆盖存在时的多段句子）——不和整词裸拼，但仍可见可选；
+        // 2 补全候选（「猜你还没打完」）——不该插到已打完的读音前面
         //   （输入 jian 时前排不能被 jiang 的词占掉），以及词库长尾字形；
-        // 2 部分候选（只覆盖前一段）——修复入口，放在最后，不干扰正常整句选词。
+        // 3 部分候选（只覆盖前一段）——修复入口，放在最后，不干扰正常整句选词。
         //
         // 长尾字形（LM 不认识 + 词频 ≤ 100，见 `is_dict_tail`）虽然确实覆盖了全部
         // 输入，但不享受「已打完的读音优先」：否则输入 n 时 ㅕ午/咹（OOV 地板 -9.0）
@@ -433,10 +472,14 @@ impl<L: NgramLm> Decoder<L> {
         // 真正常用的字仍能赢）。判据与上游打分一致：落在「在不在 LM 词表」上。
         let input_len = pinyin.len();
         let group = |s: &Scored| -> u8 {
-            if s.cand.covers_all(input_len) {
-                u8::from(s.completion || s.dict_tail)
-            } else {
+            if !s.cand.covers_all(input_len) {
                 GROUP_PARTIAL
+            } else if s.completion || s.dict_tail {
+                GROUP_COMPLETION
+            } else if s.is_whole_word || !has_word_coverage {
+                GROUP_WORD
+            } else {
+                GROUP_SENTENCE
             }
         };
         scored.sort_by(|a, b| {
@@ -455,17 +498,33 @@ impl<L: NgramLm> Decoder<L> {
                     }
                 })
         });
-        // 去重：同文本保留首个（= 组内最高分）
+        // 去重：同文本保留「组级更优」者（整词版本优先于拼接版本，同级比分数）。
+        // 整词与拼接路径可能产生同文本（从事 既在整键词里也在 beam 里），
+        // 若保留后出现的拼接版本，会把一个整词拖进降级组 —— 结构保证就漏了。
         let mut out: Vec<Scored> = Vec::new();
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for s in &scored {
-            if seen.insert(s.cand.text.as_str()) {
+            if let Some(&idx) = seen.get(s.cand.text.as_str()) {
+                let cur = &out[idx];
+                if (s.is_whole_word, s.score) > (cur.is_whole_word, cur.score) {
+                    out[idx] = Scored {
+                        cand: s.cand.clone(),
+                        score: s.score,
+                        fuzzy_edges: s.fuzzy_edges,
+                        completion: s.completion,
+                        dict_tail: s.dict_tail,
+                        is_whole_word: s.is_whole_word,
+                    };
+                }
+            } else {
+                seen.insert(s.cand.text.as_str(), out.len());
                 out.push(Scored {
                     cand: s.cand.clone(),
                     score: s.score,
                     fuzzy_edges: s.fuzzy_edges,
                     completion: s.completion,
                     dict_tail: s.dict_tail,
+                    is_whole_word: s.is_whole_word,
                 });
             }
         }
@@ -473,12 +532,15 @@ impl<L: NgramLm> Decoder<L> {
         demote_stacked_fuzzy(&mut out);
         out.truncate(CANDIDATE_LIMIT);
 
+        // 组边界（rescore 只允许组内重排）：组间是硬顺序，模型融合分不能破坏它 ——
+        // 否则降级的拼接候选会被神经模型抬回整词上方，整词优先的结构保证就漏了。
+        let groups = group_ranges(&out, &group);
         let mut out: Vec<(Candidate, f32)> =
             out.into_iter().map(|s| (s.cand, s.score)).collect();
-        // 神经重排（可选）：仅在基线不确定时对前 top_n 条重排；
+        // 神经重排（可选）：仅在基线不确定时对组内前 top_n 条重排；
         // 未装重排器时这里完全不产生开销。
         if let Some(rescorer) = &self.rescorer {
-            crate::rescore::apply(rescorer.as_ref(), &self.policy, &mut out);
+            crate::rescore::apply(rescorer.as_ref(), &self.policy, &groups, &mut out);
         }
         out
     }
@@ -501,7 +563,13 @@ impl<L: NgramLm> Decoder<L> {
                     || (-(rank as f32), false),
                     |lm| {
                         let (base, tail) = reading_base(&word, freq, lm.as_ref());
-                        (base + self.boost(pinyin, &word), tail)
+                        (
+                            cnt_score::policy::user::mixture(
+                                base,
+                                self.model.user_count(pinyin, &word),
+                            ),
+                            tail,
+                        )
                     },
                 );
                 Scored {
@@ -514,6 +582,7 @@ impl<L: NgramLm> Decoder<L> {
                     fuzzy_edges: 0, // 整键精确匹配
                     completion: false,
                     dict_tail,
+                    is_whole_word: true,
                 }
             })
             .collect()
@@ -573,7 +642,10 @@ impl<L: NgramLm> Decoder<L> {
         for (base, ext) in completions {
             let key = format!("{base}{ext}");
             for (word, freq) in self.model.ranked_words(&key, 4) {
-                let mut score = reading_base(&word, freq, lm).0 + self.boost(&key, &word);
+                let base = reading_base(&word, freq, lm).0;
+                // 用户调频是 log-linear 混合（与 beam 逐步同一口径）
+                let mut score =
+                    cnt_score::policy::user::mixture(base, self.model.user_count(&key, &word));
                 // 补全词（延长音节）减惩罚：精确读音候选优先于补全候选；
                 // 用户词（freq == 0）不动，保证 持久化 这类仍能压过拼接。
                 if freq != 0 {
@@ -591,8 +663,9 @@ impl<L: NgramLm> Decoder<L> {
                     // 用户学过的补全词（持久化）仍按补全处理：它排在精确候选之后，
                     // 但精确候选里没有它的竞争者时依旧是第一梯队。
                     completion: true,
-                    // 补全候选本就在第 1 组，长尾与否不再影响分组
+                    // 补全候选本就在第 2 组，长尾与否不再影响分组
                     dict_tail: false,
+                    is_whole_word: false,
                 });
             }
         }
@@ -813,7 +886,7 @@ impl<L: NgramLm> Decoder<L> {
                 WordCand {
                     first_base,
                     dict_tail,
-                    boost: self.boost(key, &word),
+                    count: self.model.user_count(key, &word),
                     word: Arc::from(word),
                     lm_id,
                 }
@@ -926,6 +999,9 @@ impl<L: NgramLm> Decoder<L> {
                     fuzzy_edges: h.fuzzy_edges,
                     completion: false,
                     dict_tail,
+                    // beam 单段假设 = 覆盖全串的整词（与整键词同源，同分空间）；
+                    // 多段假设是拼接路径，整词覆盖存在时降级到独立组。
+                    is_whole_word: segments.len() == 1,
                 }
             })
             .collect();
@@ -934,11 +1010,6 @@ impl<L: NgramLm> Decoder<L> {
             out.extend(partial_candidates(keys, pinyin.len()));
         }
         out
-    }
-
-    /// 用户调频加成（口径与语音侧共用：`cnt_score::policy::user`）。
-    fn boost(&self, syllable: &str, word: &str) -> f32 {
-        cnt_score::policy::user::boost(self.model.user_count(syllable, word))
     }
 
 }
@@ -1018,6 +1089,29 @@ fn min_syllables(lattice: &[Vec<SyllableEdge>]) -> usize {
     hops[end]
 }
 
+/// 把一个按组排序的候选列表切成连续等组区间（`rescore::apply` 用它限定重排范围）。
+///
+/// 组间是硬顺序：整词 > 拼接 > 补全 > 部分。候选已按组排好，相邻等组的
+/// 才属于同一切片 —— 重排只发生在切片内部，模型融合分不得改写组间顺序。
+fn group_ranges(out: &[Scored], group: &impl Fn(&Scored) -> u8) -> Vec<std::ops::Range<usize>> {
+    let Some(first) = out.first() else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut prev = group(first);
+    for (i, s) in out.iter().enumerate().skip(1) {
+        let g = group(s);
+        if g != prev {
+            ranges.push(start..i);
+            start = i;
+            prev = g;
+        }
+    }
+    ranges.push(start..out.len());
+    ranges
+}
+
 /// 硬约束：模糊边 ≥2 的候选不得占 #1。
 ///
 /// 超线性惩罚已让多处模糊的分数大幅下沉，但「不占 #1」是可用性底线，不能只靠
@@ -1070,14 +1164,18 @@ fn expand<L: NgramLm>(
         // （bigram，缺失走 Katz backoff —— 回退语义由 NgramLm::conditional 定义）。
         // 续接：在前词的 bigram 行内查条件概率（行已在上一步定位好，见 Hyp::row）；
         // 缺失走 Katz backoff —— 回退语义由 NgramLm 端口统一定义。
+        //
+        // 用户调频是 log-linear 混合（libime 口径）：`mixture(LM 分, count)`，
+        // 用户分是概率尺度、逐步 lift 有界 —— 拼接路径的量级由 LM 决定，
+        // 单字计数顶多把该段往上抬一小截（不再有 从(+2.0)+是(+2.0) 的线性叠加）。
         let step = match h.prev {
             // 不在 LM 词表的词（用户新词、词库长尾）用它的句首基础分当伪 unigram，
             // 而不是一律 UNK(-12)：否则学过的复合词只能出现在句首，句子中间一定
             // 输给逐字拼接（-12 的悬崖比任何拼接都差）。
             Prev::Word(prev_id) => lm.conditional_in_row(row, prev_id, w.lm_id, w.first_base),
             Prev::Start => w.first_base,
-        } + w.boost
-            + penalty;
+        };
+        let step = cnt_score::policy::user::mixture(step, w.count) + penalty;
         arena.push(Node {
             parent: h.node,
             key: pk.key.clone(),
@@ -1130,11 +1228,12 @@ fn partial_candidates(keys: &[PosKey], input_len: usize) -> Vec<Scored> {
                     vec![LearnedWord::new(pk.key.to_string(), w.word.to_string())],
                     pk.end,
                 ),
-                score: w.first_base + w.boost,
+                score: cnt_score::policy::user::mixture(w.first_base, w.count),
                 fuzzy_edges: 0,
                 completion: false,
                 // 部分候选自成一组（GROUP_PARTIAL），长尾与否不影响分组
                 dict_tail: false,
+                is_whole_word: false,
             });
         }
     }
@@ -1350,6 +1449,185 @@ mod tests {
             cands.iter().any(|c| c.text == "郑爽"),
             "learned new word 郑爽 should appear: {:?}",
             cands.iter().map(|c| c.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pure_concat_commit_does_not_bump_singles() {
+        // 对齐 librime UpdateElements：纯单字拼接提交（从+是）不给单字 bump ——
+        // 短语级意图不该刷高 从/是 这类高频字，它们的调频只来自直接选择。
+        let d = decoder_with(
+            "pure_concat",
+            &[("cong", "从", 900), ("shi", "是", 900)],
+            &[("从", -2.0, 0.0), ("是", -1.9, 0.0)],
+            &[],
+            false,
+        );
+        d.learn(&[
+            LearnedWord::new("cong".to_string(), "从".to_string()),
+            LearnedWord::new("shi".to_string(), "是".to_string()),
+        ]);
+        assert_eq!(d.model.user_count("cong", "从"), 0, "纯拼接不 bump 单字 从");
+        assert_eq!(d.model.user_count("shi", "是"), 0, "纯拼接不 bump 单字 是");
+        // 复合词以低可信度起点创建（未转正 → 有效计数 0），第 2 次提交转正
+        assert_eq!(
+            d.model.user_count("congshi", "从是"),
+            0,
+            "首现低权重（dee=0.1 语义，取整为 0）"
+        );
+        d.learn(&[
+            LearnedWord::new("cong".to_string(), "从".to_string()),
+            LearnedWord::new("shi".to_string(), "是".to_string()),
+        ]);
+        assert_eq!(
+            d.model.user_count("congshi", "从是"),
+            2,
+            "第 2 次确认转正满权重"
+        );
+        // 单字直接选择仍调频（输入 cong 选 从）
+        d.learn(&[LearnedWord::new("cong".to_string(), "从".to_string())]);
+        assert_eq!(d.model.user_count("cong", "从"), 1);
+    }
+
+    #[test]
+    fn mixed_path_commit_bumps_all_segments() {
+        // 对齐 librime UpdateElements：路径含任一真多音节词时，全部段（含单字）都 bump
+        let d = decoder_with(
+            "mixed_path",
+            &[
+                ("women", "我们", 900),
+                ("zai", "在", 900),
+                ("gongzuo", "工作", 900),
+            ],
+            &[
+                ("我们", -3.0, 0.0),
+                ("在", -2.0, 0.0),
+                ("工作", -3.0, 0.0),
+            ],
+            &[],
+            false,
+        );
+        d.learn(&[
+            LearnedWord::new("women".to_string(), "我们".to_string()),
+            LearnedWord::new("zai".to_string(), "在".to_string()),
+            LearnedWord::new("gongzuo".to_string(), "工作".to_string()),
+        ]);
+        assert_eq!(d.model.user_count("women", "我们"), 1);
+        assert_eq!(d.model.user_count("zai", "在"), 1, "混合路径里单字也 bump");
+        assert_eq!(d.model.user_count("gongzuo", "工作"), 1);
+    }
+
+    #[test]
+    fn whole_word_coverage_demotes_concat_path() {
+        // 对齐 librime `has_exact_match_phrase`：congshi 有整词 从事/充实/重试 覆盖全串时，
+        // 拼接路径（从是/丛是/从时）降级到独立组 —— 排在整词之后、补全之前，
+        // 不再和整词在 group 0 里按分数裸拼。
+        let d = decoder_with(
+            "demote_concat",
+            &[
+                ("cong", "从", 900),
+                ("cong", "丛", 100),
+                ("shi", "是", 900),
+                ("shi", "时", 800),
+                ("congshi", "从事", 20_000),
+                ("congshi", "充实", 5_000),
+                ("congshi", "重试", 2_000),
+            ],
+            &[
+                ("从", -2.0, 0.0),
+                ("丛", -5.0, 0.0),
+                ("是", -1.9, 0.0),
+                ("时", -2.9, 0.0),
+                ("从事", -3.0, 0.0),
+                ("充实", -4.0, 0.0),
+                ("重试", -4.5, 0.0),
+            ],
+            &[("从", "是", -1.0)],
+            false,
+        );
+        let cands = d.candidates_scored("congshi");
+        let texts: Vec<&str> = cands.iter().map(|(c, _)| c.text.as_str()).collect();
+        let pos = |t: &str| texts.iter().position(|x| *x == t);
+        let (p_word, p_concat, p_concat2, p_cong) = (
+            pos("从事").expect("整词 从事"),
+            pos("从是").expect("拼接 从是"),
+            pos("丛是").expect("拼接 丛是"),
+            pos("从").expect("部分 从"),
+        );
+        assert!(p_word < p_concat, "整词必须先于拼接: {texts:?}");
+        assert!(p_concat < p_concat2, "组内拼接按 LM 分: {texts:?}");
+        assert!(p_concat < p_cong, "拼接降级组先于部分候选: {texts:?}");
+        // 去重：从事 只出现一次（beam 单段版本被整键版本吸收，不重复占位）
+        assert_eq!(texts.iter().filter(|t| **t == "从事").count(), 1);
+    }
+
+    #[test]
+    fn long_tail_whole_word_does_not_demote_concat() {
+        // 只有长尾整词（freq≤100 且不在 LM，如 冲矢）不算「整词覆盖」：
+        // 正确候选 冲是 不该被词频 1 的异体整词挤下去，拼接仍留 group 0。
+        let d = decoder_with(
+            "long_tail_no_demote",
+            &[
+                ("chong", "冲", 800),
+                ("shi", "是", 900),
+                ("chongshi", "冲矢", 1), // 词库长尾：不在 LM、freq=1
+            ],
+            &[
+                ("冲", -4.0, 0.0),
+                ("是", -1.9, 0.0),
+            ],
+            &[],
+            false,
+        );
+        let cands = d.candidates_scored("chongshi");
+        let texts: Vec<&str> = cands.iter().map(|(c, _)| c.text.as_str()).collect();
+        let p = |t: &str| texts.iter().position(|x| *x == t);
+        let p_concat = p("冲是").expect("拼接 冲是");
+        let p_tail = p("冲矢").expect("长尾整词");
+        assert!(
+            p_concat < p_tail,
+            "长尾整词不构成整词覆盖，拼接留在 group 0: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn no_whole_word_keeps_sentences_in_group0() {
+        // 长输入无整词覆盖（womenzaigongzuo 没有整词）时，句子是唯一全覆盖候选，
+        // 必须留在 group 0 —— 与 librime「无精确短语才出句子」一致。
+        let d = decoder_with(
+            "sentences_group0",
+            &[
+                ("wo", "我", 900),
+                ("men", "们", 900),
+                ("zai", "在", 900),
+                ("gongzuo", "工作", 900),
+            ],
+            &[
+                ("我", -2.3, 0.0),
+                ("们", -4.0, 0.0),
+                ("在", -2.0, 0.0),
+                ("工作", -3.0, 0.0),
+            ],
+            &[("们", "在", -2.0), ("在", "工作", -1.0)],
+            false,
+        );
+        let cands = d.candidates_scored("womenzaigongzuo");
+        let texts: Vec<&str> = cands.iter().map(|(c, _)| c.text.as_str()).collect();
+        assert_eq!(
+            texts.first(),
+            Some(&"我们在工作"),
+            "句子应留在 group 0 且 #1: {texts:?}"
+        );
+        // 全部全覆盖候选（句子）都在任何部分候选（我/我们）之前
+        let first_partial = cands
+            .iter()
+            .position(|(c, _)| !c.covers_all("womenzaigongzuo".len()))
+            .unwrap_or(cands.len());
+        assert!(
+            cands[..first_partial]
+                .iter()
+                .all(|(c, _)| c.covers_all("womenzaigongzuo".len())),
+            "部分候选不得插到全覆盖句子之前: {texts:?}"
         );
     }
 
@@ -1641,7 +1919,8 @@ mod tests {
         let before = d.candidates("shihou");
         let pos_before = before.iter().position(|c| c.text == "时候");
         assert!(pos_before.is_some_and(|i| i > 0), "初始 时候 不该是 #1: {before:?}");
-        // 反复选择 时（每次 +0.2 log10），足够翻过 是 与 时 的 1.0 差距
+        // 反复提交 [时,候]：复合词 时候 第 2 次转正、随后计数增长（混合加成单调），
+        // 足够让它作为整词升到 #1 —— 缓存未失效则 beam 还在用旧词表/旧加成分
         for _ in 0..6 {
             d.learn(&[
                 LearnedWord::new("shi".to_string(), "时".to_string()),

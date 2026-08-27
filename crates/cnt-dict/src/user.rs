@@ -2,13 +2,18 @@
 //!
 //! 持久化为明文 tsv（Rime 风格，可读可备份可手改）：
 //! ```text
-//! zhan<TAB>栈<TAB>3<TAB>1780000000
+//! zhan<TAB>栈<TAB>3<TAB>1780000000<TAB>1
 //! ```
-//! 第 4 列为上次更新的 Unix 秒（jiff 时间戳）；旧格式 3 列兼容（视为刚更新）。
+//! 第 4 列为上次更新的 Unix 秒（jiff 时间戳）；第 5 列为 `confirmed` 标记（0/1）。
+//! 旧格式兼容：第 4 列缺失视为刚更新；第 5 列缺失视为已转正（旧数据满权重）。
 //!
 //! **时间衰减**：计数按半衰期衰减，`effective = count × 0.5^(天数/半衰期)`，
 //! 让用户模型跟随当前习惯漂移，旧习惯逐渐淡出。
+//! **低可信度起点**（对齐 librime 的 dee=0.1）：自动造出的新词条（词库中不存在的
+//! 词）首现时 `confirmed=false`，有效计数 ×0.1 —— 只「可见」不「竞争」；
+//! 第 2 次确认转正后满权重。词库已有的词一律直接转正（现有词调频不受影响）。
 //! **词库上限**：`MAX_USER_ENTRIES` 封顶，超出时淘汰有效计数最低的词条。
+//! 未转正词条有效计数低，天然优先被淘汰。
 //!
 //! 原子写盘：先写临时文件再 rename，避免中途崩溃写坏数据。
 
@@ -25,6 +30,10 @@ const HALF_LIFE_DAYS: f32 = 30.0;
 const MAX_USER_ENTRIES: usize = 20_000;
 /// 一天的秒数。
 const DAY_SECS: i64 = 86_400;
+/// 未转正新词的有效计数折扣（librime dee=0.1 语义：只可见不竞争）。
+const UNCONFIRMED_DISCOUNT: f32 = 0.1;
+/// 自动造词转正所需确认次数（第 2 次 bump 转正）。
+const CONFIRM_THRESHOLD: u32 = 2;
 
 /// 单个拼音下的计数视图（见 [`UserDb::counts_of`]）。
 pub struct CountsOf<'a>(Option<&'a HashMap<String, Entry>>);
@@ -43,6 +52,9 @@ impl CountsOf<'_> {
 struct Entry {
     count: u32,
     updated_at: i64,
+    /// 是否已转正。词库已有的词（`bump(.., known=true)`）与旧格式数据恒为 true；
+    /// 自动造词首现为 false，第 `CONFIRM_THRESHOLD` 次确认后翻 true。
+    confirmed: bool,
 }
 
 pub struct UserDb {
@@ -84,6 +96,11 @@ impl UserDb {
                     .next()
                     .and_then(|t| t.trim().parse::<i64>().ok())
                     .unwrap_or(now);
+                // 第 5 列 confirmed 可选；旧格式（≤4 列）视为已转正（满权重）
+                let confirmed = it
+                    .next()
+                    .and_then(|c| c.trim().parse::<u8>().ok())
+                    .is_none_or(|c| c != 0);
                 counts
                     .entry(pinyin.to_string())
                     .or_default()
@@ -92,6 +109,7 @@ impl UserDb {
                         Entry {
                             count: count.min(MAX_COUNT),
                             updated_at,
+                            confirmed,
                         },
                     );
             }
@@ -144,11 +162,14 @@ impl UserDb {
         self.keys_with_prefix(prefix).next().is_some()
     }
 
-    /// 全部 (词, 次数)（跨拼音键，可能重复出现同一个词）。
+    /// 全部 (词, 有效计数)（跨拼音键，可能重复出现同一个词）。
+    ///
+    /// 用有效计数（含转正折扣）：未转正的新词在语音热词偏置里也不起作用，
+    /// 与拼音侧「只可见不竞争」同一把尺。
     pub fn all_words(&self) -> impl Iterator<Item = (String, u32)> + '_ {
         self.counts
             .values()
-            .flat_map(|m| m.iter().map(|(w, e)| (w.clone(), e.count)))
+            .flat_map(|m| m.iter().map(|(w, e)| (w.clone(), effective_u32(e))))
     }
 
     /// 以 `prefix` 开头的键（有序遍历，`BTreeMap::range` 一次定位后顺序扫描）。
@@ -179,7 +200,11 @@ impl UserDb {
     }
 
     /// 用户选择了候选 (拼音, 词)：计数 +1（先按时间衰减，再封顶 `MAX_COUNT`）。
-    pub fn bump(&mut self, pinyin: &str, word: &str) {
+    ///
+    /// `known` = 该 (拼音, 词) 是否在**静态词库**中：词库已有的词是用户的确认，
+    /// 直接转正；不在词库的是自动造词（对齐 librime 新词前缀标记），首现
+    /// `confirmed=false` 低权重，第 `CONFIRM_THRESHOLD` 次确认后转正。
+    pub fn bump(&mut self, pinyin: &str, word: &str, known: bool) {
         let now = now_secs();
         // 新词且已达上限：先淘汰（避免持内层借用时调用 evict）
         let is_new = self.counts.get(pinyin).is_none_or(|m| !m.contains_key(word));
@@ -191,13 +216,19 @@ impl UserDb {
         }
         let inner = self.counts.entry(pinyin.to_string()).or_default();
         if let Some(e) = inner.get_mut(word) {
-            // 旧计数先衰减到当前有效值，再 +1
+            // 旧计数先按时间衰减到当前有效值，再 +1（衰减不含转正折扣）
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let effective = effective(e).round() as u32; // 衰减值 ≥ 0
-            e.count = effective.saturating_add(1).min(MAX_COUNT);
+            let decayed = decayed(e).round() as u32; // 衰减值 ≥ 0
+            e.count = decayed.saturating_add(1).min(MAX_COUNT);
+            if !e.confirmed && e.count >= CONFIRM_THRESHOLD {
+                e.confirmed = true; // 第 2 次确认转正
+            }
             e.updated_at = now;
         } else {
-            inner.insert(word.to_string(), Entry { count: 1, updated_at: now });
+            inner.insert(
+                word.to_string(),
+                Entry { count: 1, updated_at: now, confirmed: known },
+            );
         }
         self.dirty = true;
     }
@@ -240,7 +271,13 @@ impl UserDb {
             let mut w = f;
             for (pinyin, m) in &self.counts {
                 for (word, e) in m {
-                    writeln!(w, "{pinyin}\t{word}\t{}\t{}", e.count, e.updated_at)?;
+                    writeln!(
+                        w,
+                        "{pinyin}\t{word}\t{}\t{}\t{}",
+                        e.count,
+                        e.updated_at,
+                        u8::from(e.confirmed)
+                    )?;
                 }
             }
             w.flush()?;
@@ -268,11 +305,11 @@ fn now_secs() -> i64 {
     jiff::Timestamp::now().as_second()
 }
 
-/// 有效计数：按时间衰减。
+/// 按时间衰减后的计数（不含转正折扣；`bump` 的计数算术用它）。
 ///
 /// 用户计数 ≤ 100，u32→f32 无损（clippy 允许）。
 #[allow(clippy::cast_precision_loss)]
-fn effective(e: &Entry) -> f32 {
+fn decayed(e: &Entry) -> f32 {
     let days = (now_secs().saturating_sub(e.updated_at)) as f32 / DAY_SECS as f32;
     if days <= 0.0 {
         e.count as f32
@@ -281,7 +318,18 @@ fn effective(e: &Entry) -> f32 {
     }
 }
 
+/// 有效计数：时间衰减 × 转正折扣（未转正新词 ×0.1，只可见不竞争）。
+///
+/// 排名、前缀补全、淘汰、语音热词全走这个口径 —— 单一来源，不各自打折。
+#[allow(clippy::cast_precision_loss)]
+fn effective(e: &Entry) -> f32 {
+    let d = decayed(e);
+    if e.confirmed { d } else { d * UNCONFIRMED_DISCOUNT }
+}
+
 /// 有效计数的整数形式（衰减值 ≥ 0，截断/符号丢失在此是预期语义）。
+///
+/// 未转正新词（0.1 折扣）取整为 0：解码器拿到的计数为 0 → 无用户加成，仅可见。
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn effective_u32(e: &Entry) -> u32 {
     effective(e) as u32
@@ -295,10 +343,50 @@ mod tests {
     fn bump_and_count() {
         let mut db = UserDb::open(Path::new("/nonexistent/cnt-user.dict")).unwrap();
         assert_eq!(db.count("zhan", "栈"), 0);
-        db.bump("zhan", "栈");
-        db.bump("zhan", "栈");
+        db.bump("zhan", "栈", true);
+        db.bump("zhan", "栈", true);
         assert_eq!(db.count("zhan", "栈"), 2);
         assert!(db.dirty);
+    }
+
+    #[test]
+    fn new_word_starts_unconfirmed_and_confirms_on_second_bump() {
+        // 对齐 librime dee=0.1：自动造词首现有效计数打折（取整为 0），第 2 次确认转正
+        let mut db = UserDb::open(Path::new("/nonexistent/cnt-user.dict")).unwrap();
+        db.bump("congshi", "从是", false);
+        assert_eq!(
+            db.count("congshi", "从是"),
+            0,
+            "未转正新词只可见不竞争（0.1 → 取整 0）"
+        );
+        db.bump("congshi", "从是", false);
+        assert_eq!(db.count("congshi", "从是"), 2, "第 2 次确认转正满权重");
+        assert_eq!(db.words_for_pinyin("congshi"), vec!["从是".to_string()]);
+    }
+
+    #[test]
+    fn known_word_bumps_are_confirmed_immediately() {
+        // 词库已有的词是用户的确认，直接转正（现有调频不受影响）
+        let mut db = UserDb::open(Path::new("/nonexistent/cnt-user.dict")).unwrap();
+        db.bump("cong", "从", true);
+        assert_eq!(db.count("cong", "从"), 1);
+    }
+
+    #[test]
+    fn unconfirmed_word_evicts_first() {
+        let mut db = UserDb::open(Path::new("/nonexistent/cnt-user.dict")).unwrap();
+        db.bump("a", "词A", true);
+        db.bump("b", "词B", false); // 未转正：有效计数 0.1
+        let mut best: Option<(String, String, f32)> = None;
+        for (p, m) in &db.counts {
+            for (w, e) in m {
+                let eff = effective(e);
+                if best.as_ref().is_none_or(|(_, _, b)| eff < *b) {
+                    best = Some((p.clone(), w.clone(), eff));
+                }
+            }
+        }
+        assert_eq!(best.map(|(p, w, _)| (p, w)), Some(("b".into(), "词B".into())));
     }
 
     #[test]
@@ -307,14 +395,16 @@ mod tests {
         let path = dir.join("user.dict");
         let _ = fs::remove_dir_all(&dir);
         let mut db = UserDb::open(&path).unwrap();
-        db.bump("zhan", "栈");
-        db.bump("zhan", "栈");
-        db.bump("ni", "你");
+        db.bump("zhan", "栈", true);
+        db.bump("zhan", "栈", true);
+        db.bump("ni", "你", true);
+        db.bump("congshi", "从是", false); // 未转正也要落盘保护
         db.flush().unwrap();
         // 重新打开
         let db2 = UserDb::open(&path).unwrap();
         assert_eq!(db2.count("zhan", "栈"), 2);
         assert_eq!(db2.count("ni", "你"), 1);
+        assert_eq!(db2.count("congshi", "从是"), 0, "未转正状态跨重启保留");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -326,17 +416,17 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, "zhan\t栈\t5\n").unwrap(); // 3 列旧格式
         let db = UserDb::open(&path).unwrap();
-        assert_eq!(db.count("zhan", "栈"), 5); // 视为刚更新，不衰减
+        assert_eq!(db.count("zhan", "栈"), 5); // 视为刚更新，不衰减；旧数据视为已转正
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn words_for_pinyin_lists_user_words() {
         let mut db = UserDb::open(Path::new("/nonexistent/cnt-user.dict")).unwrap();
-        db.bump("zhan", "栈");
-        db.bump("zhan", "栈");
-        db.bump("zhan", "站");
-        db.bump("ni", "你");
+        db.bump("zhan", "栈", true);
+        db.bump("zhan", "栈", true);
+        db.bump("zhan", "站", true);
+        db.bump("ni", "你", true);
         let ws = db.words_for_pinyin("zhan");
         assert_eq!(ws, vec!["栈".to_string(), "站".to_string()]); // 栈计数更高
         assert!(db.words_for_pinyin("ni").contains(&"你".to_string()));
@@ -347,11 +437,11 @@ mod tests {
         let mut db = UserDb::open(Path::new("/nonexistent/cnt-user.dict")).unwrap();
         // 填满上限（每条 bump 多次保证有效计数不同）
         for i in 0..MAX_USER_ENTRIES {
-            db.bump(&format!("p{i}"), &format!("w{i}"));
+            db.bump(&format!("p{i}"), &format!("w{i}"), true);
         }
         assert!(db.len() <= MAX_USER_ENTRIES);
         // 淘汰后应能继续插入新词
-        db.bump("new", "词");
+        db.bump("new", "词", true);
         assert!(db.len() <= MAX_USER_ENTRIES);
         assert_eq!(db.count("new", "词"), 1);
     }

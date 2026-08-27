@@ -13,8 +13,31 @@ use cnt_score::{RescorePolicy, Rescorer, Segment, SentenceHyp};
 use fastrace::local::LocalSpan;
 use fastrace::Event;
 
-/// 对 `scored`（按分数降序）就地应用重排。返回是否真的重排了。
+/// 对 `scored`（按组排序）就地应用重排，**只在组内重排、不跨组**。
+///
+/// `groups` 是候选的组边界（连续等组区间，来自解码器的分组闭包）：
+/// 组间是硬顺序（整词 > 拼接 > 补全 > 部分），模型融合分只在组内重新排序，
+/// 否则降级到独立组的拼接候选会被神经模型抬回整词上方，结构保证失效。
+/// 返回是否真的重排了。
 pub fn apply(
+    rescorer: &dyn Rescorer,
+    policy: &RescorePolicy,
+    groups: &[std::ops::Range<usize>],
+    scored: &mut [(Candidate, f32)],
+) -> bool {
+    let mut did_rescore = false;
+    for g in groups {
+        if g.len() < 2 {
+            continue;
+        }
+        let slice = &mut scored[g.clone()];
+        did_rescore |= rescore_slice(rescorer, policy, slice);
+    }
+    did_rescore
+}
+
+/// 对一个连续组片断做重排（组内窗口 = `policy.window(组内候选数)`）。
+fn rescore_slice(
     rescorer: &dyn Rescorer,
     policy: &RescorePolicy,
     scored: &mut [(Candidate, f32)],
@@ -118,7 +141,7 @@ mod tests {
     fn rescoring_can_flip_close_candidates() {
         let mut scored = vec![(cand("先在", 2), -4.0), (cand("现在", 2), -4.2)];
         let policy = RescorePolicy::default();
-        assert!(apply(&Prefer("现在"), &policy, &mut scored));
+        assert!(apply(&Prefer("现在"), &policy, std::slice::from_ref(&(0..2)), &mut scored));
         assert_eq!(scored[0].0.text, "现在");
     }
 
@@ -127,7 +150,7 @@ mod tests {
         // 分差 3.0 ≥ gap：不调用模型，顺序不变
         let mut scored = vec![(cand("现在", 2), -2.0), (cand("先在", 2), -5.0)];
         let policy = RescorePolicy::default();
-        assert!(!apply(&Prefer("先在"), &policy, &mut scored));
+        assert!(!apply(&Prefer("先在"), &policy, std::slice::from_ref(&(0..2)), &mut scored));
         assert_eq!(scored[0].0.text, "现在");
     }
 
@@ -142,8 +165,25 @@ mod tests {
             (cand("现在", 2), -4.2),
             (cand("鲜在", 2), -4.3),
         ];
-        assert!(apply(&Prefer("鲜在"), &policy, &mut scored));
+        assert!(apply(&Prefer("鲜在"), &policy, std::slice::from_ref(&(0..3)), &mut scored));
         // 窗口外的 鲜在 未参与，仍在最后；窗口内按模型分重排
         assert_eq!(scored[2].0.text, "鲜在");
+    }
+
+    #[test]
+    fn rescore_never_crosses_group_boundary() {
+        // 结构保证：降级到独立组的拼接候选（组 1）不能被模型抬回整词（组 0）上方。
+        // 组 0 = [从事]（单段，min_segments 挡掉），组 1 = [从是, 冲是]：
+        // 模型拼命给 从是 打高分，组边界也不得被破坏。
+        let mut scored = vec![
+            (cand("从事", 1), -3.0),
+            (cand("从是", 2), -5.0),
+            (cand("冲是", 2), -6.0),
+        ];
+        let policy = RescorePolicy::default();
+        assert!(apply(&Prefer("从是"), &policy, &[0..1, 1..3], &mut scored));
+        assert_eq!(scored[0].0.text, "从事", "组 0 整词必须在最前");
+        assert_eq!(scored[1].0.text, "从是", "组 1 内部按模型分重排");
+        assert_eq!(scored[2].0.text, "冲是");
     }
 }

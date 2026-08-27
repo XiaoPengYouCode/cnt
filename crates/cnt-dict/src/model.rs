@@ -188,6 +188,7 @@ impl PinyinModel {
         // 每次比较都要抢一次用户库的锁 + 两次哈希查找 —— 20 个候选就是上百次加锁，
         // 而这是 beam 每个词键都会走的热路径。
         let mut scored: Vec<(Cow<'a, str>, u32, u64)> = Vec::new();
+        let mut user_pushed: Vec<(Cow<'a, str>, u32, u64)> = Vec::new();
         {
             let user = self
                 .user
@@ -204,18 +205,33 @@ impl PinyinModel {
             for w in user.words_for_pinyin(key) {
                 if !scored.iter().any(|(x, _, _)| x.as_ref() == w.as_str()) {
                     let rank = rank_of(&w, 0);
-                    scored.push((Cow::Owned(w), 0, rank));
+                    scored.push((Cow::Owned(w.clone()), 0, rank));
+                    user_pushed.push((Cow::Owned(w), 0, rank));
                 }
             }
         } // 锁只覆盖计数读取，排序不持锁
         scored.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-        scored.truncate(limit);
-        scored.into_iter().map(|(w, freq, _)| (w, freq)).collect()
+        let mut out: Vec<(Cow<'a, str>, u32, u64)> = scored.into_iter().take(limit).collect();
+        // 用户词恒可见（对齐 librime：用户短语权重再低也出现在候选里，可被再次选择确认）：
+        // 被截断掉的用户词补到末尾 —— 它们 rank 本就最低，补在末尾不破坏排序。
+        for uw in &user_pushed {
+            if !out.iter().any(|(x, _, _)| *x == uw.0) {
+                out.push(uw.clone());
+            }
+        }
+        out.into_iter().map(|(w, freq, _)| (w, freq)).collect()
     }
 
     /// 用户选中了候选 (pinyin, word)：记录调频。
+    ///
+    /// `known`（词在不在静态词库）由本层判定：词库已有 → 直接转正；
+    /// 不在词库（自动造词）→ 低可信度起点（见 `UserDb::bump`）。
     pub fn bump(&self, pinyin: &str, word: &str) {
-        self.user.lock().unwrap_or_else(std::sync::PoisonError::into_inner).bump(pinyin, word);
+        let known = self.dict.exact(pinyin).iter().any(|c| c.word == word);
+        self.user
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bump(pinyin, word, known);
     }
 
     /// 持久化用户数据（由定时任务/退出时调用）。
