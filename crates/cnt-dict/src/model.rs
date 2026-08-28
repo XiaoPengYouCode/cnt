@@ -234,6 +234,16 @@ impl PinyinModel {
             .bump(pinyin, word, known);
     }
 
+    /// 忘记 (拼音, 词)：撤销误学（删除用户库中的该条学习记录）。
+    ///
+    /// 词库里的静态词不受影响（仅去掉用户调频），不在词库的自动造词会从候选消失。
+    pub fn forget(&self, pinyin: &str, word: &str) {
+        self.user
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .delete(pinyin, word);
+    }
+
     /// 持久化用户数据（由定时任务/退出时调用）。
     ///
     /// # Errors

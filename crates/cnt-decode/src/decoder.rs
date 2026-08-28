@@ -21,7 +21,7 @@ use cnt_input::{Candidate, CandidateSource, LearnedWord};
 use cnt_score::{NgramLm, RescorePolicy, Rescorer};
 use fastrace::local::LocalSpan;
 
-use crate::syllable::{SyllableEdge, SyllableTable, MAX_FUZZY_COST};
+use crate::syllable::{SyllableEdge, SyllableTable, SYLLABLE_SEPARATOR, MAX_FUZZY_COST, strip_separators};
 
 /// beam 宽度：同时保留的假设数。
 const BEAM: usize = 8;
@@ -401,6 +401,18 @@ impl<L: NgramLm> Decoder<L> {
         }
     }
 
+    /// 忘记一组学习段（撤销误学：误选的候选 / 拼错的复合词）。
+    ///
+    /// 逐段删除用户库记录（词库静态词不受影响，只是去掉用户调频）；
+    /// 只动过的键精确失效缓存（与 `learn` 同口径）。
+    pub fn forget(&self, learned: &[LearnedWord]) {
+        let mut cache = self.lock_keys();
+        for seg in learned {
+            self.model.forget(&seg.pinyin, &seg.word);
+            cache.invalidate(&seg.pinyin);
+        }
+    }
+
     /// 把拼音串按标准音节切开，供预编辑显示（`nihaoshijie` → `ni hao shi jie`）。
     ///
     /// 只用精确音节表（不含模糊变体）：预编辑要如实反映**用户打的**内容，
@@ -596,7 +608,8 @@ impl<L: NgramLm> Decoder<L> {
     /// 因此一个候选都不出——它是每个词的第一键，不能空窗。
     fn completions(&self, pinyin: &str, lm: &L) -> Vec<Scored> {
         let _span = LocalSpan::enter_with_local_parent("completions");
-        if pinyin.is_empty() {
+        if pinyin.is_empty() || pinyin.contains(SYLLABLE_SEPARATOR) {
+            // 显式分隔（xi'an）后不做「猜你还没打完」：用户已经明确切分意图
             return Vec::new();
         }
         let lattice = if self.fuzzy {
@@ -704,6 +717,7 @@ impl<L: NgramLm> Decoder<L> {
         pinyin: &str,
         lattice: &[Vec<SyllableEdge>],
         reachable: &[bool],
+        boundaries: &[usize],
         lm: &L,
         limits: Limits,
     ) -> BeamResult {
@@ -744,7 +758,7 @@ impl<L: NgramLm> Decoder<L> {
                 bucket.truncate(BEAM);
             }
             if keys_at[pos].is_none() {
-                keys_at[pos] = Some(self.keys_at(lattice, pos, limits));
+                keys_at[pos] = Some(self.keys_at(lattice, pos, limits, boundaries));
             }
             let Some(keys) = keys_at[pos].as_ref() else { continue };
             rows.clear();
@@ -797,7 +811,13 @@ impl<L: NgramLm> Decoder<L> {
     /// 枚举某个位置上所有可展开的词键（单音节 + 多音节整词）及其候选词。
     ///
     /// 与假设无关，因此每个位置只调一次；词库前缀查询用于剪掉不可能成词的链。
-    fn keys_at(&self, lattice: &[Vec<SyllableEdge>], pos: usize, limits: Limits) -> Vec<PosKey> {
+    fn keys_at(
+        &self,
+        lattice: &[Vec<SyllableEdge>],
+        pos: usize,
+        limits: Limits,
+        boundaries: &[usize],
+    ) -> Vec<PosKey> {
         let _span = LocalSpan::enter_with_local_parent("keys_at");
         let mut out: Vec<PosKey> = Vec::new();
         // 链键拼接的复用缓冲：只有确认成键（前缀命中）时才真的分配 String
@@ -827,6 +847,11 @@ impl<L: NgramLm> Decoder<L> {
                 for (key, cur_end, cost, fuzzy_edges) in &chains {
                     let Some(edges) = lattice.get(*cur_end) else { continue };
                     for next_edge in edges {
+                        // 链不能跨越强制边界（xi'an 的 xian 键从这里剪掉）：
+                        // 边界处必须断开，边界之后的音节是下一段的起点。
+                        if boundaries.iter().any(|&b| pos < b && b < next_edge.end) {
+                            continue;
+                        }
                         buf.clear();
                         buf.push_str(key);
                         buf.push_str(next_edge.syl);
@@ -947,14 +972,17 @@ impl<L: NgramLm> Decoder<L> {
         let Some(lm) = &self.lm else {
             return Vec::new();
         };
+        // 音节分隔符 `'`（Rime 惯例）：剥离后建格，剪掉跨越边界的边——
+        // xi'an 只能切 xi+an，不被自动切分当成 xian/现。
+        let (clean, pos_map, boundaries) = if pinyin.contains(SYLLABLE_SEPARATOR) {
+            strip_separators(pinyin)
+        } else {
+            (pinyin.to_string(), Vec::new(), Vec::new())
+        };
         // fastrace：lattice 构建（模糊音节格）
         let lattice = {
             let _span = LocalSpan::enter_with_local_parent("lattice");
-            if self.fuzzy {
-                self.syllables.lattice_fuzzy(pinyin)
-            } else {
-                self.syllables.lattice(pinyin)
-            }
+            self.syllables.lattice_strict(&clean, &boundaries, self.fuzzy)
         };
         if lattice.len() < 2 {
             return Vec::new(); // 单音节退化，交给词候选
@@ -977,7 +1005,7 @@ impl<L: NgramLm> Decoder<L> {
             hyps,
             arena,
             keys_at,
-        } = self.beam_search(pinyin, &lattice, &reachable, lm, limits);
+        } = self.beam_search(&clean, &lattice, &reachable, &boundaries, lm, limits);
         let mut out: Vec<Scored> = hyps
             .into_iter()
             .map(|h| {
@@ -1007,7 +1035,7 @@ impl<L: NgramLm> Decoder<L> {
             .collect();
         // 部分候选：位置 0 出发、只覆盖输入前一段的词（整句错了就咬一段确认）
         if let Some(keys) = keys_at.first().and_then(Option::as_ref) {
-            out.extend(partial_candidates(keys, pinyin.len()));
+            out.extend(partial_candidates(keys, clean.len(), &pos_map));
         }
         out
     }
@@ -1213,7 +1241,7 @@ fn first_word_base<L: NgramLm>(freq: u32, lm_id: Option<u32>, lm: &L) -> (f32, b
 ///
 /// 打分与句首词同一套（读音基础分 + 用户调频 + 模糊惩罚），但它们在候选排序里
 /// 自成一组（见 `candidates_scored`），不与整句混排。
-fn partial_candidates(keys: &[PosKey], input_len: usize) -> Vec<Scored> {
+fn partial_candidates(keys: &[PosKey], input_len: usize, pos_map: &[usize]) -> Vec<Scored> {
     let mut out: Vec<Scored> = Vec::new();
     for pk in keys
         .iter()
@@ -1226,7 +1254,9 @@ fn partial_candidates(keys: &[PosKey], input_len: usize) -> Vec<Scored> {
                 cand: Candidate::partial(
                     w.word.to_string(),
                     vec![LearnedWord::new(pk.key.to_string(), w.word.to_string())],
-                    pk.end,
+                    // consumed 映射回原串坐标：clean 坐标 c → pos_map[c-1]+1
+                    // （无分隔符时 pos_map 为空 → 恒等，行为与原来一致）
+                    pos_map.get(pk.end - 1).map_or(pk.end, |p| p + 1),
                 ),
                 score: cnt_score::policy::user::mixture(w.first_base, w.count),
                 fuzzy_edges: 0,
@@ -1340,6 +1370,46 @@ mod tests {
         // 按位置分桶后，两者根本不在同一个桶里，不会互相挤掉
         let same_bucket = bucket[0].pos == bucket[1].pos;
         assert!(!same_bucket, "不同覆盖长度的假设不可比，必须分桶");
+    }
+
+    #[test]
+    fn separator_forces_syllable_split() {
+        let d = decoder_with(
+            "sep",
+            &[
+                ("xian", "现", 50_000),
+                ("xi", "西", 50_000),
+                ("an", "安", 50_000),
+            ],
+            &[
+                ("现", -1.0, 0.0),
+                ("西", -1.0, 0.0),
+                ("安", -1.0, 0.0),
+            ],
+            &[],
+            false,
+        );
+        // 无分隔符：xian 自动切 → 现
+        let plain = d.candidates_scored("xian");
+        assert!(
+            plain.iter().any(|(c, _)| c.text == "现"),
+            "xian 应出 现: {:?}",
+            plain.iter().map(|(c, _)| c.text.as_str()).collect::<Vec<_>>()
+        );
+        // xi'an：强制 xi+an → 西安，且不再自动切出 现
+        let sep = d.candidates_scored("xi'an");
+        let texts: Vec<&str> = sep.iter().map(|(c, _)| c.text.as_str()).collect();
+        assert!(
+            texts.contains(&"西安"),
+            "xi'an 应切出 西安: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"现"),
+            "xi'an 不应自动切出 现: {texts:?}"
+        );
+        // 部分候选 consumed 映射：xi'an 里选 西 → consumed = 原串 0..2（不含分隔符）
+        let xi = sep.iter().find(|(c, _)| c.text == "西").expect("部分候选 西");
+        assert_eq!(xi.0.consumed, 2, "xi 在原串 xi'an 中占 2 字节");
     }
 
     #[test]

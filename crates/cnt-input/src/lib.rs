@@ -207,6 +207,9 @@ pub mod keysym {
     /// 翻页键（Rime 行为）：- 上一页，= 下一页
     pub const MINUS: u32 = 0x002d;
     pub const EQUAL: u32 = 0x003d;
+    /// 音节分隔键（Rime 惯例）：组合中强制切分（xi'an → xi+an）；
+    /// 未组合时是智能引号（`handle_punctuation`）
+    pub const APOSTROPHE: u32 = 0x0027;
 }
 
 /// 数字选择键 → 页内序号：`1`-`9` → 0..=8，`0` → 9（候选窗里的第 10 个）。
@@ -468,6 +471,15 @@ impl EngineState {
             return Action::Handled;
         }
 
+        // 音节分隔键（Rime 惯例）：组合中 `'` = 强制切分（xi'an → xi+an，
+        // 不被自动切分当成 xian/现）；未组合时保持智能引号（handle_punctuation）。
+        // 要在 handle_punctuation 之前拦截，否则会被当标点「提交候选+引号」。
+        if !self.buffer.is_empty() && keyval == keysym::APOSTROPHE {
+            self.buffer.push('\'');
+            self.refresh(source);
+            return Action::Handled;
+        }
+
         // 翻页键（Rime 行为：- 上一页、= 下一页）：组合中优先翻页
         if !self.buffer.is_empty() && (keyval == keysym::MINUS || keyval == keysym::EQUAL) {
             if keyval == keysym::MINUS {
@@ -705,6 +717,30 @@ mod tests {
         assert!(matches!(st.handle_key(0x69, &d, false), Action::Handled)); // i
         assert_eq!(st.buffer(), "ni");
         assert!(st.candidates().iter().any(|c| c.text == "你"));
+    }
+
+    #[test]
+    fn apostrophe_is_syllable_separator_while_composing() {
+        let src = TestSource { map: std::collections::HashMap::default() };
+        let mut st = EngineState::default();
+        st.handle_key(keysym::A, &src, false);
+        // 组合中 `'` = 分隔符：进 buffer，不触发标点（不提交、不输出引号）
+        assert_eq!(st.handle_key(keysym::APOSTROPHE, &src, false), Action::Handled);
+        assert_eq!(st.buffer, "a'");
+    }
+
+    #[test]
+    fn apostrophe_is_smart_quote_when_not_composing() {
+        let src = TestSource { map: std::collections::HashMap::default() };
+        let mut st = EngineState::default();
+        let act = st.handle_key(keysym::APOSTROPHE, &src, false);
+        match act {
+            Action::Commit { text, learned } => {
+                assert_eq!(text, "‘");
+                assert!(learned.is_empty());
+            }
+            other => panic!("未组合时 `'` 应输出智能引号，got {other:?}"),
+        }
     }
 
     #[test]

@@ -233,6 +233,24 @@ impl UserDb {
         self.dirty = true;
     }
 
+    /// 删除一条用户词 (拼音, 词)：撤销误学（误选的候选 / 拼错的复合词）。
+    ///
+    /// 返回是否删除了条目；删空内层表时连带清理外层键。
+    /// 词库里的静态词不受影响（这层只删用户计数，候选里仍在，只是去掉调频）。
+    pub fn delete(&mut self, pinyin: &str, word: &str) -> bool {
+        if let Some(m) = self.counts.get_mut(pinyin)
+            && m.remove(word).is_some()
+        {
+            if m.is_empty() {
+                self.counts.remove(pinyin);
+            }
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
     /// 淘汰有效计数最低的一条（保持上限）。
     fn evict_lowest(&mut self) {
         let mut best: Option<(String, String, f32)> = None;
@@ -347,6 +365,45 @@ mod tests {
         db.bump("zhan", "栈", true);
         assert_eq!(db.count("zhan", "栈"), 2);
         assert!(db.dirty);
+    }
+
+    #[test]
+    fn delete_removes_entry_and_cleans_empty_bucket() {
+        let mut db = UserDb::open(Path::new("/nonexistent/cnt-user.dict")).unwrap();
+        db.bump("zhengshuang", "郑爽", false);
+        db.bump("nihao", "你好", true);
+        // 删除存在的条目
+        assert!(db.delete("zhengshuang", "郑爽"));
+        assert_eq!(db.count("zhengshuang", "郑爽"), 0);
+        // 删空内层表 → 外层键也被清理
+        assert!(db.delete("nihao", "你好"));
+        assert_eq!(db.count("nihao", "你好"), 0);
+        assert_eq!(db.len(), 0);
+        // 删除不存在的条目：无操作
+        assert!(!db.delete("zhengshuang", "郑爽"));
+        assert!(!db.delete("wucunzai", "不存在"));
+        assert!(db.dirty);
+    }
+
+    #[test]
+    fn delete_survives_flush_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cnt-user-delete-{}", std::process::id()));
+        let path = dir.join("user.dict");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut db = UserDb::open(&path).unwrap();
+            db.bump("congshi", "从是", false);
+            db.bump("cong", "从", true);
+            db.delete("congshi", "从是");
+            db.flush().unwrap();
+        }
+        {
+            let db = UserDb::open(&path).unwrap();
+            assert_eq!(db.count("congshi", "从是"), 0);
+            assert_eq!(db.count("cong", "从"), 1, "未删除的条目保留");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

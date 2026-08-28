@@ -198,6 +198,14 @@ fn main() {
             }
             cmd_query(&args[2], &args[3..])
         }
+        "delete-user" => {
+            // delete-user <user.dict> <pinyin> <word>
+            if args.len() != 5 {
+                usage();
+                std::process::exit(2);
+            }
+            cmd_delete_user(&args[2], &args[3], &args[4])
+        }
         _ => {
             usage();
             std::process::exit(2);
@@ -211,7 +219,7 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "usage:\n  cnt-dict-tools build <in.tsv> <out.cntd>\n  cnt-dict-tools import-rime-table <table.txt> <out.tsv>\n  cnt-dict-tools import-libime <dict.txt> <out.tsv> [--lm <lm.arpa>]\n  cnt-dict-tools build-lm <lm.arpa> <out.cntl>\n  cnt-dict-tools decode <dict.cntd> <lm.cntl> [--user <user.dict>] <pinyin>..\n  cnt-dict-tools info <dict.cntd>\n  cnt-dict-tools query <dict.cntd> <pinyin>..."
+        "usage:\n  cnt-dict-tools build <in.tsv> <out.cntd>\n  cnt-dict-tools import-rime-table <table.txt> <out.tsv>\n  cnt-dict-tools import-libime <dict.txt> <out.tsv> [--lm <lm.arpa>]\n  cnt-dict-tools build-lm <lm.arpa> <out.cntl>\n  cnt-dict-tools decode <dict.cntd> <lm.cntl> [--user <user.dict>] <pinyin>..\n  cnt-dict-tools info <dict.cntd>\n  cnt-dict-tools query <dict.cntd> <pinyin>...\n  cnt-dict-tools delete-user <user.dict> <pinyin> <word>"
     );
 }
 
@@ -449,6 +457,18 @@ fn cmd_query(path: &str, pinyins: &[String]) -> CliResult {
         } else {
             println!("{}", out.join(" "));
         }
+    }
+    Ok(())
+}
+
+/// 从用户词库删除一条 (拼音, 词)：撤销误学（对应 Ctrl+Delete 的 CLI 形式）。
+fn cmd_delete_user(path: &str, pinyin: &str, word: &str) -> CliResult {
+    let mut db = cnt_dict::UserDb::open(path)?;
+    if db.delete(pinyin, word) {
+        db.flush()?;
+        println!("deleted: {pinyin}\t{word}");
+    } else {
+        println!("not found: {pinyin}\t{word}");
     }
     Ok(())
 }

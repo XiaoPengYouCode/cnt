@@ -31,9 +31,13 @@ const RELEASE_MASK: u32 = 1 << 30;
 const SHIFT_MASK: u32 = 1 << 0;
 /// 这些组合键按下时不处理（控制键 / Alt / Super / Hyper / Meta；不含 Shift）
 const IGNORED_MOD_MASK: u32 = (1 << 2) | (1 << 3) | (1 << 26) | (1 << 27) | (1 << 28);
+/// Control 修饰键位（`IGNORED_MOD_MASK` 里的一员；Ctrl+Delete 删除候选时单独放行）
+const CONTROL_MASK: u32 = 1 << 2;
 /// Shift 键（左/右）keysym
 const KEY_SHIFT_L: u32 = 0xffe1;
 const KEY_SHIFT_R: u32 = 0xffe2;
+/// Delete 键 keysym（`XK_Delete`）
+const KEY_DELETE: u32 = 0xffff;
 /// Shift「单击」判定窗口：按下后该时间内释放且期间未打其他键 → 切换中英
 const SHIFT_TAP_DURATION: std::time::Duration = std::time::Duration::from_millis(350);
 /// 「慢按键」阈值：超过这个时长的按键才上报 span 树（含 UI 刷新）。
@@ -193,6 +197,21 @@ impl Engine {
 
         // 忽略按键释放与组合键（Ctrl/Alt/Super 等；Shift 已在上面处理）
         if state & (RELEASE_MASK | IGNORED_MOD_MASK) != 0 {
+            // Ctrl+Delete 例外：组合中删除光标处候选（「忘记此词」的撤销入口）。
+            // 修饰键只有引擎层知道（IBus state），所以在这里单独放行；
+            // 状态机保持无 IO，只从这里取选中候选的 learned 段。
+            if state & CONTROL_MASK != 0 && keyval == KEY_DELETE {
+                let learned = self.core.lock_state().selected().map(|c| c.learned.clone());
+                if let Some(learned) = learned {
+                    let root = Span::root("forget_candidate", SpanContext::random());
+                    self.core
+                        .forget_candidate(learned)
+                        .in_span(Span::enter_with_parent("update_ui", &root))
+                        .await;
+                    root.cancel(); // 忘词是同步小操作，不留诊断 span
+                    return Ok(true);
+                }
+            }
             return Ok(false);
         }
 

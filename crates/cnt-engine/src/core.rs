@@ -303,6 +303,15 @@ impl EngineCore {
         self.update_ui(&ui).await;
     }
 
+    /// 忘记一组学习段（Ctrl+Delete：撤销误学），随后刷新候选窗。
+    pub(crate) async fn forget_candidate(&self, learned: Vec<LearnedWord>) {
+        if !learned.is_empty() {
+            log::debug!("forget: {} segments", learned.len());
+            self.decoder.forget(&learned);
+        }
+        self.refresh_after_handled().await;
+    }
+
     /// 把用户学习数据写盘（`focus_out`/`disable` 时立即落盘，减少丢失窗口）。
     pub(crate) fn flush_user(&self) {
         if let Err(e) = self.decoder.flush_user() {

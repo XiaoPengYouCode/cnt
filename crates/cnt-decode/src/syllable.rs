@@ -2,6 +2,8 @@
 //!
 //! 音节表是《汉语拼音方案》的无调音节全集（约 410 个），硬编码为标准数据，
 //! 不依赖任何外部库。切分用全切分（动态规划），生成音节格（lattice）。
+//! 支持音节分隔符 `'`（Rime 惯例）：`xi'an` 强制切为 xi+an，不被自动切分
+//! 当成 xian/现 —— 见 [`strip_separators`] 与 [`SyllableTable::lattice_strict`]。
 //!
 //! **模糊音**：`FUZZY_RULES` 定义双向替换规则（平翘舌/边鼻音/前后鼻音等），
 //! 每个标准音节生成其模糊变体；用户输入的变体匹配回标准音节后查词。
@@ -109,6 +111,34 @@ impl Default for SyllableTable {
     }
 }
 
+/// 音节分隔符：组合中输入 `'` 强制切分（`xi'an` → xi+an）。
+pub const SYLLABLE_SEPARATOR: char = '\'';
+
+/// 剥离音节分隔符：返回 `(clean, pos_map, boundaries)`。
+///
+/// - `clean`：去掉所有 `'` 后的输入（切分/查询都在它上面做）；
+/// - `pos_map[i]`：clean 第 i 个字符在**原始输入**中的字节下标（把候选的
+///   consumed 从 clean 坐标映射回原串坐标用——`consumed = pos_map[c-1] + 1`）；
+/// - `boundaries`：强制切分边界（clean 字节坐标）。连续分隔符折叠、
+///   首尾分隔符忽略（`'xian` 或 `xian'` 的边界不产生效果）。
+#[must_use]
+pub fn strip_separators(input: &str) -> (String, Vec<usize>, Vec<usize>) {
+    let mut clean = String::with_capacity(input.len());
+    let mut pos_map = Vec::with_capacity(input.len());
+    let mut boundaries = Vec::new();
+    for (i, ch) in input.char_indices() {
+        if ch == SYLLABLE_SEPARATOR {
+            boundaries.push(clean.len());
+        } else {
+            clean.push(ch);
+            pos_map.push(i);
+        }
+    }
+    boundaries.dedup();
+    boundaries.retain(|&b| b > 0 && b < clean.len());
+    (clean, pos_map, boundaries)
+}
+
 impl SyllableTable {
     /// 用标准音节表构造（按首字母分桶，供 `syllables_at` 快速过滤）。
     #[must_use]
@@ -177,9 +207,16 @@ impl SyllableTable {
     ///
     /// 取「音节数最少」的切分（与解码器的规模判定同一口径）；某个位置切不下去时，
     /// 把剩下的字母原样附上 —— 用户还没打完的尾巴（`shij` 的 `j`）也要看得见。
+    /// 输入含音节分隔符 `'` 时先剥离再切（`xi'an` → `xi an`，边界强制）。
     #[must_use]
     pub fn split_for_display(&self, input: &str) -> String {
-        let n = input.len();
+        let (clean, _, boundaries) = if input.contains(SYLLABLE_SEPARATOR) {
+            strip_separators(input)
+        } else {
+            (input.to_string(), Vec::new(), Vec::new())
+        };
+        let n = clean.len();
+        let lat = self.lattice_strict(&clean, &boundaries, false);
         // 1) 正向可达：能切出音节的最远位置（还没打完的尾巴切不出来，如 shij 的 j）
         let mut reachable = vec![false; n + 1];
         reachable[0] = true;
@@ -188,7 +225,7 @@ impl SyllableTable {
             if !reachable[pos] {
                 continue;
             }
-            for e in self.syllables_at(input, pos) {
+            for e in &lat[pos] {
                 if e.is_fuzzy() {
                     continue; // 显示层只认精确读音：预编辑要如实反映用户打的内容
                 }
@@ -201,7 +238,7 @@ impl SyllableTable {
         let mut choice: Vec<Option<&'static str>> = vec![None; n + 1];
         hops[max_pos] = 0;
         for pos in (0..max_pos).rev() {
-            for e in self.syllables_at(input, pos) {
+            for e in &lat[pos] {
                 if e.is_fuzzy() || e.end > max_pos {
                     continue;
                 }
@@ -219,14 +256,14 @@ impl SyllableTable {
             if !out.is_empty() {
                 out.push(' ');
             }
-            out.push_str(&input[pos..pos + syl.len()]);
+            out.push_str(&clean[pos..pos + syl.len()]);
             pos += syl.len();
         }
         if pos < n {
             if !out.is_empty() {
                 out.push(' ');
             }
-            out.push_str(&input[pos..]);
+            out.push_str(&clean[pos..]);
         }
         out
     }
@@ -249,6 +286,31 @@ impl SyllableTable {
             out.push(self.fuzzy_syllables_at(input, pos));
         }
         out
+    }
+
+    /// 全切分（含模糊音），并剪掉跨越强制边界的边（音节分隔符 `'`）。
+    ///
+    /// 剪边让假设在边界处天然断开：`xi'an` 的边界在 clean 坐标 2，
+    /// `xian`（0..4）跨边界被剪，只剩 xi(0..2) + an(2..4)——
+    /// `keys_at`/beam 完全不用感知分隔符。
+    #[must_use]
+    pub fn lattice_strict(
+        &self,
+        input: &str,
+        boundaries: &[usize],
+        fuzzy: bool,
+    ) -> Vec<Vec<SyllableEdge>> {
+        let mut lat = if fuzzy {
+            self.lattice_fuzzy(input)
+        } else {
+            self.lattice(input)
+        };
+        for &b in boundaries {
+            for pos in 0..b {
+                lat[pos].retain(|e| e.end <= b);
+            }
+        }
+        lat
     }
 }
 
@@ -382,6 +444,62 @@ mod tests {
         let lattice = t.lattice("nihao");
         let reachable = reach(&lattice, "nihao");
         assert!(reachable.iter().any(|s| s == "ni hao"));
+    }
+
+    #[test]
+    fn strip_separators_folds_and_maps() {
+        let (clean, pos_map, boundaries) = strip_separators("xi'an");
+        assert_eq!(clean, "xian");
+        assert_eq!(pos_map, vec![0, 1, 3, 4]);
+        assert_eq!(boundaries, vec![2]);
+        // 连续分隔符折叠、首尾忽略
+        let (clean, _, boundaries) = strip_separators("'xi''an'");
+        assert_eq!(clean, "xian");
+        assert_eq!(boundaries, vec![2]);
+        // 无分隔符：边界空、映射恒等
+        let (clean, pos_map, boundaries) = strip_separators("xian");
+        assert_eq!(clean, "xian");
+        assert_eq!(pos_map, vec![0, 1, 2, 3]);
+        assert!(boundaries.is_empty());
+    }
+
+    #[test]
+    fn lattice_strict_forces_boundary() {
+        let t = SyllableTable::new();
+        // xian 本来能整切；加上边界 2 后只能 xi+an
+        let strict = t.lattice_strict("xian", &[2], false);
+        let plain = t.lattice("xian");
+        assert!(plain[0].iter().any(|e| e.syl == "xian"), "无边界时可切 xian");
+        assert!(
+            strict[0].iter().all(|e| e.end <= 2),
+            "跨边界边被剪: {:?}",
+            strict[0]
+        );
+        assert!(
+            strict[0].iter().any(|e| e.syl == "xi"),
+            "xi 保留: {:?}",
+            strict[0]
+        );
+        let reachable = reach(&strict, "xian");
+        assert!(
+            reachable.iter().any(|s| s == "xi an"),
+            "强制切 xi an: {reachable:?}"
+        );
+        assert!(
+            reachable.iter().all(|s| s != "xian"),
+            "整切被剪掉: {reachable:?}"
+        );
+        // 模糊格同样剪边
+        let strict_fuzzy = t.lattice_strict("xian", &[2], true);
+        assert!(strict_fuzzy[0].iter().all(|e| e.end <= 2));
+    }
+
+    #[test]
+    fn split_for_display_respects_separator() {
+        let t = SyllableTable::new();
+        assert_eq!(t.split_for_display("xi'an"), "xi an");
+        assert_eq!(t.split_for_display("xian"), "xian");
+        assert_eq!(t.split_for_display("nihaoshijie"), "ni hao shi jie");
     }
 
     #[test]
