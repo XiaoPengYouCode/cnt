@@ -32,6 +32,9 @@ mmap 二分查找，trigram 留作扩展（Katz backoff 已预留）。
   下次输入完整拼音直接出整词；学过的词也能用在**句子中间**——多音节链剪枝
   （`has_key_prefix`）与用户库一起判断前缀存在性，且不在 LM 词表的词用「句首基础分
   + backoff」当伪 unigram（而非一律 UNK -12），否则学过的词在句中必然输给逐字拼接
+- **忘记此词**（撤销误学）：候选误选 / 拼错的复合词会污染排序——组合中按
+  `Ctrl+Delete` 删除光标处候选的全部学习段（词库静态词不受影响，仅去掉调频加成），
+  候选窗即时刷新；CLI 等价操作 `cnt-dict-tools delete-user <user.dict> <pinyin> <word>`
 
 ### 写盘策略
 
