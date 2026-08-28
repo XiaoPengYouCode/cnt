@@ -188,8 +188,7 @@ impl MmapDict {
         i < self.entry_count
             && self
                 .str_of_entry(self.entry(i))
-                .ok()
-                .is_some_and(|k| k.starts_with(pinyin))
+                .is_ok_and(|k| k.starts_with(pinyin))
     }
 
     /// 精确匹配：返回该拼音的全部候选（文件内已按频率降序）。

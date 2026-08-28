@@ -4,25 +4,25 @@
 
 /// 读小端 `u16`。
 #[must_use]
-pub fn read_u16(b: &[u8]) -> u16 {
+pub const fn read_u16(b: &[u8]) -> u16 {
     u16::from_le_bytes([b[0], b[1]])
 }
 
 /// 读小端 `u32`。
 #[must_use]
-pub fn read_u32(b: &[u8]) -> u32 {
+pub const fn read_u32(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 /// 读小端 `u64`。
 #[must_use]
-pub fn read_u64(b: &[u8]) -> u64 {
+pub const fn read_u64(b: &[u8]) -> u64 {
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
 /// 读小端 `f32`（字节序无关，非对齐安全）。
 #[must_use]
-pub fn read_f32(b: &[u8]) -> f32 {
+pub const fn read_f32(b: &[u8]) -> f32 {
     f32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
