@@ -22,14 +22,14 @@
 //! 字母键会一直往应用灌字符。默认 `Alt_R`（很多 2024 年后的键盘已经把右 Ctrl
 //! 换成了 Copilot 键），且**不消费**该事件——照常转发给应用，行为与平时按 Alt 一致。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use cnt_input::hotkey::{is_release, mask, Hotkey};
+use cnt_input::hotkey::{Hotkey, is_release, mask};
+use cnt_voice::{Mode, Voice, VoiceError, VoiceEvent};
+use fastrace::Span;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
-use fastrace::Span;
-use cnt_voice::{Mode, Voice, VoiceError, VoiceEvent};
 
 use crate::core::EngineCore;
 
@@ -284,7 +284,7 @@ impl VoiceRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{meter, KeyOutcome};
+    use super::{KeyOutcome, meter};
 
     #[test]
     fn meter_maps_db_to_bars() {

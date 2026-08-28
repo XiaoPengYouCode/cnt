@@ -6,10 +6,10 @@
 
 use std::path::Path;
 
-use cnt_store::{StoreError, validate_regions, MmapFile};
 use crate::format::{
-    Entry, Header, CAND_HEADER_SIZE, ENTRY_SIZE, MAX_CANDIDATES, MAX_ENTRIES, MAX_STRINGS_LEN,
+    CAND_HEADER_SIZE, ENTRY_SIZE, Entry, Header, MAX_CANDIDATES, MAX_ENTRIES, MAX_STRINGS_LEN,
 };
+use cnt_store::{MmapFile, StoreError, validate_regions};
 
 /// 精确匹配命中：`word` 借用自 mmap 内存。
 #[derive(Debug, Clone, Copy)]
@@ -296,7 +296,10 @@ mod tests {
 
     #[test]
     fn dedupes_and_merges_duplicates() {
-        let d = dict_with("dedupe", &[("ni", "你", 100), ("ni", "你", 300), ("ni", "泥", 200)]);
+        let d = dict_with(
+            "dedupe",
+            &[("ni", "你", 100), ("ni", "你", 300), ("ni", "泥", 200)],
+        );
         let c = d.exact("ni");
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].word, "你");

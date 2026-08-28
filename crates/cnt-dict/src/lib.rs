@@ -14,5 +14,5 @@ pub mod writer;
 
 pub use cnt_store::StoreError;
 pub use mmap_dict::{Candidate, MmapDict, PrefixHit};
-pub use model::{DictQuery, PinyinModel, DEFAULT_DICT_FILE, DEFAULT_USER_FILE, USER_BOOST};
+pub use model::{DEFAULT_DICT_FILE, DEFAULT_USER_FILE, DictQuery, PinyinModel, USER_BOOST};
 pub use user::UserDb;

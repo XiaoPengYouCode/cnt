@@ -10,8 +10,8 @@
 
 use cnt_input::Candidate;
 use cnt_score::{RescorePolicy, Rescorer, Segment, SentenceHyp};
-use fastrace::local::LocalSpan;
 use fastrace::Event;
+use fastrace::local::LocalSpan;
 
 /// 对 `scored`（按组排序）就地应用重排，**只在组内重排、不跨组**。
 ///
@@ -141,7 +141,12 @@ mod tests {
     fn rescoring_can_flip_close_candidates() {
         let mut scored = vec![(cand("先在", 2), -4.0), (cand("现在", 2), -4.2)];
         let policy = RescorePolicy::default();
-        assert!(apply(&Prefer("现在"), &policy, std::slice::from_ref(&(0..2)), &mut scored));
+        assert!(apply(
+            &Prefer("现在"),
+            &policy,
+            std::slice::from_ref(&(0..2)),
+            &mut scored
+        ));
         assert_eq!(scored[0].0.text, "现在");
     }
 
@@ -150,7 +155,12 @@ mod tests {
         // 分差 3.0 ≥ gap：不调用模型，顺序不变
         let mut scored = vec![(cand("现在", 2), -2.0), (cand("先在", 2), -5.0)];
         let policy = RescorePolicy::default();
-        assert!(!apply(&Prefer("先在"), &policy, std::slice::from_ref(&(0..2)), &mut scored));
+        assert!(!apply(
+            &Prefer("先在"),
+            &policy,
+            std::slice::from_ref(&(0..2)),
+            &mut scored
+        ));
         assert_eq!(scored[0].0.text, "现在");
     }
 
@@ -165,7 +175,12 @@ mod tests {
             (cand("现在", 2), -4.2),
             (cand("鲜在", 2), -4.3),
         ];
-        assert!(apply(&Prefer("鲜在"), &policy, std::slice::from_ref(&(0..3)), &mut scored));
+        assert!(apply(
+            &Prefer("鲜在"),
+            &policy,
+            std::slice::from_ref(&(0..3)),
+            &mut scored
+        ));
         // 窗口外的 鲜在 未参与，仍在最后；窗口内按模型分重排
         assert_eq!(scored[2].0.text, "鲜在");
     }

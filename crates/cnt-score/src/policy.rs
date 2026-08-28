@@ -90,8 +90,14 @@ mod tests {
     #[test]
     fn skips_when_baseline_is_confident() {
         let segs = [
-            Segment { pinyin: "xian", word: "现" },
-            Segment { pinyin: "zai", word: "在" },
+            Segment {
+                pinyin: "xian",
+                word: "现",
+            },
+            Segment {
+                pinyin: "zai",
+                word: "在",
+            },
         ];
         let p = RescorePolicy::default();
         // 分差 3.0 ≥ gap(1.5)：基线确定，不重排
@@ -102,7 +108,10 @@ mod tests {
 
     #[test]
     fn skips_single_segment_and_short_lists() {
-        let one = [Segment { pinyin: "shi", word: "是" }];
+        let one = [Segment {
+            pinyin: "shi",
+            word: "是",
+        }];
         let p = RescorePolicy::default();
         assert!(!p.should_rescore(&[hyp("是", &one, -1.0), hyp("时", &one, -1.1)]));
         assert!(!p.should_rescore(&[hyp("是", &one, -1.0)]));

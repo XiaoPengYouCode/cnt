@@ -50,11 +50,7 @@ fn user_words_appear_at_partial_input() {
     std::fs::create_dir_all(&dir).unwrap();
     let dict_path = dir.join("dict.cntd");
     let user_path = dir.join("user.dict");
-    writer::write_to_file(
-        &[("chi".to_string(), "持".to_string(), 100)],
-        &dict_path,
-    )
-    .unwrap();
+    writer::write_to_file(&[("chi".to_string(), "持".to_string(), 100)], &dict_path).unwrap();
     let m = PinyinModel::open(&dict_path, &user_path).unwrap();
     // 学习复合词
     m.bump("chijiuhua", "持久化");

@@ -76,8 +76,8 @@ pub fn lookup_table<'a>(
         .add_field(page_size)
         .add_field(cursor_pos)
         .add_field(cursor_visible)
-        .add_field(true)   // round
-        .add_field(0i32)   // orientation = IBUS_ORIENTATION_SYSTEM
+        .add_field(true) // round
+        .add_field(0i32) // orientation = IBUS_ORIENTATION_SYSTEM
         .add_field(cands)
         .add_field(labels);
     Value::Structure(sb.build().expect("build lookup table"))
@@ -190,7 +190,9 @@ pub fn find_address() -> Result<String, IbusError> {
     }
 
     let config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").map_err(|_| IbusError::NoHome).unwrap_or_default();
+        let home = std::env::var("HOME")
+            .map_err(|_| IbusError::NoHome)
+            .unwrap_or_default();
         format!("{home}/.config")
     });
     let bus_dir = format!("{config_home}/ibus/bus");

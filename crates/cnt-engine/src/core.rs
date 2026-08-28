@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use zbus::connection::Connection;
 
 use cnt_decode::Decoder;
-use cnt_input::{latin_before_cursor, EngineState, LearnedWord};
+use cnt_input::{EngineState, LearnedWord, latin_before_cursor};
 
 /// `IBus` 引擎接口名。
 pub(crate) const ENGINE_IFACE: &str = "org.freedesktop.IBus.Engine";
@@ -54,7 +54,12 @@ pub struct EngineCore {
 
 impl EngineCore {
     /// 新建内核。
-    pub(crate) const fn new(conn: Connection, path: String, decoder: Arc<Decoder>, page_size: usize) -> Self {
+    pub(crate) const fn new(
+        conn: Connection,
+        path: String,
+        decoder: Arc<Decoder>,
+        page_size: usize,
+    ) -> Self {
         Self {
             conn,
             path,

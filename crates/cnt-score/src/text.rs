@@ -117,7 +117,9 @@ pub fn score_text<L: NgramLm + ?Sized>(lm: &L, text: &str) -> TextScore {
     let mut end = n;
     // 反向可达（best[n] 有值即每一步都有前驱），但仍写成不会 panic 的形式
     while end > 0 {
-        let Some((_, start, id)) = best[end] else { break };
+        let Some((_, start, id)) = best[end] else {
+            break;
+        };
         if id.is_none() {
             oov_chars += end - start;
         }
@@ -135,7 +137,7 @@ pub fn score_text<L: NgramLm + ?Sized>(lm: &L, text: &str) -> TextScore {
 
 #[cfg(test)]
 mod tests {
-    use super::{score_text, OOV_CHAR_LOGP};
+    use super::{OOV_CHAR_LOGP, score_text};
     use crate::lm::{NgramLm, WordId};
 
     /// 假 LM：词表 + 手写 unigram/bigram，用来验证 DP 而不依赖真实模型。

@@ -28,4 +28,4 @@ pub mod text;
 pub use lm::{NgramLm, WordId};
 pub use policy::RescorePolicy;
 pub use rescore::{NoRescore, Rescorer, Segment, SentenceHyp};
-pub use text::{score_text, TextScore};
+pub use text::{TextScore, score_text};

@@ -30,19 +30,19 @@
 //! 属性带上音频长度、识别耗时与 RTF（实时率）。语音链路的性能判断全靠这棵树：
 //! 「慢」到底慢在采集尾巴、fbank 还是 encoder，不看 span 树只能猜。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fastrace::collector::SpanContext;
 use fastrace::local::LocalSpan;
 use fastrace::{Event, Span};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use cnt_asr::{AsrError, Punctuator, Recognizer, TextScorer};
 use cnt_audio::vad::{Segment, Segmenter, VadConfig};
-use cnt_audio::{samples_to_secs, AudioError, CaptureConfig, Recorder};
+use cnt_audio::{AudioError, CaptureConfig, Recorder, samples_to_secs};
 
 /// 编排线程的轮询间隔：足够细（不给尾字增加可感延迟），又不至于空转烧 CPU。
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -176,6 +176,18 @@ pub struct Voice {
     punct: String,
     rescorer: String,
     device: String,
+}
+
+/// 一次采集阶段的产出（会话收尾要用到的所有状态）。
+struct Captured {
+    /// PTT 模式：累积的整段音频（常开模式下为空）。
+    ptt_buffer: Vec<f32>,
+    /// 关麦时排空的尾部音频（PTT 用尽 / 常开 flush）。
+    tail: Vec<f32>,
+    /// 常开模式的切句器（收尾时 flush 最后一句）。
+    segmenter: Segmenter,
+    cancelled: bool,
+    quit: bool,
 }
 
 impl Voice {
@@ -333,9 +345,78 @@ impl Worker {
             self.active.store(false, Ordering::SeqCst);
             return;
         }
-        log::info!("voice: session started ({}, {})", mode.as_str(), self.recorder.device_name());
+        log::info!(
+            "voice: session started ({}, {})",
+            mode.as_str(),
+            self.recorder.device_name()
+        );
         let _ = tx.send(VoiceEvent::Started(mode));
 
+        let mut captured = self.collect(mode, tx, rx);
+
+        // 放弃：录到的音频直接丢掉，一个字都不上屏
+        if captured.cancelled {
+            log::info!(
+                "voice: cancelled, discarding {:.2}s of audio",
+                samples_to_secs(captured.ptt_buffer.len() + captured.tail.len())
+            );
+            drop(captured.tail);
+            drop(captured.ptt_buffer);
+            let _ = tx.send(VoiceEvent::Stopped);
+            self.active.store(false, Ordering::SeqCst);
+            return;
+        }
+        // ★ 用户真正感受到的延迟：**松手到上屏**。
+        //
+        // 此前只埋了 transcribe 的耗时，但那不是体验——从松手到文字出现之间还有
+        // 排空音频、标点、重排、事件传递。少埋这一段，就会出现「span 树看着很快、
+        // 人却觉得慢」的经典盲区。PTT 的预算是 300ms，管的是这个数字。
+        let commit = Span::root("voice_release_to_commit", SpanContext::random())
+            .with_property(|| ("mode", mode.as_str().to_owned()))
+            .with_property(|| ("cancelled", "false".to_owned()));
+        let released = Instant::now();
+        {
+            let _guard = commit.set_local_parent();
+            let _ = tx.send(VoiceEvent::Recognizing);
+            self.finish(
+                mode,
+                &mut captured.ptt_buffer,
+                &captured.tail,
+                &mut captured.segmenter,
+                tx,
+            );
+        }
+        commit.add_property(|| {
+            (
+                "elapsed_ms",
+                format!("{:.1}", released.elapsed().as_secs_f32() * 1000.0),
+            )
+        });
+        drop(commit);
+        log::info!(
+            "voice: release→commit {:.0}ms",
+            released.elapsed().as_secs_f32() * 1000.0
+        );
+
+        log::info!(
+            "voice: session ended after {:.1}s",
+            started.elapsed().as_secs_f32()
+        );
+        let _ = tx.send(VoiceEvent::Stopped);
+        self.active.store(false, Ordering::SeqCst);
+        if captured.quit {
+            // Quit 命令在会话中到达：结束线程（Voice 正在 drop）
+            self.recorder.stop().ok();
+        }
+    }
+
+    /// 采集阶段：循环读麦克风直到 Stop/Cancel/Quit，关麦后排空尾部。
+    fn collect(
+        &self,
+        mode: Mode,
+        tx: &UnboundedSender<VoiceEvent>,
+        rx: &SyncReceiver<Cmd>,
+    ) -> Captured {
         let mut segmenter = Segmenter::new(self.config.vad);
         let mut ptt_buffer: Vec<f32> = Vec::new();
         let max_samples = cnt_audio::secs_to_samples(self.config.max_seconds);
@@ -395,51 +476,17 @@ impl Worker {
             }
         }
 
-        // ---- 收尾：关麦克风 ----
+        // ---- 关麦克风 + 排空尾部 ----
         if let Err(e) = self.recorder.stop() {
             log::warn!("voice: stopping capture failed: {e}");
         }
         let tail = self.recorder.drain();
-
-        // 放弃：录到的音频直接丢掉，一个字都不上屏
-        if cancelled {
-            log::info!(
-                "voice: cancelled, discarding {:.2}s of audio",
-                samples_to_secs(recorded + tail.len())
-            );
-            drop(tail);
-            drop(ptt_buffer);
-            let _ = tx.send(VoiceEvent::Stopped);
-            self.active.store(false, Ordering::SeqCst);
-            return;
-        }
-        // ★ 用户真正感受到的延迟：**松手到上屏**。
-        //
-        // 此前只埋了 transcribe 的耗时，但那不是体验——从松手到文字出现之间还有
-        // 排空音频、标点、重排、事件传递。少埋这一段，就会出现「span 树看着很快、
-        // 人却觉得慢」的经典盲区。PTT 的预算是 300ms，管的是这个数字。
-        let commit = Span::root("voice_release_to_commit", SpanContext::random())
-            .with_property(|| ("mode", mode.as_str().to_owned()))
-            .with_property(|| ("cancelled", "false".to_owned()));
-        let released = Instant::now();
-        {
-            let _guard = commit.set_local_parent();
-            let _ = tx.send(VoiceEvent::Recognizing);
-            self.finish(mode, &mut ptt_buffer, &tail, &mut segmenter, tx);
-        }
-        commit.add_property(|| ("elapsed_ms", format!("{:.1}", released.elapsed().as_secs_f32() * 1000.0)));
-        drop(commit);
-        log::info!(
-            "voice: release→commit {:.0}ms",
-            released.elapsed().as_secs_f32() * 1000.0
-        );
-
-        log::info!("voice: session ended after {:.1}s", started.elapsed().as_secs_f32());
-        let _ = tx.send(VoiceEvent::Stopped);
-        self.active.store(false, Ordering::SeqCst);
-        if quit {
-            // Quit 命令在会话中到达：结束线程（Voice 正在 drop）
-            self.recorder.stop().ok();
+        Captured {
+            ptt_buffer,
+            tail,
+            segmenter,
+            cancelled,
+            quit,
         }
     }
 
@@ -562,7 +609,9 @@ impl Worker {
         drop(root);
         match result {
             Ok(t) if t.is_empty() => {
-                log::info!("voice: empty result ({audio_secs:.2}s audio, {elapsed:.2}s, rtf {rtf:.2})");
+                log::info!(
+                    "voice: empty result ({audio_secs:.2}s audio, {elapsed:.2}s, rtf {rtf:.2})"
+                );
                 let _ = tx.send(VoiceEvent::Empty);
             }
             Ok(t) => {

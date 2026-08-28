@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use crate::format::{
-    CandidateHeader, Entry, Header, CAND_HEADER_SIZE, ENTRY_SIZE, HEADER_SIZE, MAX_CANDIDATES,
+    CAND_HEADER_SIZE, CandidateHeader, ENTRY_SIZE, Entry, HEADER_SIZE, Header, MAX_CANDIDATES,
     MAX_ENTRIES, MAX_STRINGS_LEN,
 };
 
@@ -98,7 +98,9 @@ pub fn build(pairs: &[(String, String, u32)]) -> io::Result<Vec<u8>> {
         }
         cand_index = cand_index
             .checked_add(narrow(list.len(), "candidate count")?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "candidate index overflow"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "candidate index overflow")
+            })?;
     }
 
     // 4. 组装：header + entries + cands + strings
@@ -116,9 +118,8 @@ pub fn build(pairs: &[(String, String, u32)]) -> io::Result<Vec<u8>> {
         strings_offset,
         strings_len: narrow(strings_len, "strings pool")?,
     };
-    let mut out: Vec<u8> = Vec::with_capacity(
-        usize::try_from(strings_offset).unwrap_or(0) + strings.len(),
-    );
+    let mut out: Vec<u8> =
+        Vec::with_capacity(usize::try_from(strings_offset).unwrap_or(0) + strings.len());
     header.write(&mut out);
     out.extend_from_slice(&entries);
     out.extend_from_slice(&cands);

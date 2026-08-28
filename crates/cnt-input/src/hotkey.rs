@@ -143,7 +143,7 @@ pub fn keysym(name: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_release, mask, normalize_mods, Hotkey};
+    use super::{Hotkey, is_release, mask, normalize_mods};
 
     #[test]
     fn parses_single_modifier_key() {

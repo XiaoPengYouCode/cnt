@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use cnt_asr::TextScorer;
 use cnt_score::policy::user;
-use cnt_score::{score_text, NgramLm};
+use cnt_score::{NgramLm, score_text};
 
 /// 用户词至少这么长才参与加成（单字太容易误命中）。
 pub const MIN_USER_WORD_CHARS: usize = 2;

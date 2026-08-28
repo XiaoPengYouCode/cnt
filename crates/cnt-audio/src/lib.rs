@@ -15,7 +15,11 @@
 //! 全部发生在 [`Recorder`] 自己的采集线程内，外部只通过命令通道驱动。
 
 // 采样数 ↔ 秒的换算贯穿全 crate，转换是本质工作。
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
 pub mod resample;
 pub mod vad;
@@ -274,7 +278,9 @@ fn capture_loop(
 }
 
 /// 选设备 + 选配置：优先能直接给 16 kHz 的配置（省一次重采样）。
-fn open_device(config: &CaptureConfig) -> Result<(cpal::Device, SupportedStreamConfig), AudioError> {
+fn open_device(
+    config: &CaptureConfig,
+) -> Result<(cpal::Device, SupportedStreamConfig), AudioError> {
     let host = cpal::default_host();
     let device = match &config.device {
         Some(want) => host

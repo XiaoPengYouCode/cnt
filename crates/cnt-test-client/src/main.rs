@@ -69,20 +69,13 @@ fn spawn_signal_printer(conn: zbus::Connection) -> tokio::task::JoinHandle<()> {
                 continue;
             }
             match member.as_str() {
-                "CommitText" => {
-                    match msg.body().deserialize::<zbus::zvariant::Value>() {
-                        Ok(text) => println!("<< CommitText: {text:?}"),
-                        Err(e) => println!("<< CommitText (deserialize err: {e})"),
-                    }
-                }
+                "CommitText" => match msg.body().deserialize::<zbus::zvariant::Value>() {
+                    Ok(text) => println!("<< CommitText: {text:?}"),
+                    Err(e) => println!("<< CommitText (deserialize err: {e})"),
+                },
                 "UpdatePreeditText" => {
                     let body = msg.body();
-                    let r = body.deserialize::<(
-                        zbus::zvariant::Value,
-                        u32,
-                        bool,
-                        u32,
-                    )>();
+                    let r = body.deserialize::<(zbus::zvariant::Value, u32, bool, u32)>();
                     match r {
                         Ok((text, cursor, visible, mode)) => println!(
                             "<< UpdatePreeditText: text={text:?} cursor={cursor} visible={visible} mode={mode}"
@@ -91,10 +84,7 @@ fn spawn_signal_printer(conn: zbus::Connection) -> tokio::task::JoinHandle<()> {
                     }
                 }
                 "UpdateLookupTable" => {
-                    match msg
-                        .body()
-                        .deserialize::<(zbus::zvariant::Value, bool)>()
-                    {
+                    match msg.body().deserialize::<(zbus::zvariant::Value, bool)>() {
                         Ok((table, visible)) => {
                             println!("<< UpdateLookupTable: visible={visible} table={table:?}");
                         }
@@ -137,7 +127,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // use-global-engine 开启时，全局引擎会自动应用到聚焦的上下文；
     // 显式 SetEngine 会报错，因此忽略失败。
     if let Err(e) = conn
-        .call_method(Some(DAEMON), ic_path.as_str(), Some(IC_IFACE), "SetEngine", &("cnt",))
+        .call_method(
+            Some(DAEMON),
+            ic_path.as_str(),
+            Some(IC_IFACE),
+            "SetEngine",
+            &("cnt",),
+        )
         .await
     {
         println!("(SetEngine skipped: {e})");
@@ -145,8 +141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("engine set: cnt");
     }
 
-    conn.call_method(Some(DAEMON), ic_path.as_str(), Some(IC_IFACE), "FocusIn", &())
-        .await?;
+    conn.call_method(
+        Some(DAEMON),
+        ic_path.as_str(),
+        Some(IC_IFACE),
+        "FocusIn",
+        &(),
+    )
+    .await?;
     println!("focused");
 
     let sig_task = spawn_signal_printer(conn.clone());

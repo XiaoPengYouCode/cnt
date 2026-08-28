@@ -36,17 +36,33 @@ impl NgramLm for CntLm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::{build, Bigram, Unigram};
+    use crate::writer::{Bigram, Unigram, build};
 
     /// 端口实现与具体类型的方法语义一致，且 Katz backoff 走端口默认实现。
     #[test]
     fn port_matches_inherent_methods() {
         let unigrams = vec![
-            Unigram { word: "在".into(), logprob: -2.0, backoff: -0.5 },
-            Unigram { word: "现".into(), logprob: -3.0, backoff: -0.4 },
-            Unigram { word: "看".into(), logprob: -4.0, backoff: -0.3 },
+            Unigram {
+                word: "在".into(),
+                logprob: -2.0,
+                backoff: -0.5,
+            },
+            Unigram {
+                word: "现".into(),
+                logprob: -3.0,
+                backoff: -0.4,
+            },
+            Unigram {
+                word: "看".into(),
+                logprob: -4.0,
+                backoff: -0.3,
+            },
         ];
-        let bigrams = vec![Bigram { w1: "现".into(), w2: "在".into(), logprob: -0.1 }];
+        let bigrams = vec![Bigram {
+            w1: "现".into(),
+            w2: "在".into(),
+            logprob: -0.1,
+        }];
         let bytes = build(&unigrams, &bigrams).unwrap();
         let path = std::env::temp_dir().join(format!("cnt-lm-port-{}.cntl", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();

@@ -15,4 +15,4 @@ pub mod writer;
 
 pub use cnt_store::StoreError;
 pub use mmap::CntLm;
-pub use writer::{build, Bigram, Unigram};
+pub use writer::{Bigram, Unigram, build};

@@ -140,9 +140,7 @@ mod tests {
     /// 分块喂入与整块喂入结果一致（流式状态正确）。
     #[test]
     fn chunked_equals_whole() {
-        let signal: Vec<f32> = (0..8000)
-            .map(|i| (i as f32 * 0.01).sin() * 0.3)
-            .collect();
+        let signal: Vec<f32> = (0..8000).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
 
         let mut whole = Vec::new();
         Resampler::new(48_000, 16_000).process(&signal, &mut whole);

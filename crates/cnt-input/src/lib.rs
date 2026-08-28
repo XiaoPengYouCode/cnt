@@ -430,7 +430,8 @@ impl EngineState {
     /// 当前光标处的候选（若有）。
     #[must_use]
     pub fn selected(&self) -> Option<&Candidate> {
-        self.candidates.get(self.page * self.page_size + self.cursor)
+        self.candidates
+            .get(self.page * self.page_size + self.cursor)
     }
 
     /// 处理一个按键（keyval 为 keysym），返回动作。
@@ -721,17 +722,24 @@ mod tests {
 
     #[test]
     fn apostrophe_is_syllable_separator_while_composing() {
-        let src = TestSource { map: std::collections::HashMap::default() };
+        let src = TestSource {
+            map: std::collections::HashMap::default(),
+        };
         let mut st = EngineState::default();
         st.handle_key(keysym::A, &src, false);
         // 组合中 `'` = 分隔符：进 buffer，不触发标点（不提交、不输出引号）
-        assert_eq!(st.handle_key(keysym::APOSTROPHE, &src, false), Action::Handled);
+        assert_eq!(
+            st.handle_key(keysym::APOSTROPHE, &src, false),
+            Action::Handled
+        );
         assert_eq!(st.buffer, "a'");
     }
 
     #[test]
     fn apostrophe_is_smart_quote_when_not_composing() {
-        let src = TestSource { map: std::collections::HashMap::default() };
+        let src = TestSource {
+            map: std::collections::HashMap::default(),
+        };
         let mut st = EngineState::default();
         let act = st.handle_key(keysym::APOSTROPHE, &src, false);
         match act {
@@ -753,7 +761,10 @@ mod tests {
         match st.handle_key(keysym::SPACE, &d, false) {
             Action::Commit { text, learned } => {
                 assert_eq!(text, "你");
-                assert_eq!(learned, vec![LearnedWord::new("ni".to_string(), "你".to_string())]);
+                assert_eq!(
+                    learned,
+                    vec![LearnedWord::new("ni".to_string(), "你".to_string())]
+                );
             }
             other => panic!("expected commit, got {other:?}"),
         }
@@ -816,7 +827,10 @@ mod tests {
         match st.handle_key(0x33, &d, false) {
             Action::Commit { text, learned } => {
                 assert_eq!(text, third.text);
-                assert_eq!(learned, vec![LearnedWord::new("shi".to_string(), "事".to_string())]);
+                assert_eq!(
+                    learned,
+                    vec![LearnedWord::new("shi".to_string(), "事".to_string())]
+                );
             }
             other => panic!("expected commit, got {other:?}"),
         }
@@ -879,9 +893,7 @@ mod tests {
     fn digits_beyond_page_size_are_swallowed() {
         // page_size=8：`9`/`0` 落在本页之外 —— 既不得跳去选下一页的候选，
         // 也不得转发成数字插进正在组合的文本里
-        let words = vec![
-            "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
-        ];
+        let words = vec!["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"];
         let d = TestSource {
             map: std::collections::HashMap::from([("shi", words)]),
         };
@@ -961,7 +973,10 @@ mod tests {
         match st.handle_key(0x2c, &d, false) {
             Action::Commit { text, learned } => {
                 assert_eq!(text, "你，");
-                assert_eq!(learned, vec![LearnedWord::new("ni".to_string(), "你".to_string())]);
+                assert_eq!(
+                    learned,
+                    vec![LearnedWord::new("ni".to_string(), "你".to_string())]
+                );
             }
             other => panic!("expected commit, got {other:?}"),
         }
@@ -1016,7 +1031,10 @@ mod tests {
         type_pinyin(&mut st, &src, "nihaoshijie");
 
         // 选第 2 个候选（部分候选 你好）：不该上屏，而是确认 + 继续组合
-        assert_eq!(st.handle_key(keysym::DIGIT1 + 1, &src, false), Action::Handled);
+        assert_eq!(
+            st.handle_key(keysym::DIGIT1 + 1, &src, false),
+            Action::Handled
+        );
         assert_eq!(st.confirmed_text(), "你好");
         assert_eq!(st.buffer(), "shijie", "已确认的拼音要从未确认串里去掉");
         assert!(st.is_composing());
@@ -1287,7 +1305,10 @@ mod tests {
         st.toggle_mode(); // → English
         // 字母/空格/标点全部转发
         assert!(matches!(st.handle_key(0x6e, &d, false), Action::Forward)); // n
-        assert!(matches!(st.handle_key(keysym::SPACE, &d, false), Action::Forward));
+        assert!(matches!(
+            st.handle_key(keysym::SPACE, &d, false),
+            Action::Forward
+        ));
         assert!(matches!(st.handle_key(0x2c, &d, false), Action::Forward)); // ,
         assert!(!st.is_composing());
     }
@@ -1310,7 +1331,10 @@ mod tests {
             // Shift+n：提交预编辑 你，转发 N
             Action::CommitAndForward { text, learned } => {
                 assert_eq!(text, "你");
-                assert_eq!(learned, vec![LearnedWord::new("ni".to_string(), "你".to_string())]);
+                assert_eq!(
+                    learned,
+                    vec![LearnedWord::new("ni".to_string(), "你".to_string())]
+                );
             }
             other => panic!("expected CommitAndForward, got {other:?}"),
         }
@@ -1325,7 +1349,10 @@ mod tests {
         st.handle_key(0x69, &d, false); // ni → 你
         let commit = st.toggle_mode().unwrap();
         assert_eq!(commit.0, "你");
-        assert_eq!(commit.1, vec![LearnedWord::new("ni".to_string(), "你".to_string())]);
+        assert_eq!(
+            commit.1,
+            vec![LearnedWord::new("ni".to_string(), "你".to_string())]
+        );
         assert!(!st.is_composing());
         assert_eq!(st.mode(), InputMode::English);
     }

@@ -55,7 +55,10 @@ mod tests {
         assert_eq!(read_u16(&b[..2]), 0x_1234);
         assert_eq!(read_u32(&b[2..6]), 0x_dead_beef);
         assert_eq!(read_u64(&b[6..14]), 0x1234_5678_9abc_def0);
-        assert_eq!(read_f32(&(-3.0f32).to_le_bytes()).to_bits(), (-3.0f32).to_bits());
+        assert_eq!(
+            read_f32(&(-3.0f32).to_le_bytes()).to_bits(),
+            (-3.0f32).to_bits()
+        );
     }
 
     #[test]

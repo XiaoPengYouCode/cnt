@@ -9,7 +9,7 @@ use zbus::connection::Builder;
 
 use cnt_config::Config as AppConfig;
 use cnt_decode::Decoder;
-use cnt_dict::{PinyinModel, DEFAULT_DICT_FILE, DEFAULT_USER_FILE};
+use cnt_dict::{DEFAULT_DICT_FILE, DEFAULT_USER_FILE, PinyinModel};
 use cnt_engine::{Factory, VoiceRuntime};
 use cnt_lm::CntLm;
 use cnt_store::StoreError;
@@ -73,26 +73,18 @@ fn data_dir() -> PathBuf {
 
 /// 词库路径：`CNT_DICT` 环境变量优先，否则默认用户数据目录。
 fn dict_path() -> PathBuf {
-    std::env::var_os("CNT_DICT").map_or_else(
-        || data_dir().join(DEFAULT_DICT_FILE),
-        PathBuf::from,
-    )
+    std::env::var_os("CNT_DICT").map_or_else(|| data_dir().join(DEFAULT_DICT_FILE), PathBuf::from)
 }
 
 /// 用户数据路径：`CNT_USER_DB` 环境变量优先，否则默认用户数据目录。
 fn user_path() -> PathBuf {
-    std::env::var_os("CNT_USER_DB").map_or_else(
-        || data_dir().join(DEFAULT_USER_FILE),
-        PathBuf::from,
-    )
+    std::env::var_os("CNT_USER_DB")
+        .map_or_else(|| data_dir().join(DEFAULT_USER_FILE), PathBuf::from)
 }
 
 /// 语言模型路径：`CNT_LM` 环境变量优先，否则默认用户数据目录。
 fn lm_path() -> PathBuf {
-    std::env::var_os("CNT_LM").map_or_else(
-        || data_dir().join(DEFAULT_LM_FILE),
-        PathBuf::from,
-    )
+    std::env::var_os("CNT_LM").map_or_else(|| data_dir().join(DEFAULT_LM_FILE), PathBuf::from)
 }
 
 /// 加载词库、用户数据与语言模型，构造解码器（返回解码器 + LM 供语音侧复用）。
@@ -190,7 +182,11 @@ fn load_punctuator(settings: &cnt_config::VoiceSettings) -> Arc<dyn cnt_asr::Pun
         PathBuf::from,
     );
     let int8 = dir.join("model.int8.onnx");
-    let model = if int8.exists() { int8 } else { dir.join("model.onnx") };
+    let model = if int8.exists() {
+        int8
+    } else {
+        dir.join("model.onnx")
+    };
     if !model.exists() {
         log::warn!(
             "voice: punctuation model not found in {} (run scripts/fetch-asr-model.sh); \
@@ -202,7 +198,9 @@ fn load_punctuator(settings: &cnt_config::VoiceSettings) -> Arc<dyn cnt_asr::Pun
     match CtPunctuator::open(&model, settings.threads) {
         Ok(p) => Arc::new(p),
         Err(e) => {
-            log::error!("voice: cannot load punctuation model: {e}; output will have no punctuation");
+            log::error!(
+                "voice: cannot load punctuation model: {e}; output will have no punctuation"
+            );
             Arc::new(cnt_asr::NoPunct)
         }
     }
@@ -213,8 +211,8 @@ fn load_voice(
     scorer: Option<Arc<dyn cnt_asr::TextScorer>>,
 ) -> Option<Arc<VoiceRuntime>> {
     use cnt_asr_onnx::{SenseVoice, SenseVoiceConfig};
-    use cnt_audio::vad::VadConfig;
     use cnt_audio::CaptureConfig;
+    use cnt_audio::vad::VadConfig;
     use cnt_voice::{Voice, VoiceConfig};
 
     if !settings.enabled {
@@ -286,7 +284,8 @@ async fn main() -> Result<(), DaemonError> {
     let (decoder, model, lm) = load_decoder();
 
     // 加载配置（TOML，仅候选词数一项）
-    let config_path = std::env::var_os("CNT_CONFIG").map_or_else(AppConfig::default_path, PathBuf::from);
+    let config_path =
+        std::env::var_os("CNT_CONFIG").map_or_else(AppConfig::default_path, PathBuf::from);
     let config = match AppConfig::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -294,7 +293,11 @@ async fn main() -> Result<(), DaemonError> {
             AppConfig::default()
         }
     };
-    log::info!("config: {} (page_size={})", config_path.display(), config.page_size);
+    log::info!(
+        "config: {} (page_size={})",
+        config_path.display(),
+        config.page_size
+    );
 
     // 语音输入（可选；模型加载在这里同步做一次，失败只是没有语音）
     let rescorer = load_rescorer(lm.as_ref(), &model);
@@ -345,10 +348,10 @@ async fn main() -> Result<(), DaemonError> {
         "0.1.0",
         "MIT",
         "cnt",
-        "",             // homepage
-        &exec_path,    // exec：本程序路径，ibus 需要时可重新拉起
-        "",             // textdomain
-        vec![],         // observed_paths
+        "",         // homepage
+        &exec_path, // exec：本程序路径，ibus 需要时可重新拉起
+        "",         // textdomain
+        vec![],     // observed_paths
         engines,
     );
 

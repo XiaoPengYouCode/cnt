@@ -86,9 +86,7 @@ impl Tokens {
         let meta: Vec<bool> = table.iter().map(|t| is_meta_bytes(t)).collect();
         let blank = table
             .iter()
-            .position(|t| {
-                std::str::from_utf8(t).is_ok_and(|s| BLANK_NAMES.contains(&s))
-            })
+            .position(|t| std::str::from_utf8(t).is_ok_and(|s| BLANK_NAMES.contains(&s)))
             .unwrap_or(0);
 
         Some(Self {
@@ -220,12 +218,13 @@ pub fn greedy_decode(logits: &[f32], vocab: usize, blank: usize) -> Vec<usize> {
     let mut out = Vec::new();
     let mut prev = usize::MAX;
     for frame in logits.chunks_exact(vocab) {
-        let (best, _) = frame
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |acc, (i, v)| {
-                if *v > acc.1 { (i, *v) } else { acc }
-            });
+        let (best, _) =
+            frame
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |acc, (i, v)| {
+                    if *v > acc.1 { (i, *v) } else { acc }
+                });
         if best != blank && best != prev {
             out.push(best);
         }
@@ -233,7 +232,6 @@ pub fn greedy_decode(logits: &[f32], vocab: usize, blank: usize) -> Vec<usize> {
     }
     out
 }
-
 
 /// CTC prefix beam search 的束宽（候选前缀数）。
 ///
@@ -373,7 +371,7 @@ fn log_add(a: f32, b: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{greedy_decode, Tokens};
+    use super::{Tokens, greedy_decode};
 
     fn frame(vocab: usize, hot: usize) -> Vec<f32> {
         let mut f = vec![0.0; vocab];

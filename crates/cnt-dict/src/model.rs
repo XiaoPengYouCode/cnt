@@ -11,9 +11,9 @@ use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
-use cnt_store::StoreError;
 use crate::mmap_dict::MmapDict;
 use crate::user::UserDb;
+use cnt_store::StoreError;
 
 /// 单次查询返回的候选上限。
 pub const QUERY_LIMIT: usize = 50;
@@ -89,9 +89,13 @@ impl PinyinModel {
     }
 
     pub fn query(&self, pinyin: &str) -> Vec<String> {
-        let user = self.user.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let user = self
+            .user
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // word -> (score, 是否精确匹配；精确匹配在平分时优先)
-        let mut scored: std::collections::HashMap<String, (u64, bool)> = std::collections::HashMap::new();
+        let mut scored: std::collections::HashMap<String, (u64, bool)> =
+            std::collections::HashMap::new();
 
         for c in self.dict.exact(pinyin) {
             let cnt = user.count(pinyin, c.word);
@@ -118,10 +122,8 @@ impl PinyinModel {
         }
         drop(user); // 锁只覆盖计数读取阶段，排序前释放
 
-        let mut out: Vec<(String, u64, bool)> = scored
-            .into_iter()
-            .map(|(w, (s, e))| (w, s, e))
-            .collect();
+        let mut out: Vec<(String, u64, bool)> =
+            scored.into_iter().map(|(w, (s, e))| (w, s, e)).collect();
         out.sort_by(|a, b| {
             b.1.cmp(&a.1) // 分数降序
                 .then_with(|| b.2.cmp(&a.2)) // 平分时精确优先
@@ -249,7 +251,10 @@ impl PinyinModel {
     /// # Errors
     /// 写盘失败（IO）时返回错误。
     pub fn flush_user(&self) -> io::Result<()> {
-        self.user.lock().unwrap_or_else(std::sync::PoisonError::into_inner).flush()
+        self.user
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush()
     }
 }
 
@@ -313,10 +318,7 @@ mod tests {
 
     #[test]
     fn user_boost_promotes_selected_word() {
-        let m = model_with(
-            "boost",
-            &[("zhan", "站", 900), ("zhan", "栈", 100)],
-        );
+        let m = model_with("boost", &[("zhan", "站", 900), ("zhan", "栈", 100)]);
         assert_eq!(m.query("zhan"), vec!["站", "栈"]);
         m.bump("zhan", "栈");
         m.bump("zhan", "栈");
@@ -328,11 +330,7 @@ mod tests {
     fn prefix_and_exact_dedup() {
         let m = model_with(
             "dedup",
-            &[
-                ("ni", "你", 900),
-                ("nihao", "你好", 800),
-                ("ni", "泥", 100),
-            ],
+            &[("ni", "你", 900), ("nihao", "你好", 800), ("ni", "泥", 100)],
         );
         let q = m.query("ni");
         assert!(q.contains(&"你".to_string()));

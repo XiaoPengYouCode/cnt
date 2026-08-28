@@ -5,11 +5,11 @@
 
 use std::path::Path;
 
-use cnt_store::{StoreError, validate_regions, MmapFile};
 use crate::format::{
-    BigramEntry, WordEntry, BIGRAM_ENTRY_SIZE, MAX_BIGRAMS, MAX_STRINGS_LEN, MAX_WORDS,
-    WORD_ENTRY_SIZE,
+    BIGRAM_ENTRY_SIZE, BigramEntry, MAX_BIGRAMS, MAX_STRINGS_LEN, MAX_WORDS, WORD_ENTRY_SIZE,
+    WordEntry,
 };
+use cnt_store::{MmapFile, StoreError, validate_regions};
 
 pub struct CntLm {
     mmap: MmapFile,
@@ -66,8 +66,16 @@ impl CntLm {
         validate_regions(
             len,
             &[
-                (self.unigram_off, self.word_count * WORD_ENTRY_SIZE, "unigrams"),
-                (self.bigram_off, self.bigram_count * BIGRAM_ENTRY_SIZE, "bigrams"),
+                (
+                    self.unigram_off,
+                    self.word_count * WORD_ENTRY_SIZE,
+                    "unigrams",
+                ),
+                (
+                    self.bigram_off,
+                    self.bigram_count * BIGRAM_ENTRY_SIZE,
+                    "bigrams",
+                ),
                 (self.strings_off, self.strings_len, "strings"),
             ],
         )
@@ -268,7 +276,7 @@ impl CntLm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::{build, Bigram, Unigram};
+    use crate::writer::{Bigram, Unigram, build};
 
     fn lm_with(name: &str, unigrams: &[Unigram], bigrams: &[Bigram]) -> CntLm {
         let bytes = build(unigrams, bigrams).unwrap();
@@ -306,10 +314,7 @@ mod tests {
                 u("中国", -2.84, -0.46),
                 u("是", -1.94, -0.41),
             ],
-            &[
-                b("中国", "是", -0.5),
-                b("我们", "是", -0.8),
-            ],
+            &[b("中国", "是", -0.5), b("我们", "是", -0.8)],
         );
         assert_eq!(lm.word_count(), 4);
         assert_eq!(lm.bigram_count(), 2);

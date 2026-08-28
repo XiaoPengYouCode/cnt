@@ -35,9 +35,9 @@ use fastrace::local::LocalSpan;
 use ort::session::{Session, SessionInputValue};
 use ort::value::{Tensor, TensorElementType, Value, ValueType};
 
-use cnt_asr::{AsrError, Recognizer, Transcript, SAMPLE_RATE};
+use cnt_asr::{AsrError, Recognizer, SAMPLE_RATE, Transcript};
 
-use crate::ctc::{prefix_beam_search, Tokens, PREFIX_BEAM};
+use crate::ctc::{PREFIX_BEAM, Tokens, prefix_beam_search};
 use crate::fbank::{Fbank, FbankOptions};
 use crate::frontend::{Cmvn, Lfr};
 
@@ -162,7 +162,9 @@ impl SenseVoice {
 
         let mut builder = Session::builder().map_err(ort_err)?;
         if config.threads > 0 {
-            builder = builder.with_intra_threads(config.threads).map_err(ort_err)?;
+            builder = builder
+                .with_intra_threads(config.threads)
+                .map_err(ort_err)?;
         }
         let session = builder
             .commit_from_file(&config.model)
@@ -202,7 +204,11 @@ impl SenseVoice {
                     .map(|(_, v)| *v)
             })
             .ok_or_else(|| AsrError::Config(format!("unknown language: {}", config.language)))?;
-        let textnorm_key = if config.itn { "with_itn" } else { "without_itn" };
+        let textnorm_key = if config.itn {
+            "with_itn"
+        } else {
+            "without_itn"
+        };
         let textnorm_id = get(textnorm_key)
             .and_then(|v| v.trim().parse::<i64>().ok())
             .unwrap_or(if config.itn {
@@ -231,7 +237,11 @@ impl SenseVoice {
         log::info!(
             "asr backend: {name}; vocab={} ({}), blank={}, lfr=({},{}), cmvn={}, scale={sample_scale}",
             tokens.len(),
-            if tokens.is_base64() { "base64 byte-BPE" } else { "plain" },
+            if tokens.is_base64() {
+                "base64 byte-BPE"
+            } else {
+                "plain"
+            },
             tokens.blank_id(),
             lfr.window,
             lfr.shift,
@@ -383,7 +393,10 @@ impl Recognizer for SenseVoice {
             .filter_map(|id| self.tokens.get(*id))
             .collect::<Vec<_>>();
         Ok(Transcript {
-            text: alternatives.first().map(|a| a.text.clone()).unwrap_or_default(),
+            text: alternatives
+                .first()
+                .map(|a| a.text.clone())
+                .unwrap_or_default(),
             tokens,
             language,
             alternatives,

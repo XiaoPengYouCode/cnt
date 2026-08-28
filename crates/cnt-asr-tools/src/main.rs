@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use cnt_asr::{AsrError, Punctuator, Recognizer, SAMPLE_RATE};
 use cnt_asr_onnx::punct::CtPunctuator;
 use cnt_asr_onnx::{SenseVoice, SenseVoiceConfig};
-use cnt_audio::{samples_to_secs, CaptureConfig, Recorder, Resampler};
+use cnt_audio::{CaptureConfig, Recorder, Resampler, samples_to_secs};
 use cnt_voice::{Mode, Voice, VoiceConfig, VoiceEvent};
 
 /// CLI 错误。
@@ -205,7 +205,11 @@ fn load_punct(acoustic_dir: &str, args: &Args) -> Option<Box<dyn Punctuator>> {
         std::path::PathBuf::from,
     );
     let int8 = dir.join("model.int8.onnx");
-    let model = if int8.exists() { int8 } else { dir.join("model.onnx") };
+    let model = if int8.exists() {
+        int8
+    } else {
+        dir.join("model.onnx")
+    };
     if !model.exists() {
         eprintln!("（未找到标点模型 {}，输出将没有标点）", model.display());
         return None;
@@ -295,11 +299,22 @@ fn cmd_info(args: &[String]) -> CliResult {
     }
 
     let tokens = cnt_asr_onnx::ctc::Tokens::load(&cfg.tokens)?;
-    println!("词表     : {} 个 token（{}）", tokens.len(), cfg.tokens.display());
+    println!(
+        "词表     : {} 个 token（{}）",
+        tokens.len(),
+        cfg.tokens.display()
+    );
     println!("  id 0    = {:?}", tokens.get(0));
     println!("  末尾    = {:?}", tokens.get(tokens.len() - 1));
     println!("  blank   = {:?}", tokens.blank_id());
-    println!("  编码    = {}", if tokens.is_base64() { "base64（字节级 BPE）" } else { "明文" });
+    println!(
+        "  编码    = {}",
+        if tokens.is_base64() {
+            "base64（字节级 BPE）"
+        } else {
+            "明文"
+        }
+    );
     Ok(())
 }
 
@@ -318,10 +333,8 @@ fn cmd_transcribe(args: &[String]) -> CliResult {
     for file in files {
         let samples = read_wav(file)?;
         let secs = samples_to_secs(samples.len());
-        let root = fastrace::Span::root(
-            "cli_transcribe",
-            fastrace::collector::SpanContext::random(),
-        );
+        let root =
+            fastrace::Span::root("cli_transcribe", fastrace::collector::SpanContext::random());
         let guard = root.set_local_parent();
         let t = Instant::now();
         let mut result = model.transcribe(&samples)?;
@@ -430,7 +443,9 @@ fn cmd_bench(args: &[String]) -> CliResult {
     );
     println!();
     println!("fastrace 阶段分解（首轮 span 树）：");
-    let table = stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let table = stats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut names: Vec<&String> = table.by_name.keys().collect();
     names.sort_by_key(|n| stage_rank(n));
     for name in names {
@@ -477,7 +492,11 @@ fn cmd_record(args: &[String]) -> CliResult {
     eprintln!(
         "已写入 {out}：{:.2}s（采集 {total} 样本{}）",
         samples_to_secs(samples.len()),
-        if overflow { "，发生过缓冲溢出" } else { "" }
+        if overflow {
+            "，发生过缓冲溢出"
+        } else {
+            ""
+        }
     );
     Ok(())
 }
@@ -501,9 +520,16 @@ fn cmd_live(args: &[String]) -> CliResult {
     };
 
     // live 也走标点：和引擎里的链路一致，才能拿它当预演
-    let punct: Arc<dyn Punctuator> = load_punct(dir, &args)
-        .map_or_else(|| Arc::new(cnt_asr::NoPunct) as Arc<dyn Punctuator>, Arc::from);
-    let voice = Voice::new(Arc::new(model), punct, load_rescorer(&args), VoiceConfig::default())?;
+    let punct: Arc<dyn Punctuator> = load_punct(dir, &args).map_or_else(
+        || Arc::new(cnt_asr::NoPunct) as Arc<dyn Punctuator>,
+        Arc::from,
+    );
+    let voice = Voice::new(
+        Arc::new(model),
+        punct,
+        load_rescorer(&args),
+        VoiceConfig::default(),
+    )?;
     eprintln!(
         "⚠ 即将打开麦克风（{}，{secs:.1}s；设备：{}）",
         mode.as_str(),

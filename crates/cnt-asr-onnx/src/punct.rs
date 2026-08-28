@@ -144,7 +144,9 @@ impl CtPunctuator {
                 lens_dtype = *ty;
             }
         }
-        log::info!("punct model inputs: {ids_input} / {lens_input} ({lens_dtype:?}), classes={puncts:?}");
+        log::info!(
+            "punct model inputs: {ids_input} / {lens_input} ({lens_dtype:?}), classes={puncts:?}"
+        );
 
         let name = format!(
             "ct-punct({})",
@@ -359,7 +361,10 @@ fn join(words: &[Word<'_>], classes: &[usize], puncts: &[String]) -> String {
         {
             // 纯拉丁语境用半角：模型是中英混合训练的，但类别表只有全角标点，
             // 英文句子后面跟一个「。」很刺眼（实测 en.wav 就是这样）
-            let latin = word.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+            let latin = word
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric());
             match (latin, narrow(p)) {
                 (true, Some(half)) => out.push_str(half),
                 _ => out.push_str(p),
@@ -401,7 +406,10 @@ mod tests {
 
     #[test]
     fn splits_chinese_by_character() {
-        assert_eq!(texts(&split_words("你好世界")), vec!["你", "好", "世", "界"]);
+        assert_eq!(
+            texts(&split_words("你好世界")),
+            vec!["你", "好", "世", "界"]
+        );
     }
 
     #[test]
@@ -441,10 +449,7 @@ mod tests {
         // 只加标点，不动空格（端口契约）
         let puncts = vec!["_".to_owned(), "。".to_owned()];
         let words = [w("조금만", false), w("생각을", true), w("하면서", true)];
-        assert_eq!(
-            join(&words, &[0, 0, 1], &puncts),
-            "조금만 생각을 하면서。"
-        );
+        assert_eq!(join(&words, &[0, 0, 1], &puncts), "조금만 생각을 하면서。");
     }
 
     #[test]
@@ -464,13 +469,21 @@ mod tests {
             w("错", false),
         ];
         // 「今天天气」后逗号，末尾句号
-        assert_eq!(join(&words, &[0, 0, 0, 1, 0, 2], &puncts), "今天天气，不错。");
+        assert_eq!(
+            join(&words, &[0, 0, 0, 1, 0, 2], &puncts),
+            "今天天气，不错。"
+        );
     }
 
     #[test]
     fn join_keeps_latin_word_spacing() {
         let puncts = vec!["_".to_owned(), "，".to_owned()];
-        let words = [w("hello", false), w("world", true), w("你", false), w("好", false)];
+        let words = [
+            w("hello", false),
+            w("world", true),
+            w("你", false),
+            w("好", false),
+        ];
         // 英文词后面的逗号用半角；空格来自原文
         assert_eq!(join(&words, &[0, 1, 0, 0], &puncts), "hello world,你好");
     }
@@ -525,6 +538,9 @@ mod tests {
     fn join_tolerates_short_class_list() {
         // 类别数组比词短（不该发生）也不 panic
         let puncts = vec!["_".to_owned()];
-        assert_eq!(join(&[w("你", false), w("好", false)], &[0], &puncts), "你好");
+        assert_eq!(
+            join(&[w("你", false), w("好", false)], &[0], &puncts),
+            "你好"
+        );
     }
 }

@@ -42,9 +42,7 @@ impl CountsOf<'_> {
     /// 该拼音下某个词的有效计数（已按半衰期衰减）。
     #[must_use]
     pub fn get(&self, word: &str) -> u32 {
-        self.0
-            .and_then(|m| m.get(word))
-            .map_or(0, effective_u32)
+        self.0.and_then(|m| m.get(word)).map_or(0, effective_u32)
     }
 }
 
@@ -101,17 +99,14 @@ impl UserDb {
                     .next()
                     .and_then(|c| c.trim().parse::<u8>().ok())
                     .is_none_or(|c| c != 0);
-                counts
-                    .entry(pinyin.to_string())
-                    .or_default()
-                    .insert(
-                        word.to_string(),
-                        Entry {
-                            count: count.min(MAX_COUNT),
-                            updated_at,
-                            confirmed,
-                        },
-                    );
+                counts.entry(pinyin.to_string()).or_default().insert(
+                    word.to_string(),
+                    Entry {
+                        count: count.min(MAX_COUNT),
+                        updated_at,
+                        confirmed,
+                    },
+                );
             }
         }
         Ok(Self {
@@ -137,7 +132,8 @@ impl UserDb {
         let mut out: Vec<(String, String, u32)> = self
             .keys_with_prefix(prefix)
             .flat_map(|(p, m)| {
-                m.iter().map(move |(w, e)| (p.clone(), w.clone(), effective_u32(e)))
+                m.iter()
+                    .map(move |(w, e)| (p.clone(), w.clone(), effective_u32(e)))
             })
             .collect();
         out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
@@ -178,7 +174,10 @@ impl UserDb {
         prefix: &str,
     ) -> impl Iterator<Item = (&String, &HashMap<String, Entry>)> {
         self.counts
-            .range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
             .take_while(move |(p, _)| p.starts_with(prefix))
     }
 
@@ -207,7 +206,10 @@ impl UserDb {
     pub fn bump(&mut self, pinyin: &str, word: &str, known: bool) {
         let now = now_secs();
         // 新词且已达上限：先淘汰（避免持内层借用时调用 evict）
-        let is_new = self.counts.get(pinyin).is_none_or(|m| !m.contains_key(word));
+        let is_new = self
+            .counts
+            .get(pinyin)
+            .is_none_or(|m| !m.contains_key(word));
         if is_new && self.len() >= MAX_USER_ENTRIES {
             self.evict_lowest();
             if self.len() >= MAX_USER_ENTRIES {
@@ -227,7 +229,11 @@ impl UserDb {
         } else {
             inner.insert(
                 word.to_string(),
-                Entry { count: 1, updated_at: now, confirmed: known },
+                Entry {
+                    count: 1,
+                    updated_at: now,
+                    confirmed: known,
+                },
             );
         }
         self.dirty = true;
@@ -342,7 +348,11 @@ fn decayed(e: &Entry) -> f32 {
 #[allow(clippy::cast_precision_loss)]
 fn effective(e: &Entry) -> f32 {
     let d = decayed(e);
-    if e.confirmed { d } else { d * UNCONFIRMED_DISCOUNT }
+    if e.confirmed {
+        d
+    } else {
+        d * UNCONFIRMED_DISCOUNT
+    }
 }
 
 /// 有效计数的整数形式（衰减值 ≥ 0，截断/符号丢失在此是预期语义）。
@@ -443,7 +453,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(best.map(|(p, w, _)| (p, w)), Some(("b".into(), "词B".into())));
+        assert_eq!(
+            best.map(|(p, w, _)| (p, w)),
+            Some(("b".into(), "词B".into()))
+        );
     }
 
     #[test]

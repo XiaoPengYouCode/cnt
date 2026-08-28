@@ -253,7 +253,7 @@ fn mel_banks(opts: &FbankOptions, fft_size: usize) -> Vec<MelBank> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hz_to_mel, mel_banks, povey_window, Fbank, FbankOptions};
+    use super::{Fbank, FbankOptions, hz_to_mel, mel_banks, povey_window};
 
     #[test]
     fn frame_count_follows_kaldi_snip_edges() {
@@ -268,9 +268,7 @@ mod tests {
     #[test]
     fn output_shape_is_frames_times_bins() {
         let fb = Fbank::new(FbankOptions::default());
-        let samples: Vec<f32> = (0..16_000)
-            .map(|i| (i as f32 * 0.05).sin() * 0.2)
-            .collect();
+        let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
         let feats = fb.compute(&samples);
         assert_eq!(feats.len(), 98 * 80);
         assert!(feats.iter().all(|v| v.is_finite()));

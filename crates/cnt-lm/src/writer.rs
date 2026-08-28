@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use crate::format::{
-    BigramEntry, Header, WordEntry, BIGRAM_ENTRY_SIZE, HEADER_SIZE, MAX_BIGRAMS, MAX_STRINGS_LEN,
-    MAX_WORDS, WORD_ENTRY_SIZE,
+    BIGRAM_ENTRY_SIZE, BigramEntry, HEADER_SIZE, Header, MAX_BIGRAMS, MAX_STRINGS_LEN, MAX_WORDS,
+    WORD_ENTRY_SIZE, WordEntry,
 };
 
 /// 一个 unigram 词条（logprob/backoff 均为 log10）。
@@ -53,7 +53,9 @@ pub fn build(unigrams: &[Unigram], bigrams: &[Bigram]) -> io::Result<Vec<u8>> {
     // 1. unigram 表：按 word 排序 + 去重 + 编下标
     let mut sorted: BTreeMap<&str, (f32, f32)> = BTreeMap::new();
     for u in unigrams {
-        sorted.entry(u.word.as_str()).or_insert((u.logprob, u.backoff));
+        sorted
+            .entry(u.word.as_str())
+            .or_insert((u.logprob, u.backoff));
     }
     let word_count = sorted.len();
     if word_count > MAX_WORDS {
@@ -115,7 +117,12 @@ pub fn build(unigrams: &[Unigram], bigrams: &[Bigram]) -> io::Result<Vec<u8>> {
     // 5. bigram 表
     let mut bg: Vec<u8> = Vec::with_capacity(bigram_count * BIGRAM_ENTRY_SIZE);
     for ((w1, w2), logprob) in &bigram_map {
-        BigramEntry { w1: *w1, w2: *w2, logprob: *logprob }.write(&mut bg);
+        BigramEntry {
+            w1: *w1,
+            w2: *w2,
+            logprob: *logprob,
+        }
+        .write(&mut bg);
     }
 
     // 6. 组装

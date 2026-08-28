@@ -216,8 +216,7 @@ impl VoiceSettings {
 #[allow(clippy::cast_precision_loss)]
 fn number(v: Option<&toml::Value>) -> Option<f64> {
     let v = v?;
-    v.as_float()
-        .or_else(|| v.as_integer().map(|i| i as f64))
+    v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
 }
 
 /// 展开路径开头的 `~`（配置文件里写 `~/...` 是人的习惯，不能当相对路径）。

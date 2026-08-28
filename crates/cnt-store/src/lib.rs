@@ -10,4 +10,4 @@ pub mod mmap;
 
 pub use bytes::{narrow, read_f32, read_u16, read_u32, read_u64};
 pub use error::StoreError;
-pub use mmap::{validate_regions, MmapFile};
+pub use mmap::{MmapFile, validate_regions};

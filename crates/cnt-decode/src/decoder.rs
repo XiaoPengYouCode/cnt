@@ -16,12 +16,14 @@
 use std::sync::Arc; // 同时用于 Decoder 与 Hyp 段
 
 use cnt_dict::PinyinModel;
-use cnt_lm::CntLm;
 use cnt_input::{Candidate, CandidateSource, LearnedWord};
+use cnt_lm::CntLm;
 use cnt_score::{NgramLm, RescorePolicy, Rescorer};
 use fastrace::local::LocalSpan;
 
-use crate::syllable::{SyllableEdge, SyllableTable, SYLLABLE_SEPARATOR, MAX_FUZZY_COST, strip_separators};
+use crate::syllable::{
+    MAX_FUZZY_COST, SYLLABLE_SEPARATOR, SyllableEdge, SyllableTable, strip_separators,
+};
 
 /// beam 宽度：同时保留的假设数。
 const BEAM: usize = 8;
@@ -547,8 +549,7 @@ impl<L: NgramLm> Decoder<L> {
         // 组边界（rescore 只允许组内重排）：组间是硬顺序，模型融合分不能破坏它 ——
         // 否则降级的拼接候选会被神经模型抬回整词上方，整词优先的结构保证就漏了。
         let groups = group_ranges(&out, &group);
-        let mut out: Vec<(Candidate, f32)> =
-            out.into_iter().map(|s| (s.cand, s.score)).collect();
+        let mut out: Vec<(Candidate, f32)> = out.into_iter().map(|s| (s.cand, s.score)).collect();
         // 神经重排（可选）：仅在基线不确定时对组内前 top_n 条重排；
         // 未装重排器时这里完全不产生开销。
         if let Some(rescorer) = &self.rescorer {
@@ -636,7 +637,11 @@ impl<L: NgramLm> Decoder<L> {
         let mut completions: Vec<(String, String)> = Vec::new();
         if max_pos == pinyin.len() {
             // 完整输入：末音节可延长（chijiuhu 的 hu → hua）
-            for e in lattice.iter().flatten().filter(|e| e.end == pinyin.len() && !e.is_fuzzy()) {
+            for e in lattice
+                .iter()
+                .flatten()
+                .filter(|e| e.end == pinyin.len() && !e.is_fuzzy())
+            {
                 let base = &pinyin[..e.end - e.syl.len()];
                 for ext in self.syllables.syllables_with_prefix(e.syl) {
                     completions.push((base.to_string(), ext.to_string()));
@@ -760,7 +765,9 @@ impl<L: NgramLm> Decoder<L> {
             if keys_at[pos].is_none() {
                 keys_at[pos] = Some(self.keys_at(lattice, pos, limits, boundaries));
             }
-            let Some(keys) = keys_at[pos].as_ref() else { continue };
+            let Some(keys) = keys_at[pos].as_ref() else {
+                continue;
+            };
             rows.clear();
             for h in &bucket {
                 // 前词的 bigram 行：只有活下来的假设才定位，且同一前词复用 ——
@@ -845,7 +852,9 @@ impl<L: NgramLm> Decoder<L> {
             for _ in 1..MAX_WORD_SYLLABLES {
                 let mut next_chains: Vec<(String, usize, u8, u8)> = Vec::new();
                 for (key, cur_end, cost, fuzzy_edges) in &chains {
-                    let Some(edges) = lattice.get(*cur_end) else { continue };
+                    let Some(edges) = lattice.get(*cur_end) else {
+                        continue;
+                    };
                     for next_edge in edges {
                         // 链不能跨越强制边界（xi'an 的 xian 键从这里剪掉）：
                         // 边界处必须断开，边界之后的音节是下一段的起点。
@@ -904,10 +913,9 @@ impl<L: NgramLm> Decoder<L> {
             .into_iter()
             .map(|(word, freq)| {
                 let lm_id = self.lm.as_ref().and_then(|lm| lm.word_index(&word));
-                let (first_base, dict_tail) = self.lm.as_ref().map_or(
-                    (OOV_BASE, false),
-                    |lm| first_word_base(freq, lm_id, lm.as_ref()),
-                );
+                let (first_base, dict_tail) = self.lm.as_ref().map_or((OOV_BASE, false), |lm| {
+                    first_word_base(freq, lm_id, lm.as_ref())
+                });
                 WordCand {
                     first_base,
                     dict_tail,
@@ -944,7 +952,12 @@ impl<L: NgramLm> Decoder<L> {
     /// 同一位置的同一词键可能由多条边得到（多个模糊变体归一到同一标准音节），
     /// 只保留代价最低的一份：代价低 = 分高，此前重复展开也是靠最终去重留高分。
     fn push_key(&self, out: &mut Vec<PosKey>, path: &KeyPath<'_>, limits: Limits) {
-        let KeyPath { key, end, cost, fuzzy_edges } = *path;
+        let KeyPath {
+            key,
+            end,
+            cost,
+            fuzzy_edges,
+        } = *path;
         if let Some(prev) = out.iter_mut().find(|p| p.end == end && &*p.key == key) {
             if cost < prev.cost {
                 prev.cost = cost;
@@ -982,7 +995,8 @@ impl<L: NgramLm> Decoder<L> {
         // fastrace：lattice 构建（模糊音节格）
         let lattice = {
             let _span = LocalSpan::enter_with_local_parent("lattice");
-            self.syllables.lattice_strict(&clean, &boundaries, self.fuzzy)
+            self.syllables
+                .lattice_strict(&clean, &boundaries, self.fuzzy)
         };
         if lattice.len() < 2 {
             return Vec::new(); // 单音节退化，交给词候选
@@ -1039,7 +1053,6 @@ impl<L: NgramLm> Decoder<L> {
         }
         out
     }
-
 }
 
 /// 读音感知的基础分（首词用），返回 `(基础分, 是否词库长尾)`：
@@ -1311,7 +1324,7 @@ mod tests {
         fuzzy: bool,
     ) -> Decoder {
         use cnt_dict::writer;
-        use cnt_lm::writer::{build, Bigram, Unigram};
+        use cnt_lm::writer::{Bigram, Unigram, build};
 
         let dir = std::env::temp_dir().join(format!("cnt-decode-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1361,8 +1374,22 @@ mod tests {
         // 这里用纯逻辑断言表达该性质（真实词库的端到端验证在 tests/e2e.rs 与
         // cnt-dict-tools decode 里做，单测不依赖 30 万词的词库）。
         let mut bucket = [
-            Hyp { pos: 3, prev: Prev::Start, score: -5.2, fuzzy_edges: 0, first_tail: false, node: NO_NODE },
-            Hyp { pos: 1, prev: Prev::Start, score: -3.4, fuzzy_edges: 0, first_tail: false, node: NO_NODE },
+            Hyp {
+                pos: 3,
+                prev: Prev::Start,
+                score: -5.2,
+                fuzzy_edges: 0,
+                first_tail: false,
+                node: NO_NODE,
+            },
+            Hyp {
+                pos: 1,
+                prev: Prev::Start,
+                score: -3.4,
+                fuzzy_edges: 0,
+                first_tail: false,
+                node: NO_NODE,
+            },
         ];
         // 全局排序会把覆盖 1 个音节的假设排在前面（这正是偏置的来源）
         bucket.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -1381,11 +1408,7 @@ mod tests {
                 ("xi", "西", 50_000),
                 ("an", "安", 50_000),
             ],
-            &[
-                ("现", -1.0, 0.0),
-                ("西", -1.0, 0.0),
-                ("安", -1.0, 0.0),
-            ],
+            &[("现", -1.0, 0.0), ("西", -1.0, 0.0), ("安", -1.0, 0.0)],
             &[],
             false,
         );
@@ -1394,21 +1417,21 @@ mod tests {
         assert!(
             plain.iter().any(|(c, _)| c.text == "现"),
             "xian 应出 现: {:?}",
-            plain.iter().map(|(c, _)| c.text.as_str()).collect::<Vec<_>>()
+            plain
+                .iter()
+                .map(|(c, _)| c.text.as_str())
+                .collect::<Vec<_>>()
         );
         // xi'an：强制 xi+an → 西安，且不再自动切出 现
         let sep = d.candidates_scored("xi'an");
         let texts: Vec<&str> = sep.iter().map(|(c, _)| c.text.as_str()).collect();
-        assert!(
-            texts.contains(&"西安"),
-            "xi'an 应切出 西安: {texts:?}"
-        );
-        assert!(
-            !texts.contains(&"现"),
-            "xi'an 不应自动切出 现: {texts:?}"
-        );
+        assert!(texts.contains(&"西安"), "xi'an 应切出 西安: {texts:?}");
+        assert!(!texts.contains(&"现"), "xi'an 不应自动切出 现: {texts:?}");
         // 部分候选 consumed 映射：xi'an 里选 西 → consumed = 原串 0..2（不含分隔符）
-        let xi = sep.iter().find(|(c, _)| c.text == "西").expect("部分候选 西");
+        let xi = sep
+            .iter()
+            .find(|(c, _)| c.text == "西")
+            .expect("部分候选 西");
         assert_eq!(xi.0.consumed, 2, "xi 在原串 xi'an 中占 2 字节");
     }
 
@@ -1489,7 +1512,10 @@ mod tests {
         let cands = d.candidates("womenzaigongzuo");
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         let idx = texts.iter().position(|t| *t == "我们在工作");
-        assert!(idx.is_some_and(|i| i == 0), "我们在工作 should be #1: {texts:?}");
+        assert!(
+            idx.is_some_and(|i| i == 0),
+            "我们在工作 should be #1: {texts:?}"
+        );
     }
 
     #[test]
@@ -1497,14 +1523,8 @@ mod tests {
         // 学过的复合词（郑+爽 → zhengshuang/郑爽）下次输入完整拼音直接出
         let d = decoder_with(
             "newword",
-            &[
-                ("zheng", "郑", 900),
-                ("shuang", "爽", 900),
-            ],
-            &[
-                ("郑", -3.0, 0.0),
-                ("爽", -3.0, 0.0),
-            ],
+            &[("zheng", "郑", 900), ("shuang", "爽", 900)],
+            &[("郑", -3.0, 0.0), ("爽", -3.0, 0.0)],
             &[("郑", "爽", -0.5)],
             false,
         );
@@ -1569,11 +1589,7 @@ mod tests {
                 ("zai", "在", 900),
                 ("gongzuo", "工作", 900),
             ],
-            &[
-                ("我们", -3.0, 0.0),
-                ("在", -2.0, 0.0),
-                ("工作", -3.0, 0.0),
-            ],
+            &[("我们", -3.0, 0.0), ("在", -2.0, 0.0), ("工作", -3.0, 0.0)],
             &[],
             false,
         );
@@ -1642,10 +1658,7 @@ mod tests {
                 ("shi", "是", 900),
                 ("chongshi", "冲矢", 1), // 词库长尾：不在 LM、freq=1
             ],
-            &[
-                ("冲", -4.0, 0.0),
-                ("是", -1.9, 0.0),
-            ],
+            &[("冲", -4.0, 0.0), ("是", -1.9, 0.0)],
             &[],
             false,
         );
@@ -1764,14 +1777,17 @@ mod tests {
         // 必须按补全给出候选，不能空窗（曾被 `len < 2` 与 `max_pos == 0` 两道早退挡住）。
         let d = decoder_with(
             "bare_initial",
-            &[("le", "了", 90_000), ("lai", "来", 80_000), ("zhe", "这", 90_000)],
+            &[
+                ("le", "了", 90_000),
+                ("lai", "来", 80_000),
+                ("zhe", "这", 90_000),
+            ],
             &[("了", -2.0, 0.0), ("来", -2.8, 0.0), ("这", -2.1, 0.0)],
             &[],
             false,
         );
         for (input, want) in [("l", "了"), ("zh", "这")] {
-            let texts: Vec<String> =
-                d.candidates(input).into_iter().map(|c| c.text).collect();
+            let texts: Vec<String> = d.candidates(input).into_iter().map(|c| c.text).collect();
             assert_eq!(
                 texts.first().map(String::as_str),
                 Some(want),
@@ -1820,7 +1836,11 @@ mod tests {
         // 输入 jian：补全候选 将(jiang，词频更高) 不得压过精确读音的 见。
         let d = decoder_with(
             "completion_rank",
-            &[("jian", "见", 900), ("jiang", "将", 900), ("hou", "后", 900)],
+            &[
+                ("jian", "见", 900),
+                ("jiang", "将", 900),
+                ("hou", "后", 900),
+            ],
             &[("见", -3.5, 0.0), ("将", -2.8, 0.0), ("后", -3.0, 0.0)],
             &[],
             false,
@@ -1862,7 +1882,10 @@ mod tests {
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         let pos = |t: &str| texts.iter().position(|x| *x == t);
         let (li, force, hist) = (pos("里"), pos("力"), pos("历"));
-        assert!(li.is_some() && force.is_some() && hist.is_some(), "精确字应全部在候选里: {texts:?}");
+        assert!(
+            li.is_some() && force.is_some() && hist.is_some(),
+            "精确字应全部在候选里: {texts:?}"
+        );
         for exact in [li, force, hist] {
             for other in [pos("两"), pos("你")] {
                 if let (Some(e), Some(o)) = (exact, other) {
@@ -1878,7 +1901,11 @@ mod tests {
         // 也不得占 #1——两处同时打错的概率远低于一处。
         let d = decoder_with(
             "stacked_fuzzy",
-            &[("zhu", "主", 90_000), ("chen", "臣", 50_000), ("zucheng", "组成", 80_000)],
+            &[
+                ("zhu", "主", 90_000),
+                ("chen", "臣", 50_000),
+                ("zucheng", "组成", 80_000),
+            ],
             &[("主", -3.0, -0.5), ("臣", -4.0, 0.0), ("组成", -2.0, 0.0)],
             &[],
             true,
@@ -1886,7 +1913,10 @@ mod tests {
         let cands = d.candidates("zhuchen");
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts.first(), Some(&"主臣"), "叠加模糊不得占 #1: {texts:?}");
-        assert!(texts.contains(&"组成"), "叠加模糊候选仍应保留（只是不占 #1）: {texts:?}");
+        assert!(
+            texts.contains(&"组成"),
+            "叠加模糊候选仍应保留（只是不占 #1）: {texts:?}"
+        );
     }
 
     #[test]
@@ -1917,7 +1947,11 @@ mod tests {
             .iter()
             .find(|c| c.text == "你好")
             .expect("应给出部分候选 你好");
-        assert_eq!(partial.consumed, "nihao".len(), "部分候选要记下消耗掉多少输入");
+        assert_eq!(
+            partial.consumed,
+            "nihao".len(),
+            "部分候选要记下消耗掉多少输入"
+        );
         assert!(!partial.covers_all("nihaoshijie".len()));
         // 结构约束：完全覆盖输入的候选一律排在部分候选之前
         let first_partial = cands
@@ -1929,7 +1963,10 @@ mod tests {
                 .iter()
                 .all(|c| c.covers_all("nihaoshijie".len())),
             "部分候选不得插到整句候选中间: {:?}",
-            cands.iter().map(|c| (&c.text, c.consumed)).collect::<Vec<_>>()
+            cands
+                .iter()
+                .map(|c| (&c.text, c.consumed))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1970,7 +2007,10 @@ mod tests {
         assert!(
             whole.is_some(),
             "学过的 郑爽 应作为整词参与整句切分: {:?}",
-            cands.iter().map(|c| (&c.text, &c.learned)).collect::<Vec<_>>()
+            cands
+                .iter()
+                .map(|c| (&c.text, &c.learned))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1988,7 +2028,10 @@ mod tests {
         // 先查一次填满缓存（此时 是候 在前）
         let before = d.candidates("shihou");
         let pos_before = before.iter().position(|c| c.text == "时候");
-        assert!(pos_before.is_some_and(|i| i > 0), "初始 时候 不该是 #1: {before:?}");
+        assert!(
+            pos_before.is_some_and(|i| i > 0),
+            "初始 时候 不该是 #1: {before:?}"
+        );
         // 反复提交 [时,候]：复合词 时候 第 2 次转正、随后计数增长（混合加成单调），
         // 足够让它作为整词升到 #1 —— 缓存未失效则 beam 还在用旧词表/旧加成分
         for _ in 0..6 {
@@ -2032,8 +2075,7 @@ mod tests {
             &[],
             false,
         );
-        let cands: Vec<String> =
-            d.candidates("men").into_iter().map(|c| c.text).collect();
+        let cands: Vec<String> = d.candidates("men").into_iter().map(|c| c.text).collect();
         let pos = |w: &str| cands.iter().position(|c| c == w);
         assert!(
             pos("扪") < pos("㙢") && pos("扪") < pos("㡈"),

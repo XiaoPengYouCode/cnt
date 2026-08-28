@@ -45,7 +45,9 @@ pub trait Rescorer: Send + Sync {
 
 impl fmt::Debug for dyn Rescorer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rescorer").field("name", &self.name()).finish()
+        f.debug_struct("Rescorer")
+            .field("name", &self.name())
+            .finish()
     }
 }
 

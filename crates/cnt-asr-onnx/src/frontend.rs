@@ -113,7 +113,9 @@ impl Cmvn {
 }
 
 fn parse_floats(s: &str) -> Vec<f32> {
-    s.split_whitespace().filter_map(|t| t.parse().ok()).collect()
+    s.split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect()
 }
 
 #[cfg(test)]

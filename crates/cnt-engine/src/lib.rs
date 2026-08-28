@@ -11,9 +11,9 @@ pub mod voice;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use fastrace::Span;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
-use fastrace::Span;
 use zbus::connection::Connection;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -326,7 +326,8 @@ impl Engine {
     async fn candidate_clicked(&self, index: u32, _button: u32, _state: u32) {
         let action = {
             let mut st = self.core.lock_state();
-            let idx = st.page_size() * st.page() + usize::try_from(index).expect("index fits usize");
+            let idx =
+                st.page_size() * st.page() + usize::try_from(index).expect("index fits usize");
             st.candidate_at(idx).map_or(Action::Handled, |cand| {
                 st.clear();
                 Action::Commit {

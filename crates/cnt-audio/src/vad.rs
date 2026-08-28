@@ -309,12 +309,10 @@ pub fn frame_db(frame: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_db, Segmenter, VadConfig, FRAME_SAMPLES};
+    use super::{FRAME_SAMPLES, Segmenter, VadConfig, frame_db};
 
     fn tone(n: usize, amp: f32) -> Vec<f32> {
-        (0..n)
-            .map(|i| (i as f32 * 0.2).sin() * amp)
-            .collect()
+        (0..n).map(|i| (i as f32 * 0.2).sin() * amp).collect()
     }
 
     fn silence(n: usize) -> Vec<f32> {

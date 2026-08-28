@@ -22,7 +22,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
-use cnt_dict::{writer, MmapDict};
+use cnt_dict::{MmapDict, writer};
 
 /// 各子命令的统一返回（CLI 错误聚合）。
 type CliResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -55,7 +55,12 @@ const FLOOR_BOOST: u32 = 5_000;
 /// 有 LM 时：词在 unigram 里 → 对数概率换算频率；否则长尾 `freq = 1`。
 /// libime 顶层词（dict 权重 == 0）若是 LM 地板词（如 你好，LM 按 你+好
 /// 二元组建模所以 unigram 概率在地板），抬到“常用词带”，避免排到生僻词后。
-fn lm_freq(map: &std::collections::HashMap<String, f64>, p_min: f64, word: &str, dict_weight: Option<&str>) -> u32 {
+fn lm_freq(
+    map: &std::collections::HashMap<String, f64>,
+    p_min: f64,
+    word: &str,
+    dict_weight: Option<&str>,
+) -> u32 {
     map.get(word).map_or(1, |p| {
         let raw = freq_u32((p - p_min) * LM_SCALE);
         let top_tier = dict_weight
@@ -248,7 +253,7 @@ fn parse_wordlist(path: &str) -> io::Result<Vec<(String, String, u32)>> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("line {}: expected 'pinyin word [freq]'", lineno + 1),
-                ))
+                ));
             }
         }
     }
@@ -322,10 +327,11 @@ fn cmd_import_rime_table(input: &str, output: &str) -> CliResult {
 /// - 有 `--lm`：`freq = round((p - p_min) * 1e4) + 1`，不在 `LM` 中的长尾词 `freq = 1`
 /// - 无 `--lm`：`freq = round((min(w,0) - min_w) * 1e5) + 1`，无权重条目 `freq = 1`
 fn cmd_import_libime(input: &str, output: &str, lm: Option<&str>) -> CliResult {
-
     // 语言模型 unigram（若提供）：.arpa 文本或已编译的 .cntl
     let unigrams: Option<(std::collections::HashMap<String, f64>, f64)> = match lm {
-        Some(path) if path.to_ascii_lowercase().ends_with(".cntl") => Some(read_cntl_unigrams(path)?),
+        Some(path) if path.to_ascii_lowercase().ends_with(".cntl") => {
+            Some(read_cntl_unigrams(path)?)
+        }
         Some(path) => Some(read_arpa_unigrams(path)?),
         None => None,
     };
@@ -350,11 +356,7 @@ fn cmd_import_libime(input: &str, output: &str, lm: Option<&str>) -> CliResult {
                 min_w = min_w.min(w.min(0.0));
             }
         }
-        if min_w.is_finite() {
-            min_w
-        } else {
-            0.0
-        }
+        if min_w.is_finite() { min_w } else { 0.0 }
     };
 
     // 转换输出
@@ -477,7 +479,7 @@ fn cmd_delete_user(path: &str, pinyin: &str, word: &str) -> CliResult {
 ///
 /// 只解析 unigram 与 bigram 段（到 `\\3-grams:` 停止），`<unk>` 等伪词跳过。
 fn cmd_build_lm(input: &str, output: &str) -> CliResult {
-    use cnt_lm::writer::{build, Bigram, Unigram};
+    use cnt_lm::writer::{Bigram, Unigram, build};
 
     let f = BufReader::new(File::open(input)?);
     let mut unigrams: Vec<Unigram> = Vec::new();
@@ -576,7 +578,10 @@ struct DecodeOpts {
 
 impl Default for DecodeOpts {
     fn default() -> Self {
-        Self { top: 10, tsv: false }
+        Self {
+            top: 10,
+            tsv: false,
+        }
     }
 }
 
@@ -627,9 +632,19 @@ fn cmd_decode(
                 format!("part:{}", &pinyin[..cand.consumed])
             };
             if opts.tsv {
-                writeln!(out, "{pinyin}\t{}\t{}\t{score:.3}\t{keys}\t{cover}", i + 1, cand.text)?;
+                writeln!(
+                    out,
+                    "{pinyin}\t{}\t{}\t{score:.3}\t{keys}\t{cover}",
+                    i + 1,
+                    cand.text
+                )?;
             } else {
-                writeln!(out, "  {}. {}  [{score:.3}] {{{keys}}} {cover}", i + 1, cand.text)?;
+                writeln!(
+                    out,
+                    "  {}. {}  [{score:.3}] {{{keys}}} {cover}",
+                    i + 1,
+                    cand.text
+                )?;
             }
         }
     }
@@ -726,7 +741,9 @@ fn measure_cold(
 ///
 /// 工作量指标以 **span 属性**形式一并打出（`expand=…`），见 AGENTS.md 的埋点约定。
 fn print_stage_table(agg: &std::sync::Arc<std::sync::Mutex<BenchStats>>) {
-    let stats = agg.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stats = agg
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     println!();
     println!("fastrace 阶段分解（每样例首轮 span 树聚合）：");
     let mut names: Vec<&String> = stats.by_name.keys().collect();
@@ -770,8 +787,8 @@ fn stage_rank(name: &str) -> usize {
 
 fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) -> CliResult {
     use cnt_decode::Decoder;
-    use cnt_input::CandidateSource;
     use cnt_dict::PinyinModel;
+    use cnt_input::CandidateSource;
     use cnt_lm::CntLm;
     use std::time::Instant;
 
@@ -792,9 +809,26 @@ fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) 
     // 常见输入样例（覆盖单音节/多音节/补全/模糊音路径；`l`/`zh` = 纯声母，
     // 每个词的第一键，走「整串都还不是音节」的最宽补全展开）
     let samples = [
-        "ni", "nihao", "womenzaigongzuo", "xianzai", "diyige", "sihou", "chijiuhu",
-        "zhongguoren", "momingqimiao", "shijie", "womendoushizhongguoren", "xiexieni",
-        "jintian", "diannao", "shurufa", "nuli", "leng", "le", "l", "zh",
+        "ni",
+        "nihao",
+        "womenzaigongzuo",
+        "xianzai",
+        "diyige",
+        "sihou",
+        "chijiuhu",
+        "zhongguoren",
+        "momingqimiao",
+        "shijie",
+        "womendoushizhongguoren",
+        "xiexieni",
+        "jintian",
+        "diannao",
+        "shurufa",
+        "nuli",
+        "leng",
+        "le",
+        "l",
+        "zh",
     ];
 
     // 预热（加载页缓存等）
@@ -839,7 +873,8 @@ fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) 
     let max = latencies[count - 1];
     println!(
         "{} 次解码（{} 个样例 × {n} 轮），共 {total_keys} 个候选",
-        count, samples.len()
+        count,
+        samples.len()
     );
     println!("热（词键缓存命中，= 连续打字的第 2 键起）：");
     println!("  平均 {avg:?}  中位 {p50:?}  90% {p90:?}  99% {p99:?}  最差 {max:?}");
