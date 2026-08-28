@@ -1,0 +1,61 @@
+# CI：fmt / clippy / test / build 四道门（全部使用 GitHub 当前最新组件，2026-08）
+#
+# - actions/checkout@v7          仓库检出（v7，2026-06 发布）
+# - dtolnay/rust-toolchain@stable   Rust 工具链（默认含 clippy + rustfmt）
+# - Swatinem/rust-cache@v2       cargo 构建缓存
+#
+# ALSA：麦克风采集走 cpal → alsa-sys → libasound，需要 dev 包里的头文件与
+# alsa.pc（系统默认只装运行时库）——见 README「构建依赖」。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # 语音侧单测不需要模型也不需要麦克风（端口层用假识别器，前端用合成信号）
+      - run: cargo test --all-targets
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo build --release --locked
