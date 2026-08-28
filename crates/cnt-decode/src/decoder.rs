@@ -82,14 +82,14 @@ const GROUP_WORD: u8 = 0;
 const GROUP_SENTENCE: u8 = 1;
 const GROUP_COMPLETION: u8 = 2;
 const GROUP_PARTIAL: u8 = 3;
-/// 部分候选（只覆盖输入前一段的词）最多给几个。
+/// 部分候选（只覆盖输入前一段的单字/词）最多给几个。
 ///
-/// Rime 式增量确认的修复入口：整句错了不必删光重打，选中前一段即可确认，
-/// 剩下的拼音继续组合。给太多会挤占整句候选的位置，但太少会把常用单字
-/// （「避」在 bi 里排第 10，早先 8 被截掉，用户翻页找不到避障里的避）切掉。
-/// 15 = 音节常用字量级（bi 前 15 常用字：比必笔逼壁鼻彼臂闭避币毕碧弊辟）；
-/// 词频排序仍把生僻字挡在门外，生僻字不会因此涌进来。
-const PARTIAL_LIMIT: usize = 15;
+/// 这是候选窗的**资源上限**，不是排序工具——可见性由词频排序决定：
+/// 常用字自然靠前、生僻字沉底；截断只会误伤常用字（「避」在 bi 排第 10，
+/// 早先 8 把用户翻不到避障的避切掉）。30 = 音节常用字量级的余量
+/// （bi 前 15 常用字 + 次常用带），生僻字排在 30 位外，用户翻不到也不干扰。
+/// 部分候选在候选窗末尾（整句/补全之后），翻页可见，不挤占前排。
+const PARTIAL_LIMIT: usize = 30;
 /// LM 完全未知词的兜底 log10 概率（下界参照）。
 ///
 /// 打分不再直接用它：不在 LM 词表的词走 `first_word_base`（用户词/次读音/按词频的
@@ -1050,9 +1050,23 @@ impl<L: NgramLm> Decoder<L> {
                 }
             })
             .collect();
-        // 部分候选：位置 0 出发、只覆盖输入前一段的词（整句错了就咬一段确认）
+        // 部分候选：位置 0 出发、只覆盖输入前一段的词（整句错了就咬一段确认）。
+        // 独立宽取词：不受 beam 的 `words_per_key` 性能参数限制——那会把常用
+        // 单字截在第 12 个（bi 的第 13~15 常用字碧弊辟就没了）。可见性交给
+        // 词频排序，`PARTIAL_LIMIT` 只是候选窗资源上限。
         if let Some(keys) = keys_at.first().and_then(Option::as_ref) {
-            out.extend(partial_candidates(keys, clean.len(), &pos_map));
+            let partial_keys: Vec<PosKey> = keys
+                .iter()
+                .map(|pk| PosKey {
+                    end: pk.end,
+                    cost: pk.cost,
+                    fuzzy_edges: pk.fuzzy_edges,
+                    key: pk.key.clone(),
+                    limit: PARTIAL_LIMIT,
+                    words: self.words_of(&pk.key, PARTIAL_LIMIT),
+                })
+                .collect();
+            out.extend(partial_candidates(&partial_keys, clean.len(), &pos_map));
         }
         out
     }
@@ -1920,6 +1934,60 @@ mod tests {
             texts.contains(&"组成"),
             "叠加模糊候选仍应保留（只是不占 #1）: {texts:?}"
         );
+    }
+
+    #[test]
+    fn partial_candidates_survive_beam_word_limit() {
+        // 部分候选独立宽取词：不受 beam 的 words_per_key（双音节=12）截断——
+        // bi 的第 13~15 常用字（碧弊辟）必须可见，否则翻页永远找不到。
+        let d = decoder_with(
+            "partialwide",
+            &[
+                ("bi", "比", 50_000),
+                ("bi", "必", 49_900),
+                ("bi", "笔", 49_800),
+                ("bi", "逼", 49_700),
+                ("bi", "壁", 49_600),
+                ("bi", "鼻", 49_500),
+                ("bi", "彼", 49_400),
+                ("bi", "臂", 49_300),
+                ("bi", "闭", 49_200),
+                ("bi", "避", 49_100),
+                ("bi", "币", 49_000),
+                ("bi", "毕", 48_900),
+                ("bi", "碧", 48_800),
+                ("bi", "弊", 48_700),
+                ("bi", "辟", 48_600),
+                ("zhang", "张", 50_000),
+            ],
+            &[
+                ("比", -1.0, 0.0),
+                ("必", -1.0, 0.0),
+                ("笔", -1.0, 0.0),
+                ("逼", -1.0, 0.0),
+                ("壁", -1.0, 0.0),
+                ("鼻", -1.0, 0.0),
+                ("彼", -1.0, 0.0),
+                ("臂", -1.0, 0.0),
+                ("闭", -1.0, 0.0),
+                ("避", -1.0, 0.0),
+                ("币", -1.0, 0.0),
+                ("毕", -1.0, 0.0),
+                ("碧", -1.0, 0.0),
+                ("弊", -1.0, 0.0),
+                ("辟", -1.0, 0.0),
+                ("张", -1.0, 0.0),
+            ],
+            &[],
+            false,
+        );
+        let cands = d.candidates("bizhang");
+        let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        // 第 10（避）与第 13~15（碧弊辟）都必须在——早先被 words_per_key=12
+        // 和 PARTIAL_LIMIT=8 双层截掉，翻页永远找不到
+        for w in ["避", "碧", "弊", "辟"] {
+            assert!(texts.contains(&w), "部分候选应含 {w}: {texts:?}");
+        }
     }
 
     #[test]
