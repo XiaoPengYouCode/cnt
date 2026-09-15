@@ -73,13 +73,10 @@ const WHOLE_KEY_WORDS: usize = 20;
 const CANDIDATE_LIMIT: usize = 30;
 /// 候选分组：
 /// 0 = 整词覆盖输入（整键词 / beam 单段）——你已经打完的读音优先；
-/// 1 = 拼接路径（仅在「整词覆盖存在」时出现）：多段 beam 句子降级到这组，
-///   不和整词在 group 0 里按分数裸拼（对齐 librime `has_exact_match_phrase` 门控，
-///   但保留可见性：整词全错时用户还能翻到拼接）；
+/// 1 = 保留的句子组编号（当前可靠整词命中时直接跳过 beam）；
 /// 2 = 补全候选 + 词库长尾字形；
 /// 3 = 部分候选（只覆盖输入前一段）。
 const GROUP_WORD: u8 = 0;
-const GROUP_SENTENCE: u8 = 1;
 const GROUP_COMPLETION: u8 = 2;
 const GROUP_PARTIAL: u8 = 3;
 /// 部分候选（只覆盖输入前一段的单字/词）最多给几个。
@@ -362,7 +359,7 @@ impl<L: NgramLm> Decoder<L> {
         self
     }
 
-    /// 提交学习数据：按 librime `UpdateElements` 语义逐段调频 + 相邻两段拼合成新词
+    /// 提交学习数据：按 librime `UpdateElements` 语义逐段调频 + 相邻段/整句拼合成新词
     /// （郑+爽 → zhengshuang/郑爽，低可信度起点，2 次确认转正）。
     ///
     /// **段 bump 规则**（对齐 librime `script_translator.cc::UpdateElements`）：
@@ -370,7 +367,7 @@ impl<L: NgramLm> Decoder<L> {
     /// 才给全部段（含单字）调频 —— 纯单字拼接（从+是）是短语级意图，不给单字
     /// bump，避免 从/是 这类高频字被句子提交无限刷高、盖过 LM。
     ///
-    /// **新词学习**：相邻两段拼成复合词键；词库没有该词 → 低可信度起点
+    /// **新词学习**：相邻两段和完整短语都拼成复合词键；词库没有该词 → 低可信度起点
     /// （`confirmed=false`，有效计数 ×0.1），第 2 次确认转正（见 `UserDb::bump`）。
     ///
     /// 词键缓存做**精确失效**：只有这次动过的键（各段 + 拼合出的新词键）会被丢弃。
@@ -388,21 +385,16 @@ impl<L: NgramLm> Decoder<L> {
         }
         // 新词学习：相邻两段拼成复合词，下次输入完整拼音直接出
         // （词库没有该词 → 低可信度起点，model.bump 内按词库归属判定）
-        let mut compounds: Vec<String> = Vec::new();
-        for pair in learned.windows(2) {
-            let key = format!("{}{}", pair[0].pinyin, pair[1].pinyin);
-            let word = format!("{}{}", pair[0].word, pair[1].word);
-            if key.len() <= 12 {
-                self.model.bump(&key, &word);
-                compounds.push(key);
-            }
+        let compounds = learned_compounds(learned);
+        for compound in &compounds {
+            self.model.bump(&compound.pinyin, &compound.word);
         }
         let mut cache = self.lock_keys();
         for seg in learned {
             cache.invalidate(&seg.pinyin);
         }
-        for key in &compounds {
-            cache.invalidate(key);
+        for compound in &compounds {
+            cache.invalidate(&compound.pinyin);
         }
     }
 
@@ -411,10 +403,15 @@ impl<L: NgramLm> Decoder<L> {
     /// 逐段删除用户库记录（词库静态词不受影响，只是去掉用户调频）；
     /// 只动过的键精确失效缓存（与 `learn` 同口径）。
     pub fn forget(&self, learned: &[LearnedWord]) {
+        let compounds = learned_compounds(learned);
         let mut cache = self.lock_keys();
         for seg in learned {
             self.model.forget(&seg.pinyin, &seg.word);
             cache.invalidate(&seg.pinyin);
+        }
+        for compound in &compounds {
+            self.model.forget(&compound.pinyin, &compound.word);
+            cache.invalidate(&compound.pinyin);
         }
     }
 
@@ -461,23 +458,42 @@ impl<L: NgramLm> Decoder<L> {
     /// 与用户实际看到的候选完全一致（同一 `CandidateSource` 路径）。
     #[must_use]
     pub fn candidates_scored(&self, pinyin: &str) -> Vec<(Candidate, f32)> {
+        self.candidates_scored_with_context(pinyin, &[])
+    }
+
+    /// 带已确认前文的完整候选查询。
+    ///
+    /// 当前 LM 是二元模型，所以只使用最后一个已确认词作为前状态；这不是
+    /// 只传递数据的预留接口，而是直接影响下一词的 bigram 打分。未来若换成
+    /// 更高阶 LM，可以在这里保留更多确认片段。
+    #[must_use]
+    pub fn candidates_scored_with_context(
+        &self,
+        pinyin: &str,
+        context: &[LearnedWord],
+    ) -> Vec<(Candidate, f32)> {
         let _span = LocalSpan::enter_with_local_parent("candidates");
-        let mut scored: Vec<Scored> = self.decode(pinyin);
         // 整个输入作为词键的精确候选（含 LM 未覆盖但词频上万的字：备/碑/辈/悲），
         // 它们与整句候选在同一分数空间里竞争——不再用 -inf 垫底排在补全词后面。
         let whole = self.whole_key_words(pinyin);
         // 整词覆盖判据（对齐 librime `has_exact_match_phrase`，但排除词库长尾）：
-        // 存在「非长尾」整词（从事/充实/重拾…）时，多段拼接路径降级到独立组；
-        // 只有长尾整词（冲矢，freq≤100 且不在 LM）不算数 —— 正确候选不该被
-        // 一个词频 1 的异体整词挤下去，那种情况拼接仍留在 group 0。
+        // 存在「非长尾」整词（从事/充实/重拾…）时直接跳过多段 beam；
+        // 只有长尾整词（冲矢，freq≤100 且不在 LM）不算数，仍允许拼接路径竞争。
         let has_word_coverage = whole.iter().any(|s| !s.dict_tail);
+        // 有可靠整词时直接走整词候选，避免每个按键都为同一整词再跑一遍完整句
+        // beam；没有可靠整词时才生成句子和补全候选。
+        let mut scored: Vec<Scored> = if has_word_coverage {
+            Vec::new()
+        } else {
+            self.decode_with_context(pinyin, context)
+        };
         scored.extend(whole);
-        if let Some(lm) = &self.lm {
+        if !has_word_coverage && let Some(lm) = &self.lm {
             scored.extend(self.completions(pinyin, lm));
         }
         // 排序分四组（组间是硬顺序，组内按分数）：
         // 0 整词覆盖输入的候选（整键词/beam 单段）——你已经打完的读音优先；
-        // 1 拼接路径（整词覆盖存在时的多段句子）——不和整词裸拼，但仍可见可选；
+        // 1 保留给未来的句子组；可靠整词命中时当前实现不会生成多段 beam；
         // 2 补全候选（「猜你还没打完」）——不该插到已打完的读音前面
         //   （输入 jian 时前排不能被 jiang 的词占掉），以及词库长尾字形；
         // 3 部分候选（只覆盖前一段）——修复入口，放在最后，不干扰正常整句选词。
@@ -493,10 +509,8 @@ impl<L: NgramLm> Decoder<L> {
                 GROUP_PARTIAL
             } else if s.completion || s.dict_tail {
                 GROUP_COMPLETION
-            } else if s.is_whole_word || !has_word_coverage {
-                GROUP_WORD
             } else {
-                GROUP_SENTENCE
+                GROUP_WORD
             }
         };
         scored.sort_by(|a, b| {
@@ -728,6 +742,7 @@ impl<L: NgramLm> Decoder<L> {
         boundaries: &[usize],
         lm: &L,
         limits: Limits,
+        initial_prev: Prev,
     ) -> BeamResult {
         let _ = pinyin; // 位置同步版不再按输入长度轮询
         let mut arena: Vec<Node> = Vec::new();
@@ -737,7 +752,7 @@ impl<L: NgramLm> Decoder<L> {
         let mut at: Vec<Vec<Hyp>> = (0..=lattice.len()).map(|_| Vec::new()).collect();
         at[0].push(Hyp {
             pos: 0,
-            prev: Prev::Start,
+            prev: initial_prev,
             score: 0.0,
             fuzzy_edges: 0,
             first_tail: false,
@@ -983,8 +998,8 @@ impl<L: NgramLm> Decoder<L> {
         });
     }
 
-    /// beam search 解码：Top-K 句子候选（带分数）。
-    fn decode(&self, pinyin: &str) -> Vec<Scored> {
+    /// 从指定的前词状态开始解码；输入缓冲区本身仍只包含尚未确认的拼音。
+    fn decode_with_context(&self, pinyin: &str, context: &[LearnedWord]) -> Vec<Scored> {
         let Some(lm) = &self.lm else {
             return Vec::new();
         };
@@ -1018,11 +1033,26 @@ impl<L: NgramLm> Decoder<L> {
         // 单音节 li 与七字整句用同一套上限是错的（前者要宽、后者要省）。
         let limits = Limits::for_syllables(min_syllables(&lattice));
 
+        // EngineState 的 confirmed 是已经选定的前文；二元 LM 只需最后一个词。
+        // 未登录 LM 的前词仍保留 Word(None)，让当前词走「有前词但无 bigram」的
+        // backoff 路径，而不是错误地当作句首。
+        let initial_prev = context
+            .last()
+            .map_or(Prev::Start, |word| Prev::Word(lm.word_index(&word.word)));
+
         let BeamResult {
             hyps,
             arena,
             keys_at,
-        } = self.beam_search(&clean, &lattice, &reachable, &boundaries, lm, limits);
+        } = self.beam_search(
+            &clean,
+            &lattice,
+            &reachable,
+            &boundaries,
+            lm,
+            limits,
+            initial_prev,
+        );
         let mut out: Vec<Scored> = hyps
             .into_iter()
             .map(|h| {
@@ -1122,9 +1152,48 @@ fn oov_score(freq: u32) -> f32 {
     OOV_BASE + adjust
 }
 
+/// 从一次提交构造出 `learn` 与 `forget` 完全对称的用户复合词集合。
+///
+/// 相邻二段词是即时可用的增量学习；整句词让较长的用户短语也能作为一个整体
+/// 参与后续解码。用 `(pinyin, word)` 去重，保证二段提交不会重复 bump/forget。
+fn learned_compounds(learned: &[LearnedWord]) -> Vec<LearnedWord> {
+    let mut out = Vec::new();
+    for pair in learned.windows(2) {
+        let pinyin = format!("{}{}", pair[0].pinyin, pair[1].pinyin);
+        let word = format!("{}{}", pair[0].word, pair[1].word);
+        if pinyin.len() <= 12 {
+            let candidate = LearnedWord::new(pinyin, word);
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    if learned.len() > 2 {
+        let pinyin = learned
+            .iter()
+            .map(|s| s.pinyin.as_str())
+            .collect::<String>();
+        let word = learned.iter().map(|s| s.word.as_str()).collect::<String>();
+        if pinyin.len() <= 12 {
+            let candidate = LearnedWord::new(pinyin, word);
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
 impl<L: NgramLm> CandidateSource for Decoder<L> {
     fn candidates(&self, pinyin: &str) -> Vec<Candidate> {
         self.candidates_merged(pinyin)
+    }
+
+    fn candidates_with_context(&self, pinyin: &str, context: &[LearnedWord]) -> Vec<Candidate> {
+        self.candidates_scored_with_context(pinyin, context)
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect()
     }
 }
 
@@ -1497,6 +1566,47 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_context_affects_next_segment() {
+        let d = decoder_with(
+            "confirmed_context",
+            &[
+                ("wo", "我", 900),
+                ("shi", "是", 900),
+                ("shi", "时", 800),
+                ("hou", "候", 900),
+            ],
+            &[
+                ("我", -3.0, 0.0),
+                ("是", -1.0, 0.0),
+                ("时", -3.0, 0.0),
+                ("候", -1.0, 0.0),
+            ],
+            &[
+                ("我", "是", -5.0),
+                ("我", "时", -0.1),
+                ("是", "候", -0.1),
+                ("时", "候", -0.1),
+            ],
+            false,
+        );
+        let without_context = d.candidates_scored("shihou");
+        let with_context =
+            d.candidates_scored_with_context("shihou", &[LearnedWord::new("wo", "我")]);
+        assert_eq!(
+            without_context
+                .first()
+                .map(|(candidate, _)| candidate.text.as_str()),
+            Some("是候")
+        );
+        assert_eq!(
+            with_context
+                .first()
+                .map(|(candidate, _)| candidate.text.as_str()),
+            Some("时候")
+        );
+    }
+
+    #[test]
     fn decode_prefers_multisyllable_word() {
         // 词库含多音节词 工作(gongzuo)，应优先于 宫+坐 拼字
         let d = decoder_with(
@@ -1556,6 +1666,39 @@ mod tests {
             cands.iter().any(|c| c.text == "郑爽"),
             "learned new word 郑爽 should appear: {:?}",
             cands.iter().map(|c| c.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn forget_removes_learned_compound() {
+        let d = decoder_with(
+            "forget_compound",
+            &[("zheng", "郑", 900), ("shuang", "爽", 900)],
+            &[("郑", -3.0, 0.0), ("爽", -3.0, 0.0)],
+            &[],
+            false,
+        );
+        let learned = [
+            LearnedWord::new("zheng", "郑"),
+            LearnedWord::new("shuang", "爽"),
+        ];
+        d.learn(&learned);
+        assert!(
+            d.candidates("zhengshuang")
+                .iter()
+                .any(|candidate| candidate.text == "郑爽"),
+            "learned compound should be visible before forget"
+        );
+
+        d.forget(&learned);
+        assert!(
+            !d.candidates("zhengshuang").iter().any(|candidate| {
+                candidate
+                    .learned
+                    .iter()
+                    .any(|segment| segment.pinyin == "zhengshuang" && segment.word == "郑爽")
+            }),
+            "Ctrl+Delete must remove the learned compound too"
         );
     }
 
@@ -1621,10 +1764,9 @@ mod tests {
     }
 
     #[test]
-    fn whole_word_coverage_demotes_concat_path() {
-        // 对齐 librime `has_exact_match_phrase`：congshi 有整词 从事/充实/重试 覆盖全串时，
-        // 拼接路径（从是/丛是/从时）降级到独立组 —— 排在整词之后、补全之前，
-        // 不再和整词在 group 0 里按分数裸拼。
+    fn whole_word_coverage_skips_sentence_search() {
+        // 对齐 librime `has_exact_match_phrase`：congshi 有可靠整词覆盖全串时，
+        // 直接返回整词，跳过完整句 beam，避免每次按键重复搜索同一整句。
         let d = decoder_with(
             "demote_concat",
             &[
@@ -1650,17 +1792,13 @@ mod tests {
         );
         let cands = d.candidates_scored("congshi");
         let texts: Vec<&str> = cands.iter().map(|(c, _)| c.text.as_str()).collect();
-        let pos = |t: &str| texts.iter().position(|x| *x == t);
-        let (p_word, p_concat, p_concat2, p_cong) = (
-            pos("从事").expect("整词 从事"),
-            pos("从是").expect("拼接 从是"),
-            pos("丛是").expect("拼接 丛是"),
-            pos("从").expect("部分 从"),
-        );
-        assert!(p_word < p_concat, "整词必须先于拼接: {texts:?}");
-        assert!(p_concat < p_concat2, "组内拼接按 LM 分: {texts:?}");
-        assert!(p_concat < p_cong, "拼接降级组先于部分候选: {texts:?}");
-        // 去重：从事 只出现一次（beam 单段版本被整键版本吸收，不重复占位）
+        assert!(texts.contains(&"从事"), "整词 从事: {texts:?}");
+        assert!(texts.contains(&"充实"), "整词 充实: {texts:?}");
+        assert!(texts.contains(&"重试"), "整词 重试: {texts:?}");
+        assert!(!texts.contains(&"从是"), "不应再跑拼接 beam: {texts:?}");
+        assert!(!texts.contains(&"丛是"), "不应再跑拼接 beam: {texts:?}");
+        assert!(!texts.contains(&"从"), "不应再生成部分候选: {texts:?}");
+        // 整词只出现一次（没有 beam 单段版本重复占位）
         assert_eq!(texts.iter().filter(|t| **t == "从事").count(), 1);
     }
 

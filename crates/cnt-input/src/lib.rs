@@ -79,6 +79,15 @@ impl Candidate {
 /// 候选来源：输入逻辑查询候选的统一接口（由 cnt-decode 的整句解码器实现）。
 pub trait CandidateSource {
     fn candidates(&self, pinyin: &str) -> Vec<Candidate>;
+
+    /// 查询候选时带上已经确认的前文。
+    ///
+    /// 默认回退到旧接口，保持纯输入逻辑和测试用候选源的兼容性；解码器可以
+    /// 用这些片段初始化语言模型上下文，让「确认了前半句后继续输入」仍然受
+    /// 前文影响，而不是每次从句首重新开始。
+    fn candidates_with_context(&self, pinyin: &str, _context: &[LearnedWord]) -> Vec<Candidate> {
+        self.candidates(pinyin)
+    }
 }
 
 /// 输入模式（中/英）。
@@ -337,7 +346,7 @@ impl EngineState {
         self.candidates = if self.buffer.is_empty() {
             Vec::new()
         } else {
-            source.candidates(&self.buffer)
+            source.candidates_with_context(&self.buffer, &self.confirmed)
         };
         self.page = 0;
         self.cursor = 0;

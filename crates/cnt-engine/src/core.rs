@@ -25,12 +25,19 @@ use cnt_input::{EngineState, LearnedWord, latin_before_cursor};
 pub(crate) const ENGINE_IFACE: &str = "org.freedesktop.IBus.Engine";
 
 /// 界面状态快照（所有数据均为 owned，可安全跨 await）。
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct UiState {
     /// 预编辑文本：语音提示 + 已确认的汉字 + 分节显示的未确认拼音（`你好 shi jie`）。
     pub preedit: String,
     pub all_cands: Vec<String>,
     /// 光标在全部候选中的绝对位置（面板据此计算当前页）。
     pub cursor_abs: u32,
+}
+
+#[derive(Default)]
+struct UiCache {
+    /// 最近一次完整发送成功的快照；失败时保持 None，下一次必须重试。
+    last_sent: Option<UiState>,
 }
 
 /// 一个输入上下文的共享内核。
@@ -50,11 +57,15 @@ pub struct EngineCore {
     last_commit_char: Mutex<Option<char>>,
     /// 语音会话的状态提示（`🎤 说话中…`）；None = 没在录音。
     voice_hint: Mutex<Option<String>>,
+    /// 串行化两路 UI signal，防止旧快照在新快照之后到达面板。
+    ui_send_lock: tokio::sync::Mutex<()>,
+    /// 仅缓存派生的最后发送快照，不作为输入状态的事实来源。
+    ui_cache: Mutex<UiCache>,
 }
 
 impl EngineCore {
     /// 新建内核。
-    pub(crate) const fn new(
+    pub(crate) fn new(
         conn: Connection,
         path: String,
         decoder: Arc<Decoder>,
@@ -69,6 +80,8 @@ impl EngineCore {
             surrounding: Mutex::new(None),
             last_commit_char: Mutex::new(None),
             voice_hint: Mutex::new(None),
+            ui_send_lock: tokio::sync::Mutex::new(()),
+            ui_cache: Mutex::new(UiCache::default()),
         }
     }
 
@@ -96,12 +109,7 @@ impl EngineCore {
             .voice_hint
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = hint;
-        let ui = self.snapshot();
-        if ui.preedit.is_empty() && ui.all_cands.is_empty() {
-            self.hide_ui().await;
-        } else {
-            self.update_ui(&ui).await;
-        }
+        self.publish_current_ui().await;
     }
 
     /// 取当前状态快照（不持锁跨 await）。
@@ -127,8 +135,26 @@ impl EngineCore {
         }
     }
 
-    /// 更新候选窗口与预编辑文本（上屏前的拼音）。
-    pub(crate) async fn update_ui(&self, ui: &UiState) {
+    /// 在取得发送锁之后重新取快照，确保并发调用不会发送过期状态。
+    async fn publish_current_ui(&self) {
+        let _send_guard = self.ui_send_lock.lock().await;
+        let ui = self.snapshot();
+        self.send_ui_locked(&ui).await;
+    }
+
+    /// 发送一个完整快照；调用者必须持有 `ui_send_lock`。
+    async fn send_ui_locked(&self, ui: &UiState) {
+        if self
+            .ui_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_sent
+            .as_ref()
+            == Some(ui)
+        {
+            return;
+        }
+
         // 预编辑文本（拼音缓冲区 / 语音提示）
         let (preedit, cursor, visible) = if ui.preedit.is_empty() {
             (String::new(), 0u32, false)
@@ -139,7 +165,7 @@ impl EngineCore {
                 true,
             )
         };
-        let _ = self
+        let preedit_result = self
             .conn
             .emit_signal(
                 None::<&str>,
@@ -160,7 +186,7 @@ impl EngineCore {
             ui.cursor_abs,
             visible,
         );
-        let _ = self
+        let lookup_result = self
             .conn
             .emit_signal(
                 None::<&str>,
@@ -170,47 +196,46 @@ impl EngineCore {
                 &(table, visible),
             )
             .await;
+
+        let mut cache = self.ui_cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if preedit_result.is_ok() && lookup_result.is_ok() {
+            cache.last_sent = Some(ui.clone());
+        } else {
+            // 任一路失败都不记为成功，后续刷新必须重发两路，避免预编辑和候选表
+            // 只更新了一半后被缓存短路。
+            cache.last_sent = None;
+            log::debug!(
+                "UI refresh signal failed: preedit={:?}, lookup={:?}",
+                preedit_result.as_ref().err(),
+                lookup_result.as_ref().err()
+            );
+        }
     }
 
     /// 隐藏预编辑文本与候选窗口。
     pub(crate) async fn hide_ui(&self) {
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                self.path.as_str(),
-                ENGINE_IFACE,
-                "UpdatePreeditText",
-                &(cnt_ibus::text(""), 0u32, false, 0u32),
-            )
-            .await;
-        let table = cnt_ibus::lookup_table(
-            &[],
-            u32::try_from(self.page_size).expect("page size fits u32"),
-            0,
-            false,
-        );
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                self.path.as_str(),
-                ENGINE_IFACE,
-                "UpdateLookupTable",
-                &(table, false),
-            )
-            .await;
+        let _send_guard = self.ui_send_lock.lock().await;
+        self.send_ui_locked(&UiState {
+            preedit: String::new(),
+            all_cands: Vec::new(),
+            cursor_abs: 0,
+        })
+        .await;
     }
 
     /// 提交一段文字并清空状态。
     pub(crate) async fn commit(&self, text: &str) {
+        let _send_guard = self.ui_send_lock.lock().await;
         // 记住自己上屏的最后一个字符：下一个标点的宽度判定以此为准，
         // 不再依赖应用是否及时重发 surrounding text。
         *self
             .last_commit_char
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = text.chars().last();
-        let _ = self
+        // 先从事实状态中取走组合，避免 CommitText 的 await 期间并发按键写入的
+        // 新组合随后被误清掉；UI 发送仍由同一把锁串行化，提交后再画空状态。
+        self.lock_state().clear();
+        let commit_result = self
             .conn
             .emit_signal(
                 None::<&str>,
@@ -220,17 +245,26 @@ impl EngineCore {
                 &(cnt_ibus::text(text),),
             )
             .await;
-        self.lock_state().clear();
-        self.hide_ui().await;
+        self.send_ui_locked(&UiState {
+            preedit: String::new(),
+            all_cands: Vec::new(),
+            cursor_abs: 0,
+        })
+        .await;
+        if let Err(error) = commit_result {
+            log::debug!("CommitText signal failed: {error}");
+        }
     }
 
     /// 语音识别结果上屏：上屏后把语音提示重新画回去（会话还在继续）。
+    ///
+    /// 必须先清提示再提交：`CommitText` 到达应用时，预编辑里若是还挂着
+    /// 「🎤 说话中 …」（含话筒图标），某些应用会把预编辑一起提交上屏
+    /// （实测：提示文字被打进文档、语音结果反而没上）。提交边界必须保证
+    /// 预编辑为空；常开模式的提示由事件泵在 `commit_voice` 返回后重画。
     pub(crate) async fn commit_voice(&self, text: &str) {
+        self.set_voice_hint(None).await;
         self.commit(text).await;
-        if self.hint().is_some() {
-            let ui = self.snapshot();
-            self.update_ui(&ui).await;
-        }
     }
 
     /// 丢弃半角判定的上下文（焦点切换/重置：旧位置的前一字符已无意义）。
@@ -304,8 +338,7 @@ impl EngineCore {
 
     /// 刷新界面（按键处理完 / 语音提示变化）。
     pub(crate) async fn refresh_after_handled(&self) {
-        let ui = self.snapshot();
-        self.update_ui(&ui).await;
+        self.publish_current_ui().await;
     }
 
     /// 忘记一组学习段（Ctrl+Delete：撤销误学），随后刷新候选窗。
