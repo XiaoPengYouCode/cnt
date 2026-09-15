@@ -61,6 +61,8 @@ pub struct EngineCore {
     ui_send_lock: tokio::sync::Mutex<()>,
     /// 仅缓存派生的最后发送快照，不作为输入状态的事实来源。
     ui_cache: Mutex<UiCache>,
+    /// 串行化会改写组合状态的用户操作与语音提交。
+    operation_gate: tokio::sync::Mutex<()>,
 }
 
 impl EngineCore {
@@ -82,7 +84,13 @@ impl EngineCore {
             voice_hint: Mutex::new(None),
             ui_send_lock: tokio::sync::Mutex::new(()),
             ui_cache: Mutex::new(UiCache::default()),
+            operation_gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// 锁住一次完整的输入操作；调用者可在持锁期间跨 await。
+    pub(crate) async fn lock_operations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.operation_gate.lock().await
     }
 
     /// 解码器（候选来源 + 用户学习）。
@@ -197,18 +205,21 @@ impl EngineCore {
             )
             .await;
 
-        let mut cache = self.ui_cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if preedit_result.is_ok() && lookup_result.is_ok() {
-            cache.last_sent = Some(ui.clone());
-        } else {
-            // 任一路失败都不记为成功，后续刷新必须重发两路，避免预编辑和候选表
-            // 只更新了一半后被缓存短路。
-            cache.last_sent = None;
-            log::debug!(
-                "UI refresh signal failed: preedit={:?}, lookup={:?}",
-                preedit_result.as_ref().err(),
-                lookup_result.as_ref().err()
-            );
+        {
+            let mut cache = self.ui_cache.lock().unwrap_or_else(PoisonError::into_inner);
+            if preedit_result.is_ok() && lookup_result.is_ok() {
+                cache.last_sent = Some(ui.clone());
+            } else {
+                // 任一路失败都不记为成功，后续刷新必须重发两路，避免预编辑和候选表
+                // 只更新了一半后被缓存短路。
+                cache.last_sent = None;
+                log::debug!(
+                    "UI refresh signal failed: preedit={:?}, lookup={:?}",
+                    preedit_result.as_ref().err(),
+                    lookup_result.as_ref().err()
+                );
+            }
+            drop(cache);
         }
     }
 
@@ -226,6 +237,10 @@ impl EngineCore {
     /// 提交一段文字并清空状态。
     pub(crate) async fn commit(&self, text: &str) {
         let _send_guard = self.ui_send_lock.lock().await;
+        self.commit_locked(text).await;
+    }
+
+    async fn commit_locked(&self, text: &str) {
         // 记住自己上屏的最后一个字符：下一个标点的宽度判定以此为准，
         // 不再依赖应用是否及时重发 surrounding text。
         *self
@@ -262,9 +277,14 @@ impl EngineCore {
     /// 「🎤 说话中 …」（含话筒图标），某些应用会把预编辑一起提交上屏
     /// （实测：提示文字被打进文档、语音结果反而没上）。提交边界必须保证
     /// 预编辑为空；常开模式的提示由事件泵在 `commit_voice` 返回后重画。
-    pub(crate) async fn commit_voice(&self, text: &str) {
-        self.set_voice_hint(None).await;
-        self.commit(text).await;
+    /// 调用者已持有 `operation_gate` 时使用，避免重复加锁。
+    pub(crate) async fn commit_voice_locked(&self, text: &str) {
+        let _send_guard = self.ui_send_lock.lock().await;
+        *self
+            .voice_hint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.commit_locked(text).await;
     }
 
     /// 丢弃半角判定的上下文（焦点切换/重置：旧位置的前一字符已无意义）。
@@ -369,6 +389,11 @@ impl EngineCore {
 
     /// 若正在组合，把预编辑先上屏（中英切换 / 开始语音输入前调用）。
     pub(crate) async fn commit_composing(&self) {
+        let _operation_guard = self.operation_gate.lock().await;
+        self.commit_composing_locked().await;
+    }
+
+    async fn commit_composing_locked(&self) {
         let pending = self.lock_state().take_composing();
         if let Some((text, learned)) = pending {
             log::debug!("commit pending composition: {text}");

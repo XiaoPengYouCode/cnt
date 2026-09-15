@@ -211,7 +211,7 @@ const KEY_CACHE_CAP: usize = 4096;
 const NO_NODE: u32 = u32::MAX;
 
 /// 上一个词的状态（打分用）：句首 vs 有前词（可能不在 LM 词表）。
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Prev {
     /// 句首：用读音感知的基础分
     Start,
@@ -239,6 +239,8 @@ struct Limits {
     top_sentences: usize,
     /// 模糊边的额外惩罚（单音节输入无上下文佐证时加重）
     fuzzy_extra: f32,
+    /// 句首之前已确认的前词状态。
+    initial_prev: Prev,
 }
 
 impl Limits {
@@ -250,17 +252,20 @@ impl Limits {
                 words_per_key: WORDS_PER_SYLLABLE_MONO,
                 top_sentences: TOP_SENTENCES_MONO,
                 fuzzy_extra: SINGLE_SYLLABLE_FUZZY_PENALTY,
+                initial_prev: Prev::Start,
             },
             // 双音节：展开是乘性的，取中间档
             2 => Self {
                 words_per_key: WORDS_PER_SYLLABLE_SHORT,
                 top_sentences: TOP_SENTENCES_SHORT,
                 fuzzy_extra: 0.0,
+                initial_prev: Prev::Start,
             },
             _ => Self {
                 words_per_key: WORDS_PER_SYLLABLE,
                 top_sentences: TOP_SENTENCES,
                 fuzzy_extra: 0.0,
+                initial_prev: Prev::Start,
             },
         }
     }
@@ -742,7 +747,6 @@ impl<L: NgramLm> Decoder<L> {
         boundaries: &[usize],
         lm: &L,
         limits: Limits,
-        initial_prev: Prev,
     ) -> BeamResult {
         let _ = pinyin; // 位置同步版不再按输入长度轮询
         let mut arena: Vec<Node> = Vec::new();
@@ -752,7 +756,7 @@ impl<L: NgramLm> Decoder<L> {
         let mut at: Vec<Vec<Hyp>> = (0..=lattice.len()).map(|_| Vec::new()).collect();
         at[0].push(Hyp {
             pos: 0,
-            prev: initial_prev,
+            prev: limits.initial_prev,
             score: 0.0,
             fuzzy_edges: 0,
             first_tail: false,
@@ -1031,12 +1035,12 @@ impl<L: NgramLm> Decoder<L> {
 
         // 覆盖输入所需的最少音节数（最短跳数 DP）：候选规模按它自适应。
         // 单音节 li 与七字整句用同一套上限是错的（前者要宽、后者要省）。
-        let limits = Limits::for_syllables(min_syllables(&lattice));
+        let mut limits = Limits::for_syllables(min_syllables(&lattice));
 
         // EngineState 的 confirmed 是已经选定的前文；二元 LM 只需最后一个词。
         // 未登录 LM 的前词仍保留 Word(None)，让当前词走「有前词但无 bigram」的
         // backoff 路径，而不是错误地当作句首。
-        let initial_prev = context
+        limits.initial_prev = context
             .last()
             .map_or(Prev::Start, |word| Prev::Word(lm.word_index(&word.word)));
 
@@ -1044,15 +1048,7 @@ impl<L: NgramLm> Decoder<L> {
             hyps,
             arena,
             keys_at,
-        } = self.beam_search(
-            &clean,
-            &lattice,
-            &reachable,
-            &boundaries,
-            lm,
-            limits,
-            initial_prev,
-        );
+        } = self.beam_search(&clean, &lattice, &reachable, &boundaries, lm, limits);
         let mut out: Vec<Scored> = hyps
             .into_iter()
             .map(|h| {

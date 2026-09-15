@@ -549,15 +549,17 @@ fn cmd_live(args: &[String]) -> CliResult {
         loop {
             tokio::select! {
                 event = session.next() => match event {
-                    Some(VoiceEvent::Text(text)) => println!("→ {text}"),
-                    Some(VoiceEvent::Empty) => println!("（没听到内容）"),
-                    Some(VoiceEvent::Error(e)) => eprintln!("识别出错: {e}"),
-                    Some(VoiceEvent::Recognizing) => eprintln!("识别中……"),
-                    Some(VoiceEvent::Level { secs, db }) => {
+                    Some(VoiceEvent::Text { text, .. }) => println!("→ {text}"),
+                    Some(VoiceEvent::Empty { .. }) => println!("（没听到内容）"),
+                    Some(VoiceEvent::Error { error, .. }) => eprintln!("识别出错: {error}"),
+                    Some(VoiceEvent::Recognizing { .. }) => eprintln!("识别中……"),
+                    Some(VoiceEvent::Level { secs, db, .. }) => {
                         eprint!("\r录音 {secs:5.1}s  {db:6.1} dBFS   ");
                     }
-                    Some(VoiceEvent::Started(m)) => eprintln!("开始（{}）", m.as_str()),
-                    Some(VoiceEvent::Stopped) | None => break,
+                    Some(VoiceEvent::Started { mode, .. }) => {
+                        eprintln!("开始（{}）", mode.as_str());
+                    }
+                    Some(VoiceEvent::Stopped { .. }) | None => break,
                 },
                 () = tokio::time::sleep_until(deadline) => {
                     voice.stop()?;

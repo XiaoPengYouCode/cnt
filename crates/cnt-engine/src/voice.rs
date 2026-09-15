@@ -22,14 +22,15 @@
 //! 字母键会一直往应用灌字符。默认 `Alt_R`（很多 2024 年后的键盘已经把右 Ctrl
 //! 换成了 Copilot 键），且**不消费**该事件——照常转发给应用，行为与平时按 Alt 一致。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use cnt_input::hotkey::{Hotkey, is_release, mask};
-use cnt_voice::{Mode, Voice, VoiceError, VoiceEvent};
+use cnt_voice::{Mode, Voice, VoiceError, VoiceEvent, VoiceSession};
 use fastrace::Span;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
+use futures_util::FutureExt as _;
 
 use crate::core::EngineCore;
 
@@ -80,15 +81,77 @@ const TOGGLE_FALLBACK: Hotkey = Hotkey {
     mods: mask::CONTROL | mask::SHIFT,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoicePhase {
+    Idle,
+    Starting,
+    Recording,
+    Stopping,
+    Finished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PttState {
+    Released,
+    Held,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuousState {
+    Off,
+    On,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopState {
+    None,
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelState {
+    Clear,
+    Requested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceAction {
+    None,
+    Start(Mode),
+    Stop,
+}
+
+#[derive(Debug)]
+struct VoiceState {
+    phase: VoicePhase,
+    ptt: PttState,
+    continuous: ContinuousState,
+    stop: StopState,
+    cancel: CancelState,
+    session_id: Option<u64>,
+}
+
+impl Default for VoiceState {
+    fn default() -> Self {
+        Self {
+            phase: VoicePhase::Idle,
+            ptt: PttState::Released,
+            continuous: ContinuousState::Off,
+            stop: StopState::None,
+            cancel: CancelState::Clear,
+            session_id: None,
+        }
+    }
+}
+
 /// 引擎侧的语音运行时（所有输入上下文共享一份：麦克风和模型都只该有一份）。
 pub struct VoiceRuntime {
     voice: Arc<Voice>,
     ptt: Hotkey,
     toggle: Hotkey,
-    /// PTT 是否处于「按住」状态（按键会重复上报，必须去抖）。
-    ptt_held: AtomicBool,
-    /// 常开模式是否开启。
-    continuous: AtomicBool,
+    /// 串行化按键、提交和取消，保证会话状态有单一线性顺序。
+    lifecycle_gate: tokio::sync::Mutex<()>,
+    state: Mutex<VoiceState>,
 }
 
 impl VoiceRuntime {
@@ -120,9 +183,63 @@ impl VoiceRuntime {
             voice: Arc::new(voice),
             ptt,
             toggle,
-            ptt_held: AtomicBool::new(false),
-            continuous: AtomicBool::new(false),
+            lifecycle_gate: tokio::sync::Mutex::new(()),
+            state: Mutex::new(VoiceState::default()),
         }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, VoiceState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn output_allowed(&self, session_id: u64) -> bool {
+        let state = self.lock_state();
+        state.session_id == Some(session_id)
+            && state.phase != VoicePhase::Finished
+            && state.cancel == CancelState::Clear
+    }
+
+    fn continuous_for(&self, session_id: u64) -> bool {
+        let state = self.lock_state();
+        state.session_id == Some(session_id)
+            && state.continuous == ContinuousState::On
+            && state.cancel == CancelState::Clear
+    }
+
+    fn finish_session(&self, session_id: u64) -> bool {
+        let mut state = self.lock_state();
+        if state.session_id != Some(session_id) {
+            return false;
+        }
+        state.phase = VoicePhase::Finished;
+        state.session_id = None;
+        state.ptt = PttState::Released;
+        state.continuous = ContinuousState::Off;
+        state.stop = StopState::None;
+        state.cancel = CancelState::Clear;
+        state.phase = VoicePhase::Idle;
+        true
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.lock_state().cancel == CancelState::Requested
+    }
+
+    fn has_session(&self) -> bool {
+        self.lock_state().phase != VoicePhase::Idle
+    }
+
+    fn reset_start(&self) {
+        let mut state = self.lock_state();
+        if state.session_id.is_some() || state.phase != VoicePhase::Starting {
+            return;
+        }
+        state.phase = VoicePhase::Idle;
+        state.ptt = PttState::Released;
+        state.continuous = ContinuousState::Off;
+        state.stop = StopState::None;
+        state.cancel = CancelState::Clear;
+        state.session_id = None;
     }
 
     /// 处理一个按键事件（在任何其他按键逻辑之前调用）。
@@ -137,70 +254,145 @@ impl VoiceRuntime {
         // ---- 录音中按 Esc：放弃（一个字都不上屏）----
         // 这条必须有：说错了、被人打断了、误触了，用户需要一个「作废」出口，
         // 否则唯一选择是让错的内容上屏再删。
-        if keyval == KEY_ESCAPE && !release && self.voice.is_active() {
+        if keyval == KEY_ESCAPE && !release && self.has_session() {
             log::info!("voice: cancelled by Esc");
-            self.continuous.store(false, Ordering::SeqCst);
-            self.ptt_held.store(false, Ordering::SeqCst);
-            if let Err(e) = self.voice.cancel() {
-                log::error!("voice: cancel failed: {e}");
-            }
+            self.cancel().await;
             core.set_voice_hint(Some(HINT_CANCELLED.to_owned())).await;
             return KeyOutcome::Consumed;
         }
 
-        // ---- 切换式常开 ----
         if self.toggle.matches(keyval, state) {
-            if release {
-                return KeyOutcome::Consumed; // 组合键的释放事件不给应用
-            }
-            // fetch_xor 一次原子翻转并拿到旧值（先 load 再 swap 会有竞态）
-            if self.continuous.fetch_xor(true, Ordering::SeqCst) {
-                log::info!("voice: continuous mode off");
-                if let Err(e) = self.voice.stop() {
-                    log::error!("voice: stop failed: {e}");
-                }
-            } else {
-                self.begin(core, Mode::Continuous).await;
-            }
-            return KeyOutcome::Consumed;
+            return self.handle_toggle(core, release).await;
         }
 
-        // ---- 按住说话 ----
         if self.ptt.matches(keyval, state) {
-            if release {
-                if self.ptt_held.swap(false, Ordering::SeqCst) {
-                    log::debug!("voice: ptt released");
-                    if let Err(e) = self.voice.stop() {
-                        log::error!("voice: stop failed: {e}");
-                    }
-                }
-            } else if !self.ptt_held.swap(true, Ordering::SeqCst) {
-                if self.continuous.load(Ordering::SeqCst) {
-                    log::debug!("voice: ptt ignored (continuous mode active)");
-                } else {
-                    log::debug!("voice: ptt pressed");
-                    self.begin(core, Mode::PushToTalk).await;
-                }
-            }
-            // 修饰键要照常转发，应用侧的 Ctrl 行为不能被输入法吞掉
-            return if self.ptt.is_modifier_key() {
-                KeyOutcome::Forwarded
-            } else {
-                KeyOutcome::Consumed
-            };
+            return self.handle_ptt(core, release).await;
         }
 
         KeyOutcome::NotVoice
     }
 
+    async fn handle_toggle(self: &Arc<Self>, core: &Arc<EngineCore>, release: bool) -> KeyOutcome {
+        if release {
+            return KeyOutcome::Consumed;
+        }
+        let action = {
+            let mut state = self.lock_state();
+            let action = if state.continuous == ContinuousState::On {
+                state.continuous = ContinuousState::Off;
+                if state.phase == VoicePhase::Starting {
+                    state.stop = StopState::Pending;
+                    VoiceAction::None
+                } else {
+                    state.phase = VoicePhase::Stopping;
+                    VoiceAction::Stop
+                }
+            } else if state.phase == VoicePhase::Idle {
+                state.continuous = ContinuousState::On;
+                state.cancel = CancelState::Clear;
+                state.phase = VoicePhase::Starting;
+                VoiceAction::Start(Mode::Continuous)
+            } else {
+                log::debug!("voice: continuous start ignored while session is active");
+                VoiceAction::None
+            };
+            drop(state);
+            action
+        };
+        match action {
+            VoiceAction::None => {}
+            VoiceAction::Start(mode) => self.begin(core, mode).await,
+            VoiceAction::Stop => {
+                log::info!("voice: continuous mode off");
+                if let Err(e) = self.voice.stop() {
+                    log::error!("voice: stop failed: {e}");
+                }
+            }
+        }
+        KeyOutcome::Consumed
+    }
+
+    async fn handle_ptt(self: &Arc<Self>, core: &Arc<EngineCore>, release: bool) -> KeyOutcome {
+        let action = if release {
+            let mut state = self.lock_state();
+            match state.ptt {
+                PttState::Released => VoiceAction::None,
+                PttState::Held => {
+                    state.ptt = PttState::Released;
+                    match state.phase {
+                        VoicePhase::Starting => {
+                            state.stop = StopState::Pending;
+                            VoiceAction::None
+                        }
+                        VoicePhase::Recording => {
+                            state.phase = VoicePhase::Stopping;
+                            VoiceAction::Stop
+                        }
+                        _ => VoiceAction::None,
+                    }
+                }
+            }
+        } else {
+            let mut state = self.lock_state();
+            match state.ptt {
+                PttState::Held => VoiceAction::None,
+                PttState::Released => {
+                    state.ptt = PttState::Held;
+                    if state.continuous == ContinuousState::On {
+                        log::debug!("voice: ptt ignored (continuous mode active)");
+                        VoiceAction::None
+                    } else if state.phase == VoicePhase::Idle {
+                        state.cancel = CancelState::Clear;
+                        state.phase = VoicePhase::Starting;
+                        VoiceAction::Start(Mode::PushToTalk)
+                    } else if state.phase == VoicePhase::Starting {
+                        state.stop = StopState::None;
+                        VoiceAction::None
+                    } else {
+                        VoiceAction::None
+                    }
+                }
+            }
+        };
+        match action {
+            VoiceAction::Start(mode) => {
+                log::debug!("voice: ptt pressed");
+                self.begin(core, mode).await;
+            }
+            VoiceAction::Stop => {
+                log::debug!("voice: ptt released");
+                if let Err(e) = self.voice.stop() {
+                    log::error!("voice: stop failed: {e}");
+                }
+            }
+            VoiceAction::None => {}
+        }
+        if self.ptt.is_modifier_key() {
+            KeyOutcome::Forwarded
+        } else {
+            KeyOutcome::Consumed
+        }
+    }
+
     /// 会话结束时（引擎失去焦点 / 被禁用）收尾：麦克风不能跟着焦点漂。
-    pub fn cancel(&self) {
-        if self.voice.is_active() {
+    pub async fn cancel(&self) {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let should_cancel = {
+            let mut state = self.lock_state();
+            if state.phase == VoicePhase::Idle {
+                false
+            } else {
+                state.cancel = CancelState::Requested;
+                state.phase = VoicePhase::Stopping;
+                state.continuous = ContinuousState::Off;
+                state.ptt = PttState::Released;
+                true
+            }
+        };
+        if should_cancel {
             log::info!("voice: cancelling session (focus lost)");
-            self.continuous.store(false, Ordering::SeqCst);
-            self.ptt_held.store(false, Ordering::SeqCst);
-            if let Err(e) = self.voice.stop() {
-                log::error!("voice: stop failed: {e}");
+            if let Err(e) = self.voice.cancel() {
+                log::error!("voice: cancel failed: {e}");
             }
         }
     }
@@ -208,77 +400,127 @@ impl VoiceRuntime {
     /// 开一个会话：先把拼音预编辑上屏，再起事件泵。
     async fn begin(self: &Arc<Self>, core: &Arc<EngineCore>, mode: Mode) {
         core.commit_composing().await;
+        if self.cancel_requested() {
+            self.reset_start();
+            return;
+        }
         let session = match self.voice.start(mode) {
             Ok(s) => s,
             Err(VoiceError::Busy) => {
                 log::debug!("voice: session already active");
+                self.reset_start();
                 return;
             }
             Err(e) => {
                 log::error!("voice: cannot start session: {e}");
+                self.reset_start();
                 core.set_voice_hint(None).await;
                 return;
             }
         };
+        let session_id = session.session_id();
+        let stop_after_start = {
+            let mut state = self.lock_state();
+            state.session_id = Some(session_id);
+            let cancel = state.cancel == CancelState::Requested;
+            let stop = cancel
+                || state.stop == StopState::Pending
+                || (mode == Mode::PushToTalk && state.ptt == PttState::Released);
+            state.stop = StopState::None;
+            state.phase = if stop {
+                VoicePhase::Stopping
+            } else {
+                VoicePhase::Recording
+            };
+            stop
+        };
         let core = Arc::clone(core);
         let runtime = Arc::clone(self);
-        // 事件泵：识别在别的线程，这里只把结果搬到 IBus 上。
-        // spawn 而不是 await：按键处理必须立刻返回。
         tokio::spawn(async move {
-            let mut session = session;
-            while let Some(event) = session.next().await {
-                match event {
-                    VoiceEvent::Started(Mode::PushToTalk) => {
-                        core.set_voice_hint(Some(HINT_LISTENING.to_owned())).await;
+            let cleanup_runtime = Arc::clone(&runtime);
+            let result = AssertUnwindSafe(runtime.run_session(core.clone(), session))
+                .catch_unwind()
+                .await;
+            if result.is_err() {
+                log::error!("voice: event pump panicked; closing session {session_id}");
+                if cleanup_runtime.finish_session(session_id) {
+                    core.set_voice_hint(None).await;
+                }
+            }
+        });
+        if stop_after_start {
+            let cancelled = self.cancel_requested();
+            let result = if cancelled {
+                self.voice.cancel()
+            } else {
+                self.voice.stop()
+            };
+            if let Err(e) = result {
+                log::error!("voice: stop-after-start failed: {e}");
+            }
+        }
+    }
+
+    async fn run_session(self: Arc<Self>, core: Arc<EngineCore>, mut session: VoiceSession) {
+        let session_id = session.session_id();
+        while let Some(event) = session.next().await {
+            if event.session_id() != session_id {
+                log::warn!(
+                    "voice: ignoring event from unexpected session {} (current {})",
+                    event.session_id(),
+                    session_id
+                );
+                continue;
+            }
+            match event {
+                VoiceEvent::Started { mode, .. } if self.output_allowed(session_id) => {
+                    let hint = match mode {
+                        Mode::PushToTalk => HINT_LISTENING,
+                        Mode::Continuous => HINT_LISTENING_CONT,
+                    };
+                    core.set_voice_hint(Some(hint.to_owned())).await;
+                }
+                VoiceEvent::Level { secs, db, .. } if self.output_allowed(session_id) => {
+                    let base = if self.continuous_for(session_id) {
+                        HINT_LISTENING_CONT
+                    } else {
+                        HINT_LISTENING
+                    };
+                    core.set_voice_hint(Some(format!("{base} {secs:.1}s {}", meter(db))))
+                        .await;
+                }
+                VoiceEvent::Recognizing { .. } if self.output_allowed(session_id) => {
+                    core.set_voice_hint(Some(HINT_RECOGNIZING.to_owned())).await;
+                }
+                VoiceEvent::Text { text, .. } => {
+                    let _operation_guard = core.lock_operations().await;
+                    let _lifecycle_guard = self.lifecycle_gate.lock().await;
+                    if !self.output_allowed(session_id) {
+                        continue;
                     }
-                    VoiceEvent::Started(Mode::Continuous) => {
+                    let chars = text.chars().count();
+                    core.commit_voice_locked(&text)
+                        .in_span(
+                            Span::root("voice_commit", SpanContext::random())
+                                .with_property(|| ("chars", chars.to_string())),
+                        )
+                        .await;
+                    if self.continuous_for(session_id) {
                         core.set_voice_hint(Some(HINT_LISTENING_CONT.to_owned()))
                             .await;
                     }
-                    VoiceEvent::Level { secs, db } => {
-                        let base = if runtime.continuous.load(Ordering::SeqCst) {
-                            HINT_LISTENING_CONT
-                        } else {
-                            HINT_LISTENING
-                        };
-                        core.set_voice_hint(Some(format!("{base} {secs:.1}s {}", meter(db))))
-                            .await;
-                    }
-                    VoiceEvent::Recognizing => {
-                        core.set_voice_hint(Some(HINT_RECOGNIZING.to_owned())).await;
-                    }
-                    VoiceEvent::Text(text) => {
-                        // 常开模式一句一次上屏；提示随后重画（会话还在继续）。
-                        //
-                        // 这里独立成一棵 root span 而不是接到 cnt-voice 的
-                        // voice_release_to_commit 下面：上屏发生在**引擎的 tokio 任务**里，
-                        // 跨任务连成一棵树需要把 SpanContext 随事件传过来。
-                        // 先量出 D-Bus 这一段到底有多贵，再决定值不值得做那层传递。
-                        let chars = text.chars().count();
-                        core.commit_voice(&text)
-                            .in_span(
-                                Span::root("voice_commit", SpanContext::random())
-                                    .with_property(|| ("chars", chars.to_string())),
-                            )
-                            .await;
-                        if runtime.continuous.load(Ordering::SeqCst) {
-                            core.set_voice_hint(Some(HINT_LISTENING_CONT.to_owned()))
-                                .await;
-                        }
-                    }
-                    VoiceEvent::Empty => {
-                        log::debug!("voice: nothing recognized");
-                    }
-                    VoiceEvent::Error(e) => {
-                        log::error!("voice: {e}");
-                    }
-                    VoiceEvent::Stopped => break,
                 }
+                VoiceEvent::Empty { .. } => log::debug!("voice: nothing recognized"),
+                VoiceEvent::Error { error, .. } => log::error!("voice: {error}"),
+                VoiceEvent::Stopped { .. } => break,
+                VoiceEvent::Started { .. }
+                | VoiceEvent::Level { .. }
+                | VoiceEvent::Recognizing { .. } => {}
             }
-            runtime.continuous.store(false, Ordering::SeqCst);
-            runtime.ptt_held.store(false, Ordering::SeqCst);
+        }
+        if self.finish_session(session_id) {
             core.set_voice_hint(None).await;
-        });
+        }
     }
 }
 

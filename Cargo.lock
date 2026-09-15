@@ -273,6 +273,7 @@ dependencies = [
  "cnt-input",
  "cnt-voice",
  "fastrace",
+ "futures-util",
  "log",
  "tokio",
  "zbus",

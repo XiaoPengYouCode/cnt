@@ -30,8 +30,9 @@
 //! 属性带上音频长度、识别耗时与 RTF（实时率）。语音链路的性能判断全靠这棵树：
 //! 「慢」到底慢在采集尾巴、fbank 还是 encoder，不看 span 树只能猜。
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
@@ -103,22 +104,38 @@ impl Mode {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceEvent {
     /// 麦克风已打开，开始采集。
-    Started(Mode),
+    Started { session_id: u64, mode: Mode },
     /// 采集中的实时状态：已录时长（秒）+ 当前音量（dBFS）。
     ///
     /// 非流式模型没有中间结果，界面上必须有**别的**东西证明「它在听」，
     /// 否则用户不知道该不该继续说。这条事件就是那个证据。
-    Level { secs: f32, db: f32 },
+    Level { session_id: u64, secs: f32, db: f32 },
     /// 采集结束，正在识别（PTT 松手后 UI 应显示「识别中」）。
-    Recognizing,
+    Recognizing { session_id: u64 },
     /// 一段识别结果（常开模式一句一条）。
-    Text(String),
+    Text { session_id: u64, text: String },
     /// 这一段没有识别出内容（静音 / 只有噪声）。
-    Empty,
+    Empty { session_id: u64 },
     /// 出错（麦克风被占用、模型报错……）。
-    Error(String),
+    Error { session_id: u64, error: String },
     /// 会话结束，麦克风已关闭。
-    Stopped,
+    Stopped { session_id: u64 },
+}
+
+impl VoiceEvent {
+    /// 事件所属的语音会话；引擎据此拒绝旧会话迟到的回写。
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        match self {
+            Self::Started { session_id, .. }
+            | Self::Level { session_id, .. }
+            | Self::Recognizing { session_id }
+            | Self::Text { session_id, .. }
+            | Self::Empty { session_id }
+            | Self::Error { session_id, .. }
+            | Self::Stopped { session_id } => *session_id,
+        }
+    }
 }
 
 /// 语音输入配置。
@@ -147,10 +164,17 @@ impl Default for VoiceConfig {
 
 /// 一次会话的事件流（引擎持有；drop 即不再关心后续事件）。
 pub struct VoiceSession {
+    session_id: u64,
     rx: UnboundedReceiver<VoiceEvent>,
 }
 
 impl VoiceSession {
+    /// 会话 ID；与该会话发出的每一条事件一致。
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
     /// 等下一个事件（会话结束后返回 None）。
     pub async fn next(&mut self) -> Option<VoiceEvent> {
         self.rx.recv().await
@@ -159,7 +183,7 @@ impl VoiceSession {
 
 /// 编排线程命令。
 enum Cmd {
-    Start(Mode, UnboundedSender<VoiceEvent>),
+    Start(u64, Mode, UnboundedSender<VoiceEvent>),
     /// 结束采集并识别（PTT 松手 / 关常开）。
     Stop,
     /// 放弃：停止采集且**不识别、不上屏**（说错了、按错了）。
@@ -171,6 +195,7 @@ enum Cmd {
 pub struct Voice {
     cmd: SyncSender<Cmd>,
     active: Arc<AtomicBool>,
+    next_session_id: AtomicU64,
     handle: Option<std::thread::JoinHandle<()>>,
     backend: String,
     punct: String,
@@ -215,6 +240,7 @@ impl Voice {
         let handle = std::thread::Builder::new()
             .name("cnt-voice".into())
             .spawn(move || {
+                let panic_active = Arc::clone(&worker_active);
                 let worker = Worker {
                     recorder,
                     recognizer,
@@ -223,12 +249,16 @@ impl Voice {
                     config,
                     active: worker_active,
                 };
-                worker.run(&rx);
+                if catch_unwind(AssertUnwindSafe(|| worker.run(&rx))).is_err() {
+                    log::error!("voice: worker panicked; closing all sessions");
+                    panic_active.store(false, Ordering::SeqCst);
+                }
             })
             .map_err(|e| VoiceError::Audio(AudioError::Cpal(e.to_string())))?;
         Ok(Self {
             cmd: tx,
             active,
+            next_session_id: AtomicU64::new(1),
             handle: Some(handle),
             backend,
             punct,
@@ -275,12 +305,15 @@ impl Voice {
         if self.active.swap(true, Ordering::SeqCst) {
             return Err(VoiceError::Busy);
         }
+        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = unbounded_channel();
-        self.cmd.send(Cmd::Start(mode, tx)).map_err(|_| {
-            self.active.store(false, Ordering::SeqCst);
-            VoiceError::WorkerGone
-        })?;
-        Ok(VoiceSession { rx })
+        self.cmd
+            .send(Cmd::Start(session_id, mode, tx))
+            .map_err(|_| {
+                self.active.store(false, Ordering::SeqCst);
+                VoiceError::WorkerGone
+            })?;
+        Ok(VoiceSession { session_id, rx })
     }
 
     /// 结束采集（PTT 松手 / 关掉常开）。识别结果随后通过事件流送达。
@@ -327,7 +360,7 @@ impl Worker {
     fn run(&self, rx: &SyncReceiver<Cmd>) {
         loop {
             match rx.recv() {
-                Ok(Cmd::Start(mode, tx)) => self.session(mode, &tx, rx),
+                Ok(Cmd::Start(session_id, mode, tx)) => self.session(session_id, mode, &tx, rx),
                 // 无会话时的 stop/cancel：忽略
                 Ok(Cmd::Stop | Cmd::Cancel) => {}
                 Ok(Cmd::Quit) | Err(_) => return,
@@ -336,12 +369,21 @@ impl Worker {
     }
 
     /// 一次会话的完整生命周期（采集 → 识别 → 结束）。
-    fn session(&self, mode: Mode, tx: &UnboundedSender<VoiceEvent>, rx: &SyncReceiver<Cmd>) {
+    fn session(
+        &self,
+        session_id: u64,
+        mode: Mode,
+        tx: &UnboundedSender<VoiceEvent>,
+        rx: &SyncReceiver<Cmd>,
+    ) {
         let started = Instant::now();
         if let Err(e) = self.recorder.start() {
             log::error!("voice: cannot open microphone: {e}");
-            let _ = tx.send(VoiceEvent::Error(e.to_string()));
-            let _ = tx.send(VoiceEvent::Stopped);
+            let _ = tx.send(VoiceEvent::Error {
+                session_id,
+                error: e.to_string(),
+            });
+            let _ = tx.send(VoiceEvent::Stopped { session_id });
             self.active.store(false, Ordering::SeqCst);
             return;
         }
@@ -350,9 +392,9 @@ impl Worker {
             mode.as_str(),
             self.recorder.device_name()
         );
-        let _ = tx.send(VoiceEvent::Started(mode));
+        let _ = tx.send(VoiceEvent::Started { session_id, mode });
 
-        let mut captured = self.collect(mode, tx, rx);
+        let mut captured = self.collect(session_id, mode, tx, rx);
 
         // 放弃：录到的音频直接丢掉，一个字都不上屏
         if captured.cancelled {
@@ -362,7 +404,7 @@ impl Worker {
             );
             drop(captured.tail);
             drop(captured.ptt_buffer);
-            let _ = tx.send(VoiceEvent::Stopped);
+            let _ = tx.send(VoiceEvent::Stopped { session_id });
             self.active.store(false, Ordering::SeqCst);
             return;
         }
@@ -377,8 +419,9 @@ impl Worker {
         let released = Instant::now();
         {
             let _guard = commit.set_local_parent();
-            let _ = tx.send(VoiceEvent::Recognizing);
+            let _ = tx.send(VoiceEvent::Recognizing { session_id });
             self.finish(
+                session_id,
                 mode,
                 &mut captured.ptt_buffer,
                 &captured.tail,
@@ -402,7 +445,7 @@ impl Worker {
             "voice: session ended after {:.1}s",
             started.elapsed().as_secs_f32()
         );
-        let _ = tx.send(VoiceEvent::Stopped);
+        let _ = tx.send(VoiceEvent::Stopped { session_id });
         self.active.store(false, Ordering::SeqCst);
         if captured.quit {
             // Quit 命令在会话中到达：结束线程（Voice 正在 drop）
@@ -413,6 +456,7 @@ impl Worker {
     /// 采集阶段：循环读麦克风直到 Stop/Cancel/Quit，关麦后排空尾部。
     fn collect(
         &self,
+        session_id: u64,
         mode: Mode,
         tx: &UnboundedSender<VoiceEvent>,
         rx: &SyncReceiver<Cmd>,
@@ -448,6 +492,7 @@ impl Worker {
             if !chunk.is_empty() && last_level.elapsed() >= LEVEL_INTERVAL {
                 last_level = Instant::now();
                 let _ = tx.send(VoiceEvent::Level {
+                    session_id,
                     secs: samples_to_secs(recorded),
                     db: cnt_audio::vad::frame_db(&chunk),
                 });
@@ -470,7 +515,7 @@ impl Worker {
                         let seg_root = Span::root("voice_segment", SpanContext::random())
                             .with_property(|| ("start_secs", format!("{:.1}", segment.start_secs)));
                         let _guard = seg_root.set_local_parent();
-                        self.recognize_segment(&segment, tx);
+                        self.recognize_segment(session_id, &segment, tx);
                     }
                 }
             }
@@ -493,6 +538,7 @@ impl Worker {
     /// 收尾：把剩余音频识别掉（PTT 是整段，常开是尾巴 + flush）。
     fn finish(
         &self,
+        session_id: u64,
         mode: Mode,
         ptt_buffer: &mut Vec<f32>,
         tail: &[f32],
@@ -508,17 +554,17 @@ impl Worker {
                         "voice: ignoring {secs:.2}s tap (min {}s)",
                         self.config.min_seconds
                     );
-                    let _ = tx.send(VoiceEvent::Empty);
+                    let _ = tx.send(VoiceEvent::Empty { session_id });
                 } else {
-                    self.recognize(ptt_buffer, false, tx);
+                    self.recognize(session_id, ptt_buffer, false, tx);
                 }
             }
             Mode::Continuous => {
                 for segment in segmenter.push(tail) {
-                    self.recognize_segment(&segment, tx);
+                    self.recognize_segment(session_id, &segment, tx);
                 }
                 if let Some(segment) = segmenter.flush() {
-                    self.recognize_segment(&segment, tx);
+                    self.recognize_segment(session_id, &segment, tx);
                 }
                 // 会话级 span：VAD 的判定质量只能在「一整段会话」的尺度上看
                 // （切了几句、丢了几段、噪声底跑到哪去了），逐句 span 看不出来
@@ -547,18 +593,29 @@ impl Worker {
         }
     }
 
-    fn recognize_segment(&self, segment: &Segment, tx: &UnboundedSender<VoiceEvent>) {
+    fn recognize_segment(
+        &self,
+        session_id: u64,
+        segment: &Segment,
+        tx: &UnboundedSender<VoiceEvent>,
+    ) {
         log::debug!(
             "voice: segment at {:.1}s, {:.2}s long{}",
             segment.start_secs,
             samples_to_secs(segment.samples.len()),
             if segment.forced { " (forced cut)" } else { "" }
         );
-        self.recognize(&segment.samples, segment.forced, tx);
+        self.recognize(session_id, &segment.samples, segment.forced, tx);
     }
 
     /// 识别一段音频并发事件。每句话一棵 root span。
-    fn recognize(&self, samples: &[f32], forced: bool, tx: &UnboundedSender<VoiceEvent>) {
+    fn recognize(
+        &self,
+        session_id: u64,
+        samples: &[f32],
+        forced: bool,
+        tx: &UnboundedSender<VoiceEvent>,
+    ) {
         let audio_secs = samples_to_secs(samples.len());
         let started = Instant::now();
         // 每句一个 span，挂在**外层 root** 下（PTT 是 voice_release_to_commit，
@@ -612,7 +669,7 @@ impl Worker {
                 log::info!(
                     "voice: empty result ({audio_secs:.2}s audio, {elapsed:.2}s, rtf {rtf:.2})"
                 );
-                let _ = tx.send(VoiceEvent::Empty);
+                let _ = tx.send(VoiceEvent::Empty { session_id });
             }
             Ok(t) => {
                 log::info!(
@@ -620,11 +677,17 @@ impl Worker {
                     t.text,
                     t.tokens.len()
                 );
-                let _ = tx.send(VoiceEvent::Text(t.text));
+                let _ = tx.send(VoiceEvent::Text {
+                    session_id,
+                    text: t.text,
+                });
             }
             Err(e) => {
                 log::error!("voice: recognition failed: {e}");
-                let _ = tx.send(VoiceEvent::Error(e.to_string()));
+                let _ = tx.send(VoiceEvent::Error {
+                    session_id,
+                    error: e.to_string(),
+                });
             }
         }
     }
@@ -818,9 +881,26 @@ mod tests {
     fn events_are_comparable() {
         // 引擎侧要按事件类型分派，事件需要可比较
         assert_eq!(
-            VoiceEvent::Text("你好".to_owned()),
-            VoiceEvent::Text("你好".to_owned())
+            VoiceEvent::Text {
+                session_id: 7,
+                text: "你好".to_owned()
+            },
+            VoiceEvent::Text {
+                session_id: 7,
+                text: "你好".to_owned()
+            }
         );
-        assert_ne!(VoiceEvent::Empty, VoiceEvent::Stopped);
+        assert_ne!(
+            VoiceEvent::Empty { session_id: 7 },
+            VoiceEvent::Stopped { session_id: 7 }
+        );
+        assert_eq!(
+            VoiceEvent::Text {
+                session_id: 7,
+                text: "你好".to_owned()
+            }
+            .session_id(),
+            7
+        );
     }
 }

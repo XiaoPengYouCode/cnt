@@ -168,6 +168,10 @@ impl Engine {
             }
         }
 
+        // 从这里到 UI 刷新完成，组合状态和对应的 signal 必须属于同一个操作；
+        // 语音提交也使用同一把锁，避免 CommitText await 期间新组合被旧空 UI 覆盖。
+        let _operation_guard = self.core.lock_operations().await;
+
         // Shift 键：必须先于通用 release 检查处理 ——
         // 通用检查会把所有 release 事件拦下（含 Shift 释放），导致释放分支永不执行。
         // 用 RELEASE_MASK 区分按下/释放（IBus 的 release 事件带 1<<30 位）。
@@ -298,6 +302,7 @@ impl Engine {
     }
 
     async fn reset(&self) {
+        let _operation_guard = self.core.lock_operations().await;
         self.core.lock_state().clear();
         self.core.forget_context();
         self.core.hide_ui().await;
@@ -324,6 +329,7 @@ impl Engine {
 
     /// 鼠标点击候选（index 为当前页内从 0 开始的下标）
     async fn candidate_clicked(&self, index: u32, _button: u32, _state: u32) {
+        let _operation_guard = self.core.lock_operations().await;
         let action = {
             let mut st = self.core.lock_state();
             let idx =
@@ -342,21 +348,25 @@ impl Engine {
     }
 
     async fn page_up(&self) {
+        let _operation_guard = self.core.lock_operations().await;
         self.core.lock_state().page_up();
         self.core.refresh_after_handled().await;
     }
 
     async fn page_down(&self) {
+        let _operation_guard = self.core.lock_operations().await;
         self.core.lock_state().page_down();
         self.core.refresh_after_handled().await;
     }
 
     async fn cursor_up(&self) {
+        let _operation_guard = self.core.lock_operations().await;
         self.core.lock_state().cursor_up();
         self.core.refresh_after_handled().await;
     }
 
     async fn cursor_down(&self) {
+        let _operation_guard = self.core.lock_operations().await;
         self.core.lock_state().cursor_down();
         self.core.refresh_after_handled().await;
     }
@@ -406,8 +416,9 @@ impl Engine {
     /// 语音会话绝不能跟着焦点漂到别的窗口去：切走了就停录，
     /// 这是隐私底线，也避免识别结果上屏到错误的应用里。
     async fn leave(&self) {
+        let _operation_guard = self.core.lock_operations().await;
         if let Some(voice) = &self.voice {
-            voice.cancel();
+            voice.cancel().await;
         }
         self.core.lock_state().clear();
         self.core.forget_context();

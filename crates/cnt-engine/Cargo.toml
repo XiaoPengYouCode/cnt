@@ -12,6 +12,7 @@ cnt-input.workspace = true
 cnt-decode.workspace = true
 cnt-voice.workspace = true
 tokio.workspace = true
+futures-util.workspace = true
 fastrace.workspace = true
 log.workspace = true
 
