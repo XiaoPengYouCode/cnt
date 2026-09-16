@@ -87,7 +87,7 @@ bash scripts/fetch-asr-model.sh   # 声学 188 MB → data/asr，标点 65 MB �
 
 | 内容 | 位置 | 权限 |
 |---|---|---|
-| 主程序 / 诊断工具 | `~/.local/bin/cnt-daemon` / `~/.local/bin/cnt-asr-tools` | 用户级 |
+| 主程序 | `~/.local/bin/cnt-daemon` | 用户级 |
 | 词库/语言模型 | `~/.local/share/cnt/{dict.cntd,lm.cntl}` | 用户级 |
 | 语音模型 | `~/.local/share/cnt/{asr,punct}` | 用户级 |
 | 配置 | `~/.config/cnt/config.toml`（缺 `[voice]` 时自动补上并开启语音） | 用户级 |
@@ -101,7 +101,8 @@ Fedora 用 `alsa-lib-devel` / Arch 用 `alsa-lib`）；PipeWire 自带 ALSA 兼�
 
 ```bash
 sudo rm /usr/share/ibus/component/cnt.xml
-rm -rf ~/.local/bin/cnt-daemon ~/.local/bin/cnt-asr-tools ~/.local/share/cnt
+rm -f ~/.local/bin/cnt-daemon
+rm -rf ~/.local/share/cnt
 ibus restart
 ```
 

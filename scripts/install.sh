@@ -3,7 +3,6 @@
 #
 # 安装为「第三个输入法」，与英文输入和 Rime 互不冲突：
 # - 主程序    → ~/.local/bin/cnt-daemon
-# - 诊断工具  → ~/.local/bin/cnt-asr-tools
 # - 数据/模型 → ~/.local/share/cnt/{dict.cntd,lm.cntl,asr/,punct/}
 # - 配置      → ~/.config/cnt/config.toml（缺 [voice] 时自动补上并开启语音）
 # - 组件      → /usr/share/ibus/component/cnt.xml（唯一需要管理员密码的步骤）
@@ -17,7 +16,7 @@
 #
 # 卸载：
 #   sudo rm /usr/share/ibus/component/cnt.xml
-#   rm -rf ~/.local/bin/cnt-daemon ~/.local/bin/cnt-asr-tools ~/.local/share/cnt && ibus restart
+#   rm -f ~/.local/bin/cnt-daemon && rm -rf ~/.local/share/cnt && ibus restart
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -65,7 +64,7 @@ fi
 step "编译程序（首次需要几分钟，请稍候）..."
 # 发布构建：不带 --features 即全局关闭 fastrace（编译期零开销）。
 # onnxruntime 静态链入二进制，安装时不需要额外拷动态库。
-cargo build --release -p cnt-daemon -p cnt-asr-tools
+cargo build --release -p cnt-daemon
 
 # 激活 cnt 输入法：首次启动偶尔会超时，自动重试最多 3 次。
 activate_cnt() {
@@ -99,8 +98,7 @@ if [ -n "${OLD}" ]; then
 fi
 rm -f "${BIN_DIR}/cnt-daemon"
 cp target/release/cnt-daemon "${BIN_DIR}/cnt-daemon"
-cp target/release/cnt-asr-tools "${BIN_DIR}/cnt-asr-tools"
-ok "cnt-daemon + cnt-asr-tools → ${BIN_DIR}"
+ok "cnt-daemon → ${BIN_DIR}"
 activate_cnt || true
 
 # ── 4. 词库与语言模型 ─────────────────────────────────────────
@@ -150,24 +148,7 @@ if [ "${WITH_VOICE}" = "1" ]; then
     fi
 fi
 
-# ── 6. 自检（离线，不开麦克风）────────────────────────────────
-# 用模型自带的测试音频跑一次完整链路：证明模型装对了、前端与词表都能用。
-# 这一步失败就不该说「安装完成」。
-if [ "${VOICE_READY}" = "1" ] && [ -f "${DATA_DIR}/asr/test_wavs/zh.wav" ]; then
-    step "语音链路自检（离线，不使用麦克风）"
-    CHECK=$("${BIN_DIR}/cnt-asr-tools" transcribe "${DATA_DIR}/asr" \
-        "${DATA_DIR}/asr/test_wavs/zh.wav" --punct "${DATA_DIR}/punct" 2>/dev/null \
-        | sed -n 's/^  → //p' || true)
-    if [ -n "${CHECK}" ]; then
-        ok "识别正常：${CHECK}"
-    else
-        warn "自检没有输出，语音可能不可用；诊断命令："
-        warn "  cnt-asr-tools info ${DATA_DIR}/asr"
-        VOICE_READY=0
-    fi
-fi
-
-# ── 7. 配置 ──────────────────────────────────────────────────
+# ── 6. 配置 ──────────────────────────────────────────────────
 step "配置文件"
 mkdir -p "${CONFIG_DIR}"
 if [ ! -f "${CONFIG_FILE}" ]; then
@@ -215,7 +196,7 @@ else
     fi
 fi
 
-# ── 8. 注册 IBus 组件 ────────────────────────────────────────
+# ── 7. 注册 IBus 组件 ────────────────────────────────────────
 step "注册输入法组件（如需修改，会要求管理员密码）"
 XML=$(cat <<EOF
 <?xml version="1.0" encoding="utf-8"?>
