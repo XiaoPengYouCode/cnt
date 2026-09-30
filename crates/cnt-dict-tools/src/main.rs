@@ -7,7 +7,7 @@
 //! cnt-dict-tools build-lm <lm.arpa> <out.cntl>           ARPA 语言模型 → 二进制
 //! cnt-dict-tools decode <dict.cntd> <lm.cntl> <pinyin>.. 整句解码（开发调试）
 //!   decode 选项：--user <user.dict> 用真实用户库；--top <n> 候选条数；
-//!   --tsv 机器可读输出（`拼音<TAB>排名<TAB>候选<TAB>分数<TAB>拼音键`），
+//!   --tsv 机器可读输出（`拼音<TAB>排名<TAB>候选<TAB>分数<TAB>拼音键<TAB>覆盖<TAB>来源`），
 //!   拼音键是解码器实际走的读音路径，供 fuzzy 测试判定精确/模糊/补全
 //! cnt-dict-tools info  <dict.cntd>                       打印词库统计
 //! cnt-dict-tools query <dict.cntd> <pinyin>..            查询候选
@@ -634,16 +634,18 @@ fn cmd_decode(
             if opts.tsv {
                 writeln!(
                     out,
-                    "{pinyin}\t{}\t{}\t{score:.3}\t{keys}\t{cover}",
+                    "{pinyin}\t{}\t{}\t{score:.3}\t{keys}\t{cover}\t{}",
                     i + 1,
-                    cand.text
+                    cand.text,
+                    cand.match_kind.as_str()
                 )?;
             } else {
                 writeln!(
                     out,
-                    "  {}. {}  [{score:.3}] {{{keys}}} {cover}",
+                    "  {}. {}  [{score:.3}] {{{keys}}} {cover} {}",
                     i + 1,
-                    cand.text
+                    cand.text,
+                    cand.match_kind.as_str()
                 )?;
             }
         }

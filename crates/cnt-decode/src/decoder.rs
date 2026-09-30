@@ -16,7 +16,7 @@
 use std::sync::Arc; // 同时用于 Decoder 与 Hyp 段
 
 use cnt_dict::PinyinModel;
-use cnt_input::{Candidate, CandidateSource, LearnedWord};
+use cnt_input::{Candidate, CandidateSource, LearnedWord, MatchKind};
 use cnt_lm::CntLm;
 use cnt_score::{NgramLm, RescorePolicy, Rescorer};
 use fastrace::local::LocalSpan;
@@ -73,10 +73,11 @@ const WHOLE_KEY_WORDS: usize = 20;
 const CANDIDATE_LIMIT: usize = 30;
 /// 候选分组：
 /// 0 = 整词覆盖输入（整键词 / beam 单段）——你已经打完的读音优先；
-/// 1 = 保留的句子组编号（当前可靠整词命中时直接跳过 beam）；
+/// 1 = 可靠精确整词之后的模糊整词回退（仍不生成句子 beam）；
 /// 2 = 补全候选 + 词库长尾字形；
 /// 3 = 部分候选（只覆盖输入前一段）。
 const GROUP_WORD: u8 = 0;
+const GROUP_FUZZY_FALLBACK: u8 = 1;
 const GROUP_COMPLETION: u8 = 2;
 const GROUP_PARTIAL: u8 = 3;
 /// 部分候选（只覆盖输入前一段的单字/词）最多给几个。
@@ -109,6 +110,10 @@ const OOV_ADJUST_MAX: f32 = 1.0;
 /// -1.5：-0.5 太轻，输入 jian 时 jiang 的高频词（将 -2.82）会压过精确读音的
 /// 见/件/间，单音节候选前排被「猜你还没打完」的词占掉。
 const COMPLETION_PENALTY: f32 = -1.5;
+/// 一次键盘错误的惩罚；不与模糊音叠加，且只召回可靠的多字整词。
+const CORRECTION_PENALTY: f32 = -1.5;
+/// 与 librime 的 `max_corrections` 同类的候选预算，避免猜测占满候选窗。
+const REPAIR_CANDIDATE_LIMIT: usize = 4;
 /// 次读音的基础分上限（`freq ≤ SECONDARY_FREQ_CAP` 且**在 LM 词表**）。
 ///
 /// 只封顶、不抬升：`min(SECONDARY_BASE, unigram)`。多音字的次读音（的di、和hu）
@@ -276,6 +281,7 @@ impl Limits {
 /// `fuzzy_edges` / `completion` / `dict_tail` 不只是元数据：它们参与**硬约束**
 /// （模糊叠加不得 #1、补全词不得插到精确候选之前、词库长尾不得凭「精确」
 /// 占住前排）——这些是分数调参担保不了的，必须结构上保证。
+#[derive(Clone)]
 struct Scored {
     cand: Candidate,
     score: f32,
@@ -330,13 +336,25 @@ pub struct Decoder<L: NgramLm = CntLm> {
     syllables: SyllableTable,
     /// 模糊音开关（平翘舌/边鼻音/前后鼻音等）。
     fuzzy: bool,
+    /// 单次键盘纠错，与方音模糊开关独立。
+    typo_correction: bool,
     /// 可选的整句重排器（小神经模型等）；`None` = 纯 n-gram 基线。
     rescorer: Option<Arc<dyn Rescorer>>,
     /// 重排触发/融合策略。
     policy: RescorePolicy,
     /// 跨按键的词键缓存（用户调频变化时整体失效）。
     keys: std::sync::Mutex<KeyCache>,
+    /// 小型回退结果缓存（含空结果），避免退格/重查同一输入时重新枚举变体。
+    /// 学习/忘记会改变分数与词键存在性，必须同步失效。
+    repairs: std::sync::Mutex<RepairCache>,
 }
+
+#[derive(Default)]
+struct RepairCache {
+    entries: std::collections::HashMap<Box<str>, (bool, Vec<Scored>)>,
+}
+
+const REPAIR_CACHE_CAP: usize = 128;
 
 impl<L: NgramLm> Decoder<L> {
     /// 构造解码器。`lm` 为 `None` 时退化为单字/词候选（无整句）。
@@ -347,10 +365,19 @@ impl<L: NgramLm> Decoder<L> {
             lm,
             syllables: SyllableTable::new(),
             fuzzy,
+            typo_correction: true,
             rescorer: None,
             policy: RescorePolicy::default(),
             keys: std::sync::Mutex::new(KeyCache::default()),
+            repairs: std::sync::Mutex::new(RepairCache::default()),
         }
+    }
+
+    /// 设置整词单次键盘纠错；默认开启，不影响模糊音开关。
+    #[must_use]
+    pub const fn with_typo_correction(mut self, enabled: bool) -> Self {
+        self.typo_correction = enabled;
+        self
     }
 
     /// 装上整句重排器（构造期注入，运行期不可变）。
@@ -401,6 +428,8 @@ impl<L: NgramLm> Decoder<L> {
         for compound in &compounds {
             cache.invalidate(&compound.pinyin);
         }
+        drop(cache);
+        self.clear_repairs();
     }
 
     /// 忘记一组学习段（撤销误学：误选的候选 / 拼错的复合词）。
@@ -418,6 +447,8 @@ impl<L: NgramLm> Decoder<L> {
             self.model.forget(&compound.pinyin, &compound.word);
             cache.invalidate(&compound.pinyin);
         }
+        drop(cache);
+        self.clear_repairs();
     }
 
     /// 把拼音串按标准音节切开，供预编辑显示（`nihaoshijie` → `ni hao shi jie`）。
@@ -435,6 +466,15 @@ impl<L: NgramLm> Decoder<L> {
     /// 「冷启动延迟」基准测量用。
     pub fn clear_cache(&self) {
         self.lock_keys().clear();
+        self.clear_repairs();
+    }
+
+    fn clear_repairs(&self) {
+        self.repairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .clear();
     }
 
     /// 持久化用户数据。
@@ -493,12 +533,15 @@ impl<L: NgramLm> Decoder<L> {
             self.decode_with_context(pinyin, context)
         };
         scored.extend(whole);
+        // librime 的可靠整词门控只省略句子拼接，不能顺带关闭模糊词召回。
+        // 有精确整词时补查单处模糊整词；否则尝试一次键盘纠错，不递归解码变体。
+        scored.extend(self.repaired_words(pinyin, has_word_coverage));
         if !has_word_coverage && let Some(lm) = &self.lm {
             scored.extend(self.completions(pinyin, lm));
         }
         // 排序分四组（组间是硬顺序，组内按分数）：
         // 0 整词覆盖输入的候选（整键词/beam 单段）——你已经打完的读音优先；
-        // 1 保留给未来的句子组；可靠整词命中时当前实现不会生成多段 beam；
+        // 1 有可靠精确整词时的模糊整词回退；不生成多段 beam；
         // 2 补全候选（「猜你还没打完」）——不该插到已打完的读音前面
         //   （输入 jian 时前排不能被 jiang 的词占掉），以及词库长尾字形；
         // 3 部分候选（只覆盖前一段）——修复入口，放在最后，不干扰正常整句选词。
@@ -512,6 +555,8 @@ impl<L: NgramLm> Decoder<L> {
         let group = |s: &Scored| -> u8 {
             if !s.cand.covers_all(input_len) {
                 GROUP_PARTIAL
+            } else if has_word_coverage && s.fuzzy_edges > 0 {
+                GROUP_FUZZY_FALLBACK
             } else if s.completion || s.dict_tail {
                 GROUP_COMPLETION
             } else {
@@ -542,7 +587,9 @@ impl<L: NgramLm> Decoder<L> {
         for s in &scored {
             if let Some(&idx) = seen.get(s.cand.text.as_str()) {
                 let cur = &out[idx];
-                if (s.is_whole_word, s.score) > (cur.is_whole_word, cur.score) {
+                if group(s) == group(cur)
+                    && (s.is_whole_word, s.score) > (cur.is_whole_word, cur.score)
+                {
                     out[idx] = Scored {
                         cand: s.cand.clone(),
                         score: s.score,
@@ -571,12 +618,94 @@ impl<L: NgramLm> Decoder<L> {
         // 组边界（rescore 只允许组内重排）：组间是硬顺序，模型融合分不能破坏它 ——
         // 否则降级的拼接候选会被神经模型抬回整词上方，整词优先的结构保证就漏了。
         let groups = group_ranges(&out, &group);
-        let mut out: Vec<(Candidate, f32)> = out.into_iter().map(|s| (s.cand, s.score)).collect();
+        let mut out: Vec<(Candidate, f32)> = out
+            .into_iter()
+            .map(|mut s| {
+                if s.cand.match_kind != MatchKind::Correction {
+                    s.cand.match_kind = if s.completion {
+                        MatchKind::Completion
+                    } else if s.fuzzy_edges > 0 {
+                        MatchKind::Fuzzy
+                    } else {
+                        MatchKind::Exact
+                    };
+                }
+                (s.cand, s.score)
+            })
+            .collect();
         // 神经重排（可选）：仅在基线不确定时对组内前 top_n 条重排；
         // 未装重排器时这里完全不产生开销。
         if let Some(rescorer) = &self.rescorer {
             crate::rescore::apply(rescorer.as_ref(), &self.policy, &groups, &mut out);
         }
+        out
+    }
+
+    /// 有界整词回退；已存在的端到端 root → candidates → `word_repair`。
+    /// 词键与输入长度分开保存，重复按键删除后仍消费完整原始输入。
+    fn repaired_words(&self, pinyin: &str, has_word_coverage: bool) -> Vec<Scored> {
+        if !crate::repair::eligible(pinyin)
+            || (has_word_coverage && !self.fuzzy)
+            || (!has_word_coverage && !self.typo_correction)
+        {
+            return Vec::new();
+        }
+        let _span = LocalSpan::enter_with_local_parent("word_repair");
+        // 锁覆盖本阶段：learn/forget 在更新模型后拿同一把锁清空，
+        // 避免旧结果在失效之后才写回。这里不获取词键缓存锁。
+        let mut cache = self
+            .repairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_mode, out)) = cache.entries.get(pinyin)
+            && *cached_mode == has_word_coverage
+        {
+            LocalSpan::add_property(|| ("cache_hit", "1"));
+            return out.clone();
+        }
+        LocalSpan::add_property(|| ("cache_hit", "0"));
+        let keys = if has_word_coverage {
+            crate::repair::fuzzy_keys(pinyin, &self.syllables)
+        } else {
+            crate::repair::typo_keys(pinyin)
+                .into_iter()
+                .map(|key| (key, 0))
+                .collect()
+        };
+        LocalSpan::add_property(|| ("keys", keys.len().to_string()));
+        let mut out = Vec::new();
+        for (key, fuzzy_cost) in keys {
+            for mut s in self.lookup_whole_key(&key) {
+                // 不推荐词库长尾字形；单字没有足够的词内证据。
+                if s.dict_tail || s.cand.text.chars().count() < 2 {
+                    continue;
+                }
+                s.cand.consumed = pinyin.len();
+                if has_word_coverage {
+                    s.score += FUZZY_PENALTY[usize::from(fuzzy_cost)];
+                    s.fuzzy_edges = 1;
+                } else {
+                    s.score += CORRECTION_PENALTY;
+                    s.cand.match_kind = MatchKind::Correction;
+                }
+                out.push(s);
+            }
+        }
+        out.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.cand.text.cmp(&b.cand.text))
+        });
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|s| seen.insert(s.cand.text.clone()));
+        out.truncate(REPAIR_CANDIDATE_LIMIT);
+        LocalSpan::add_property(|| ("candidates", out.len().to_string()));
+        if cache.entries.len() >= REPAIR_CACHE_CAP {
+            cache.entries.clear();
+        }
+        cache
+            .entries
+            .insert(pinyin.into(), (has_word_coverage, out.clone()));
         out
     }
 
@@ -587,6 +716,10 @@ impl<L: NgramLm> Decoder<L> {
     /// LM 未覆盖但词频上万的精确字（备/碑）永远排在补全词与模糊音之后。
     fn whole_key_words(&self, pinyin: &str) -> Vec<Scored> {
         let _span = LocalSpan::enter_with_local_parent("whole_key_words");
+        self.lookup_whole_key(pinyin)
+    }
+
+    fn lookup_whole_key(&self, pinyin: &str) -> Vec<Scored> {
         self.model
             .ranked_words(pinyin, WHOLE_KEY_WORDS)
             .into_iter()
@@ -1863,6 +1996,130 @@ mod tests {
                 .all(|(c, _)| c.covers_all("womenzaigongzuo".len())),
             "部分候选不得插到全覆盖句子之前: {texts:?}"
         );
+    }
+
+    #[test]
+    fn exact_whole_words_do_not_hide_fuzzy_whole_words() {
+        let d = decoder_with(
+            "fuzzy_whole_recall",
+            &[("sihou", "死后", 10000), ("shihou", "时候", 10000)],
+            &[("死后", -5.0, 0.0), ("时候", -2.0, 0.0)],
+            &[],
+            true,
+        );
+        let cands = d.candidates("sihou");
+        assert_eq!(cands[0].text, "死后", "精确整词保持优先");
+        let fuzzy = cands.iter().find(|c| c.text == "时候").unwrap();
+        assert_eq!(fuzzy.match_kind, MatchKind::Fuzzy);
+        assert_eq!(fuzzy.consumed, 5);
+        assert_eq!(fuzzy.learned, vec![LearnedWord::new("shihou", "时候")]);
+    }
+
+    #[test]
+    fn fuzzy_duplicate_cannot_replace_an_exact_reading() {
+        let d = decoder_with(
+            "fuzzy_duplicate",
+            &[("shide", "似的", 1), ("side", "似的", 10000)],
+            &[("似的", -2.0, 0.0)],
+            &[],
+            true,
+        );
+        let cands = d.candidates("shide");
+        assert_eq!(cands[0].match_kind, MatchKind::Exact);
+        assert_eq!(cands[0].learned, vec![LearnedWord::new("shide", "似的")]);
+        assert_eq!(cands.iter().filter(|c| c.text == "似的").count(), 1);
+    }
+
+    #[test]
+    fn keyboard_correction_consumes_input_and_learns_canonical_key() {
+        let d = decoder_with(
+            "keyboard_correction",
+            &[("nihao", "你好", 10000), ("ni", "你", 10000)],
+            &[("你好", -2.0, 0.0), ("你", -2.0, 0.0)],
+            &[],
+            false, // 键盘纠错不依赖方音模糊。
+        );
+        for input in ["nihso", "nihoa", "niihao"] {
+            let cands = d.candidates(input);
+            let cand = &cands[0];
+            assert_eq!(cand.text, "你好", "{input}");
+            assert_eq!(cand.match_kind, MatchKind::Correction);
+            assert_eq!(cand.consumed, input.len());
+            assert_eq!(cand.learned, vec![LearnedWord::new("nihao", "你好")]);
+            // 经过真实输入状态机确认：不能漏掉重复字符，也不能学到错拼键。
+            let mut state = cnt_input::EngineState::new();
+            for key in input.bytes() {
+                state.handle_key(u32::from(key), &d, false);
+            }
+            let cnt_input::Action::Commit { text, learned } =
+                state.handle_key(cnt_input::keysym::SPACE, &d, false)
+            else {
+                panic!("expected correction commit");
+            };
+            assert_eq!(text, "你好");
+            d.learn(&learned);
+            assert!(!state.is_composing());
+            assert_eq!(d.model.user_count(input, "你好"), 0);
+            assert!(d.model.user_count("nihao", "你好") > 0);
+        }
+        let d = d.with_typo_correction(false);
+        assert!(
+            d.candidates("nihso")
+                .iter()
+                .all(|c| c.match_kind != MatchKind::Correction)
+        );
+    }
+
+    #[test]
+    fn repair_cache_invalidates_negative_hits_and_user_scores() {
+        let d = decoder_with(
+            "repair_cache_invalidation",
+            &[("ni", "你", 10000)],
+            &[("你", -2.0, 0.0)],
+            &[],
+            false,
+        );
+        assert!(
+            d.candidates("nihso")
+                .iter()
+                .all(|c| c.match_kind != MatchKind::Correction)
+        );
+        let learned = [LearnedWord::new("nihao", "你好")];
+        d.learn(&learned);
+        d.learn(&learned); // 新词两次确认转正。
+        assert_eq!(d.candidates("nihso")[0].text, "你好");
+        let before = d.candidates_scored("nihso")[0].1;
+        d.learn(&learned);
+        assert!(d.candidates_scored("nihso")[0].1 > before);
+        d.forget(&learned);
+        assert!(
+            d.candidates("nihso")
+                .iter()
+                .all(|c| c.match_kind != MatchKind::Correction)
+        );
+        assert!(!d.repairs.lock().unwrap().entries.is_empty());
+        d.clear_cache();
+        assert!(d.repairs.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn correction_does_not_override_valid_words_or_explicit_boundaries() {
+        let d = decoder_with(
+            "correction_guardrails",
+            &[("nihao", "你好", 10000), ("nigao", "拟稿", 10000)],
+            &[("你好", -1.0, 0.0), ("拟稿", -5.0, 0.0)],
+            &[],
+            false,
+        );
+        assert_eq!(d.candidates("nigao")[0].text, "拟稿");
+        for input in ["nigao", "ni'hso", "niihso", "nh"] {
+            assert!(
+                d.candidates(input)
+                    .iter()
+                    .all(|c| c.match_kind != MatchKind::Correction),
+                "{input}"
+            );
+        }
     }
 
     #[test]

@@ -326,7 +326,7 @@ impl EngineCore {
 
     /// 标点半角判定：自己刚上屏的字符优先，否则看应用给的 surrounding text。
     ///
-    /// 两边都没信息时返回 false（全角）——中文输入法的默认应当是全角。
+    /// 两边都没信息时返回 false，使用中文模式默认映射（不等于所有符号全角）。
     pub(crate) fn punct_half_width(&self) -> bool {
         let last = *self
             .last_commit_char

@@ -90,7 +90,7 @@ fn lm_path() -> PathBuf {
 /// 加载词库、用户数据与语言模型，构造解码器（返回解码器 + LM 供语音侧复用）。
 ///
 /// 词库是硬依赖（缺失即退出）；语言模型缺失时降级为单字/词候选。
-fn load_decoder() -> (Arc<Decoder>, Arc<PinyinModel>, Option<Arc<CntLm>>) {
+fn load_decoder(config: &AppConfig) -> (Arc<Decoder>, Arc<PinyinModel>, Option<Arc<CntLm>>) {
     // 词库 + 用户数据（mmap 二进制词库）
     let dict_path = dict_path();
     let user_path = user_path();
@@ -131,7 +131,10 @@ fn load_decoder() -> (Arc<Decoder>, Arc<PinyinModel>, Option<Arc<CntLm>>) {
         }
     };
     (
-        Arc::new(Decoder::new(model.clone(), lm.clone(), true)),
+        Arc::new(
+            Decoder::new(model.clone(), lm.clone(), true)
+                .with_typo_correction(config.typo_correction),
+        ),
         model,
         lm,
     )
@@ -281,9 +284,7 @@ fn load_voice(
 async fn main() -> Result<(), DaemonError> {
     init_observability();
 
-    let (decoder, model, lm) = load_decoder();
-
-    // 加载配置（TOML，仅候选词数一项）
+    // 先加载配置，解码器与语音初始化均使用同一份设置。
     let config_path =
         std::env::var_os("CNT_CONFIG").map_or_else(AppConfig::default_path, PathBuf::from);
     let config = match AppConfig::load(&config_path) {
@@ -294,10 +295,13 @@ async fn main() -> Result<(), DaemonError> {
         }
     };
     log::info!(
-        "config: {} (page_size={})",
+        "config: {} (page_size={}, typo_correction={})",
         config_path.display(),
-        config.page_size
+        config.page_size,
+        config.typo_correction
     );
+
+    let (decoder, model, lm) = load_decoder(&config);
 
     // 语音输入（可选；模型加载在这里同步做一次，失败只是没有语音）
     let rescorer = load_rescorer(lm.as_ref(), &model);

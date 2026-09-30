@@ -34,10 +34,33 @@ impl LearnedWord {
     }
 }
 
+/// 候选的读音匹配来源；覆盖范围由 `Candidate::consumed` 独立表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    Exact,
+    Fuzzy,
+    Completion,
+    Correction,
+}
+
+impl MatchKind {
+    /// 诊断输出中的稳定名称。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Fuzzy => "fuzzy",
+            Self::Completion => "completion",
+            Self::Correction => "correction",
+        }
+    }
+}
+
 /// 一个候选（词、整句，或只覆盖输入前一段的「部分候选」）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub text: String,
+    pub match_kind: MatchKind,
     /// 用于用户调频学习的拼音-词段：单字/词 = 1 段，整句 = 多段。
     pub learned: Vec<LearnedWord>,
     /// 该候选消耗掉的**输入字节数**。
@@ -56,6 +79,7 @@ impl Candidate {
             text: text.into(),
             learned,
             consumed: input_len,
+            match_kind: MatchKind::Exact,
         }
     }
 
@@ -66,6 +90,7 @@ impl Candidate {
             text: text.into(),
             learned,
             consumed,
+            match_kind: MatchKind::Exact,
         }
     }
 
@@ -117,41 +142,43 @@ pub enum Action {
     },
 }
 
-/// ASCII 标点键 → 中文标点（简体，参考 `Rime` `luna_pinyin` 的默认映射）。
+/// ASCII 标点键 → 中文模式符号；中文标点与 ASCII 运算/标识符符号混用。
 /// `"` 与 `'` 为智能引号，交替开合（用 `quote_open` 状态）。
-/// `half_width`：前一个字符是数字/英文时用半角标点（`3，` → `3,`）。
+/// `half_width`：前一个字符是数字/英文时用 ASCII 标点（`3，` → `3,`）。
+/// `+ - * = / @ # % & | ~` 始终保持 ASCII，具体取舍见 docs/input-behavior.md。
 fn punct_of(keyval: u32, quote_open: &mut bool, half_width: bool) -> Option<String> {
     let c = char::from_u32(keyval)?;
-    // (全角, 半角)
+    // (中文模式默认符号, ASCII 上下文符号)，默认符号不一定是全角。
     let pair = match c {
         ',' => ("，", ","),
         '.' => ("。", "."),
-        '/' | '\\' => ("／", "/"),
+        '/' => ("/", "/"),
+        '\\' => ("、", "\\"),
         ';' => ("；", ";"),
         ':' => ("：", ":"),
         '?' => ("？", "?"),
         '!' => ("！", "!"),
-        '[' => ("「", "["),
-        ']' => ("」", "]"),
+        '[' => ("【", "["),
+        ']' => ("】", "]"),
         '{' => ("『", "{"),
         '}' => ("』", "}"),
         '(' => ("（", "("),
         ')' => ("）", ")"),
         '<' => ("《", "<"),
         '>' => ("》", ">"),
-        '~' => ("～", "~"),
-        '@' => ("＠", "@"),
-        '#' => ("＃", "#"),
+        '~' => ("~", "~"),
+        '@' => ("@", "@"),
+        '#' => ("#", "#"),
         '$' => ("＄", "$"),
-        '%' => ("％", "%"),
-        '^' => ("＾", "^"),
-        '&' => ("＆", "&"),
-        '*' => ("＊", "*"),
-        '-' => ("－", "-"),
-        '_' => ("＿", "_"),
-        '+' => ("＋", "+"),
-        '=' => ("＝", "="),
-        '|' => ("｜", "|"),
+        '%' => ("%", "%"),
+        '^' => ("……", "^"),
+        '&' => ("&", "&"),
+        '*' => ("*", "*"),
+        '-' => ("-", "-"),
+        '_' => ("——", "_"),
+        '+' => ("+", "+"),
+        '=' => ("=", "="),
+        '|' => ("|", "|"),
         '`' => ("·", "`"),
         '"' => {
             // 英文/数字后（写代码、写 `x="1"`）要的是直引号，不是弯引号
@@ -178,14 +205,13 @@ fn punct_of(keyval: u32, quote_open: &mut bool, half_width: bool) -> Option<Stri
 /// 标点宽度判定：光标前一个字符是否为 ASCII 字母/数字。
 ///
 /// 语义就是「英文/数字后面紧跟的**第一个**标点用半角」：只看紧邻的那一个字符，
-/// 所以 `abc,` 之后再打标点（前一字符是 `,`）会回到全角。
+/// 所以 `abc,` 之后再打标点（前一字符是 `,`）会回到中文模式默认映射。
 ///
 /// `cursor_chars` 是 **字符** 偏移 —— `IBus` 的 `SetSurroundingText` 的 `cursor_pos`
 /// 按字符计（不是字节）。曾经把它当字节下标用：中文一字 3 字节，字符偏移 N 会
 /// 落在文本约 1/3 处，只要前文有任何英文/数字就误判成半角，表现为「所有标点都变半角」。
 ///
-/// 光标越界（应用给的 surrounding text 过期）时返回 `false`，即回到全角——
-/// 宁可全角错一次，也不要在中文里冒出半角标点。
+/// 光标越界（应用给的 surrounding text 过期）时返回 `false`，回到中文模式默认映射。
 #[must_use]
 pub fn latin_before_cursor(text: &str, cursor_chars: usize) -> bool {
     if cursor_chars == 0 {
@@ -1279,10 +1305,10 @@ mod tests {
         assert_eq!(st.page(), 1);
         assert_eq!(st.handle_key(keysym::MINUS, &d, false), Action::Handled); // - 上一页
         assert_eq!(st.page(), 0);
-        // 未组合时 - / = 是标点
+        // 未组合时 - / = 是 ASCII 标点
         st.clear();
         match st.handle_key(keysym::MINUS, &d, false) {
-            Action::Commit { text, .. } => assert_eq!(text, "－"),
+            Action::Commit { text, .. } => assert_eq!(text, "-"),
             other => panic!("expected commit, got {other:?}"),
         }
     }

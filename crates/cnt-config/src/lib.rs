@@ -5,6 +5,7 @@
 //! ```toml
 //! # 每页候选词数（5-10；数字键 1-9 加 0 刚好盖到 10 个）
 //! page_size = 8
+//! typo_correction = true # 整词内单次键盘纠错，不影响方音模糊
 //!
 //! # 语音输入（默认关闭：模型不随程序分发）
 //! [voice]
@@ -43,6 +44,8 @@ const PAGE_SIZE_RANGE: std::ops::RangeInclusive<usize> = 5..=10;
 pub struct Config {
     /// 每页候选词数。
     pub page_size: usize,
+    /// 是否开启整词内的单次键盘纠错。
+    pub typo_correction: bool,
     /// 语音输入。
     pub voice: VoiceSettings,
 }
@@ -107,6 +110,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             page_size: DEFAULT_PAGE_SIZE,
+            typo_correction: true,
             voice: VoiceSettings::default(),
         }
     }
@@ -146,6 +150,9 @@ impl Config {
         }
         if let Some(voice) = value.get("voice") {
             config.voice.merge_toml(voice);
+        }
+        if let Some(enabled) = value.get("typo_correction").and_then(toml::Value::as_bool) {
+            config.typo_correction = enabled;
         }
         Ok(config)
     }
@@ -245,6 +252,21 @@ mod tests {
     fn default_when_file_missing() {
         let cfg = Config::load("/nonexistent/cnt-config.toml").unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn typo_correction_can_be_disabled_and_bad_type_keeps_default() {
+        let dir = std::env::temp_dir().join(format!("cnt-config-typo-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        assert!(Config::default().typo_correction);
+        fs::write(&path, "typo_correction = false\npage_size = 6\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(!cfg.typo_correction);
+        assert_eq!(cfg.page_size, 6);
+        fs::write(&path, "typo_correction = 'false'\n").unwrap();
+        assert!(Config::load(&path).unwrap().typo_correction);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

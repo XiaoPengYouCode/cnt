@@ -6,6 +6,7 @@
 //! - `rescore`：可选的整句重排阶段（`cnt-score::Rescorer` 编排）
 
 pub mod decoder;
+mod repair;
 pub(crate) mod rescore;
 pub mod syllable;
 

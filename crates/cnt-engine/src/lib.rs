@@ -234,7 +234,7 @@ impl Engine {
             let act = {
                 let mut st = self.core.lock_state();
                 // 半角标点上下文：未组合且光标前一个字符是数字/英文 → 半角（3，→ 3,）。
-                // 组合中（前面肯定是刚上屏的中文）永远全角。
+                // 组合中使用中文模式默认映射（其中 + - * = 等仍是 ASCII）。
                 let punct_half_width = !st.is_composing() && self.core.punct_half_width();
                 st.handle_key(keyval, &**self.core.decoder(), punct_half_width)
             };
