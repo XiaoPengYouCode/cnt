@@ -31,7 +31,7 @@ cargo run -p cnt-dict-tools -- build       data/wordlist.tsv data/cnt.dict
 cargo run -p cnt-dict-tools -- build-lm    lm_sc.arpa data/lm.cntl
 
 # 2. 启动引擎（数据默认在 ~/.local/share/cnt/，可用环境变量覆盖）
-CNT_DICT=data/cnt.dict CNT_LM=data/lm.cntl cargo run -p cnt-daemon
+CNT_DICT=data/cnt.dict CNT_LM=data/lm.cntl cargo run -p cnt-daemon -- --standalone
 
 # 3. 另一终端：测试客户端模拟输入（a-z、空格、回车、退格、1-9、方向键，空行退出）
 cargo run -p cnt-test-client
@@ -39,6 +39,10 @@ cargo run -p cnt-test-client
 
 环境变量：`CNT_DICT`、`CNT_LM`、`CNT_USER_DB`、`CNT_ASR_DIR`、`CNT_PUNCT_DIR`
 （默认都在 `$XDG_DATA_HOME/cnt/`）、`CNT_CONFIG`（配置路径）。
+
+已安装的引擎由 IBus 无参数启动，通过申请组件总线名称完成就绪握手。
+`--standalone` 仅供未安装 XML 的开发启动，额外动态注册组件；两种模式都不抢占已有实例。
+启动协议与登录超时排查见 [架构文档](docs/architecture.md#启动与首次激活)。
 
 ## 键位
 

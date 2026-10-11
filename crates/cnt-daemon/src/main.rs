@@ -4,8 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fastrace::Span;
+use fastrace::collector::SpanContext;
 use fastrace::collector::{Config, ConsoleReporter};
+use fastrace::future::FutureExt;
+use fastrace::local::LocalSpan;
 use zbus::connection::Builder;
+use zbus::fdo::RequestNameFlags;
 
 use cnt_config::Config as AppConfig;
 use cnt_decode::Decoder;
@@ -28,6 +33,8 @@ const DEFAULT_PUNCT_DIR: &str = "punct";
 /// 主程序错误（显式，thiserror）。
 #[derive(Debug, thiserror::Error)]
 enum DaemonError {
+    #[error("usage: cnt-daemon [--standalone] (dynamic registration for development only)")]
+    Arguments,
     #[error("ibus: {0}")]
     Ibus(#[from] cnt_ibus::IbusError),
     #[error("zbus: {0}")]
@@ -87,10 +94,13 @@ fn lm_path() -> PathBuf {
     std::env::var_os("CNT_LM").map_or_else(|| data_dir().join(DEFAULT_LM_FILE), PathBuf::from)
 }
 
+type DecoderResources = (Arc<Decoder>, Arc<PinyinModel>, Option<Arc<CntLm>>);
+
 /// 加载词库、用户数据与语言模型，构造解码器（返回解码器 + LM 供语音侧复用）。
 ///
 /// 词库是硬依赖（缺失即退出）；语言模型缺失时降级为单字/词候选。
-fn load_decoder(config: &AppConfig) -> (Arc<Decoder>, Arc<PinyinModel>, Option<Arc<CntLm>>) {
+fn load_decoder(config: &AppConfig) -> Result<DecoderResources, DaemonError> {
+    let _span = LocalSpan::enter_with_local_parent("load_decoder");
     // 词库 + 用户数据（mmap 二进制词库）
     let dict_path = dict_path();
     let user_path = user_path();
@@ -102,7 +112,7 @@ fn load_decoder(config: &AppConfig) -> (Arc<Decoder>, Arc<PinyinModel>, Option<A
                 "build it first:\n  cargo run -p cnt-dict-tools -- build data/wordlist.tsv {}",
                 dict_path.display()
             );
-            std::process::exit(1);
+            return Err(e.into());
         }
     };
     let model = Arc::new(model);
@@ -130,14 +140,14 @@ fn load_decoder(config: &AppConfig) -> (Arc<Decoder>, Arc<PinyinModel>, Option<A
             None
         }
     };
-    (
+    Ok((
         Arc::new(
             Decoder::new(model.clone(), lm.clone(), true)
                 .with_typo_correction(config.typo_correction),
         ),
         model,
         lm,
-    )
+    ))
 }
 
 /// 语音的 n-best 重排器：**复用拼音那份 LM 与用户词库**。
@@ -149,6 +159,7 @@ fn load_rescorer(
     lm: Option<&Arc<CntLm>>,
     model: &Arc<PinyinModel>,
 ) -> Option<Arc<dyn cnt_asr::TextScorer>> {
+    let _span = LocalSpan::enter_with_local_parent("load_voice_rescorer");
     let lm = lm?;
     let user_words = model.user_words();
     let n_user = user_words.len();
@@ -171,6 +182,7 @@ fn load_rescorer(
 fn load_punctuator(settings: &cnt_config::VoiceSettings) -> Arc<dyn cnt_asr::Punctuator> {
     use cnt_asr_onnx::punct::CtPunctuator;
 
+    let _span = LocalSpan::enter_with_local_parent("load_punctuator");
     if !settings.punctuation {
         log::info!("voice: punctuation disabled by config");
         return Arc::new(cnt_asr::NoPunct);
@@ -218,6 +230,9 @@ fn load_voice(
     use cnt_audio::vad::VadConfig;
     use cnt_voice::{Voice, VoiceConfig};
 
+    let _span = LocalSpan::enter_with_local_parent("load_voice");
+    LocalSpan::add_property(|| ("enabled", settings.enabled.to_string()));
+    LocalSpan::add_property(|| ("threads", settings.threads.to_string()));
     if !settings.enabled {
         log::info!("voice input: disabled (set [voice] enabled = true to turn on)");
         return None;
@@ -244,15 +259,18 @@ fn load_voice(
         return None;
     }
 
-    let started = std::time::Instant::now();
-    let model = match SenseVoice::open(&asr) {
+    let loaded = {
+        let _span = LocalSpan::enter_with_local_parent("load_asr_model");
+        SenseVoice::open(&asr)
+    };
+    let model = match loaded {
         Ok(m) => m,
         Err(e) => {
             log::error!("voice input: cannot load model: {e}; voice disabled");
             return None;
         }
     };
-    log::info!("voice input: model loaded in {:?}", started.elapsed());
+    log::info!("voice input: model loaded");
 
     let voice_config = VoiceConfig {
         capture: CaptureConfig {
@@ -283,7 +301,48 @@ fn load_voice(
 #[tokio::main]
 async fn main() -> Result<(), DaemonError> {
     init_observability();
+    let result = run().await;
+    // 启动失败也要排空：名称冲突/连接失败的 trace 同样是诊断证据。
+    fastrace::flush();
+    result
+}
 
+async fn run() -> Result<(), DaemonError> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let standalone = match args.as_slice() {
+        [] => false,
+        [arg] if arg == "--standalone" => true,
+        _ => return Err(DaemonError::Arguments),
+    };
+    // 独立 root 只量进程初始化到注册 IO 完成，不把整个常驻会话挂在它下面。
+    let startup = Span::root("daemon_startup", SpanContext::random())
+        .with_property(|| ("standalone", standalone.to_string()));
+    let (conn, decoder) = start(standalone).in_span(startup).await?;
+    fastrace::flush();
+
+    log::info!("running (Ctrl-C to quit)");
+    let flush_decoder = decoder.clone();
+    let flush_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) = flush_decoder.flush_user() {
+                log::error!("flush user data failed: {e}");
+            }
+        }
+    });
+
+    tokio::signal::ctrl_c().await?;
+    log::info!("received Ctrl-C, flushing user data");
+    flush_task.abort();
+    decoder.flush_user()?;
+    // 保持连接直到用户数据已落盘；关闭连接会释放组件名称。
+    drop(conn);
+    Ok(())
+}
+
+async fn start(standalone: bool) -> Result<(zbus::Connection, Arc<Decoder>), DaemonError> {
     // 先加载配置，解码器与语音初始化均使用同一份设置。
     let config_path =
         std::env::var_os("CNT_CONFIG").map_or_else(AppConfig::default_path, PathBuf::from);
@@ -301,29 +360,54 @@ async fn main() -> Result<(), DaemonError> {
         config.typo_correction
     );
 
-    let (decoder, model, lm) = load_decoder(&config);
+    let (decoder, model, lm) = load_decoder(&config)?;
 
     // 语音输入（可选；模型加载在这里同步做一次，失败只是没有语音）
-    let rescorer = load_rescorer(lm.as_ref(), &model);
+    let rescorer = config
+        .voice
+        .enabled
+        .then(|| load_rescorer(lm.as_ref(), &model))
+        .flatten();
     let voice = load_voice(&config.voice, rescorer);
 
     // 1. 找到 IBus 私有总线地址并连接
     let addr = cnt_ibus::find_address()?;
     log::info!("connecting to IBus: {addr}");
 
-    let conn = Builder::address(addr.as_str())?.build().await?;
+    // 异步阶段用 Span + in_span，确保连接与注册 IO 都归入启动树。
+    let conn = Builder::address(addr.as_str())?
+        .build()
+        .in_span(Span::enter_with_local_parent("connect_ibus"))
+        .await?;
     log::info!("connected (unique name: {:?})", conn.unique_name());
 
-    // 2. 提供 Factory 服务（路径固定为 /org/freedesktop/IBus/Engine/Factory）
+    // 2. 先提供 Factory，再申请名称；IBus 看到 NameOwnerChanged 后即可调用它。
     conn.object_server()
         .at(
             cnt_engine::FACTORY_OBJ_PATH,
             Factory::new(conn.clone(), decoder.clone(), config.page_size, voice),
         )
+        .in_span(Span::enter_with_local_parent("serve_factory"))
         .await?;
     log::info!("factory served at {}", cnt_engine::FACTORY_OBJ_PATH);
 
-    // 3. 注册组件（含引擎描述）
+    // XML 自动启动靠名称持有事件唤醒等待中的静态组件。
+    // RegisterComponent 只创建另一个动态组件，无法完成这次静态激活握手。
+    // 不抢占、不排队：重复进程应失败，避免两个进程同时写用户词库。
+    conn.request_name_with_flags(COMPONENT_NAME, RequestNameFlags::DoNotQueue.into())
+        .in_span(Span::enter_with_local_parent("request_component_name"))
+        .await?;
+    log::info!("component name acquired: {COMPONENT_NAME}");
+    if standalone {
+        register_standalone(&conn)
+            .in_span(Span::enter_with_local_parent("register_standalone"))
+            .await?;
+    }
+    Ok((conn, decoder))
+}
+
+/// 显式开发模式：允许没有 XML 安装记录时手动启动。
+async fn register_standalone(conn: &zbus::Connection) -> Result<(), DaemonError> {
     let exec_path = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -369,28 +453,5 @@ async fn main() -> Result<(), DaemonError> {
     .await?;
     log::info!("component registered: {ENGINE_NAME}");
 
-    // 4. 用户学习数据 write-behind：
-    //    - focus_out/disable 时立即 flush（见 cnt-engine）
-    //    - 这里 30s 周期兑底（长时间不切走输入框的连续输入）
-    //    - 优雅退出时 flush（见下方 ctrl_c）
-    //    注意：fastrace 有自己的后台上报线程（默认 1s），无需在这里 flush。
-    log::info!("running (Ctrl-C to quit)");
-    let flush_decoder = decoder.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(30));
-        tick.tick().await; // 第一次立即 tick，跳过
-        loop {
-            tick.tick().await;
-            if let Err(e) = flush_decoder.flush_user() {
-                log::error!("flush user data failed: {e}");
-            }
-        }
-    });
-
-    // 5. 优雅退出：Ctrl-C 时写盘用户数据 + 排空 fastrace
-    tokio::signal::ctrl_c().await?;
-    log::info!("received Ctrl-C, flushing user data");
-    decoder.flush_user()?;
-    fastrace::flush();
     Ok(())
 }

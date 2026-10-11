@@ -24,9 +24,73 @@ crates/
 ├── cnt-voice         语音编排：按住说话 / 切换式常开，每句一棵 span 树
 ├── cnt-asr-tools     语音 CLI：transcribe / bench（离线）、record / live（开麦克风）
 ├── cnt-engine         IBus Factory/Engine D-Bus 服务端
-├── cnt-daemon        主程序：加载词库+LM、连接 IBus、注册组件、事件循环
+├── cnt-daemon        主程序：加载词库+LM、连接 IBus、申请组件名称、事件循环
 └── cnt-test-client   开发用测试客户端（模拟应用程序走 IBus 链路）
 ```
+
+## 启动与首次激活
+
+默认启动顺序：加载配置/拼音与语音资源 → 连接 **IBus 私有总线** → 导出
+`/org/freedesktop/IBus/Factory` → `RequestName(org.freedesktop.IBus.Cnt)`。
+名字必须与安装 XML 的 `<name>` 一致；必须先导出工厂，再申请名字，避免 IBus
+收到 `NameOwnerChanged` 后调用尚不存在的对象。使用 `DoNotQueue`，不抢占旧实例，
+也不让第二个进程排队等待后接管同一份用户数据。
+
+`RegisterComponent` 不是上述握手的替代品。IBus 从 XML 查到的静态组件会等待
+自身的 factory 属性就绪；动态注册创建的是另一个组件，不能唤醒原来那次等待。
+旧实现因此可能表现为首次激活超时、第二次立即成功：第二次查询优先命中动态组件。
+现在仅显式 `--standalone` 开发模式额外动态注册；已安装 XML 的启动不需要参数，
+也不需要更新已有 XML。
+
+### 登录故障证据（2026-10-11）
+
+本机本次开机日志仍在，记录了以下顺序（Asia/Shanghai）：
+
+- 14:47:48：用户会话的 IBus systemd 服务启动。
+- 14:47:53：GNOME Shell 报 `Gio.IOErrorEnum: Timeout was reached`，调用栈经过
+  `_ibusReadyCallback → _inputSourcesChanged → activateInputSource → _setEngine`。
+- 本机 `/usr/lib/gnome-shell/libshell-18.so` 内的 `ibusManager.js` 设置激活超时
+  为 4000ms，失败后请求英文 `xkb:us::eng`。
+- cnt 已运行且第二次激活成功时，只读 `NameHasOwner(org.freedesktop.IBus.Cnt)`
+  仍返回 false，与源码缺少名称申请一致。
+
+日志证明登录时存在首次激活超时，但该条日志没有写出目标引擎名；当前 MRU 首项
+是 cnt 也不是登录时 MRU 的历史快照。结合用户现象和名称缺失，可将握手错误定位为
+明确修复项，不能宣称已经完成重启后的系统验证。cnt 的 stderr 被 IBus 重定向到
+`/dev/null`，没有保留下来的模型加载耗时，不能把超时等待时间当成模型加载时间。
+
+只读复查命令：
+
+```bash
+journalctl -b _COMM=gnome-shell --grep='Timeout was reached' --no-pager
+journalctl --user -b -u org.freedesktop.IBus.session.GNOME.service --no-pager
+gdbus call --address "$(ibus address)" --dest org.freedesktop.DBus \
+  --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.NameHasOwner \
+  org.freedesktop.IBus.Cnt
+```
+
+### 上游依据与后续优化
+
+| 参考 | 源码行为 | 对 cnt 的启示 |
+|---|---|---|
+| [IBus 1.5.34-rc2](https://github.com/ibus/ibus/blob/1.5.34-rc2/bus/ibusimpl.c) | 静态组件按名称持有事件绑定工厂；动态注册另建组件 | 修正握手，不能靠重试掩盖 |
+| [D-Bus RequestName](https://dbus.freedesktop.org/doc/dbus-specification.html#bus-messages-request-name) | 区分名称所有者、排队与已存在；`DoNotQueue` 禁止排队 | 名称申请失败即报告错误 |
+| [ibus-rime](https://github.com/rime/ibus-rime/blob/master/rime_main.c) | 创建工厂、申请 `im.rime.Rime`，随后初始化 Rime | 由适配层处理 IBus 生命周期；当前源码没有手动注册分支 |
+| [librime 本地对应版本](https://github.com/rime/librime/blob/13faefe2819d01fce208752c2539744094bb4787/src/rime/deployer.cc) | `StartWork` 默认用异步工作线程部署；无线程构建例外 | 区分基础服务就绪和后台维护完成 |
+| [libime 本地对应版本](https://github.com/fcitx/libime/blob/65003b6020623affcdbda14ce9292f408fb7a3ad/src/libime/core/languagemodel.cpp) | 预测 trie 在首次 `predictionTrie()` 调用时加载 | 可选数据可以延迟加载；核心库不负责 IBus 注册 |
+| [Fcitx 拼音适配层](https://github.com/fcitx/fcitx5-chinese-addons/blob/master/im/pinyin/pinyin.cpp) | 基础词库同步加载，附加词库 `loadDict` 通过 worker 加载后发布 | 明确关键资源与可选资源，不必将所有加载都异步化 |
+
+本轮先修复协议并补测量：`daemon_startup` 覆盖初始化到最后一次注册 IO；
+子阶段包括 `load_decoder`、`load_voice_rescorer`、`load_voice`、`load_asr_model`、
+`load_punctuator`、`connect_ibus`、`serve_factory`、`request_component_name`。
+启动结束及失败返回时 flush；root 不持续到进程退出。这个 root 量的是本进程就绪，
+不冒充桌面完成激活的端到端时间。原有按键 root 继续量到候选 UI 刷新。
+
+语音当前仍同步加载；关闭语音时跳过重排器初始化。下一步应在获准的诊断环境中
+保留 stderr，开启 `fastrace/enable` 测量冷启动。如果语音占据关键路径，将它移到
+后台并以共享就绪状态接入已经创建的引擎，保证加载失败不影响拼音、未就绪时不会
+丢失语音热键状态。不能仅提前导出一个不能响应的工厂，或简单加长等待时间。
+本轮未启动/注册引擎、未运行 D-Bus 上屏测试，也未修改桌面输入源设置。
 
 ## 数据流
 
