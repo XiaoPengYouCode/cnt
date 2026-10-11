@@ -7,6 +7,7 @@
 
 pub mod core;
 pub mod voice;
+mod voice_loading;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,8 @@ use cnt_input::Action;
 
 pub use crate::core::EngineCore;
 pub use crate::voice::{KeyOutcome, VoiceRuntime};
+use crate::voice_loading::PendingVoiceKeys;
+pub use crate::voice_loading::VoiceAvailability;
 
 const FACTORY_PATH: &str = "/org/freedesktop/IBus/Factory";
 
@@ -61,8 +64,8 @@ pub struct Factory {
     counter: AtomicU32,
     decoder: Arc<Decoder>,
     page_size: usize,
-    /// 语音运行时（None = 未启用/不可用；此时输入法照常工作）。
-    voice: Option<Arc<VoiceRuntime>>,
+    /// 所有引擎共享后台加载结果，包括加载完成前创建的引擎。
+    voice: Arc<VoiceAvailability>,
 }
 
 impl Factory {
@@ -71,7 +74,7 @@ impl Factory {
         conn: Connection,
         decoder: Arc<Decoder>,
         page_size: usize,
-        voice: Option<Arc<VoiceRuntime>>,
+        voice: Arc<VoiceAvailability>,
     ) -> Self {
         Self {
             conn,
@@ -113,7 +116,8 @@ impl Factory {
 pub struct Engine {
     core: Arc<EngineCore>,
     shift_tap: Mutex<ShiftTap>,
-    voice: Option<Arc<VoiceRuntime>>,
+    voice: Arc<VoiceAvailability>,
+    pending_voice_keys: Mutex<PendingVoiceKeys>,
 }
 
 impl Engine {
@@ -123,12 +127,13 @@ impl Engine {
         path: String,
         decoder: Arc<Decoder>,
         page_size: usize,
-        voice: Option<Arc<VoiceRuntime>>,
+        voice: Arc<VoiceAvailability>,
     ) -> Self {
         Self {
             core: Arc::new(EngineCore::new(conn, path, decoder, page_size)),
             shift_tap: Mutex::new(ShiftTap::default()),
             voice,
+            pending_voice_keys: Mutex::new(PendingVoiceKeys::default()),
         }
     }
 }
@@ -160,12 +165,14 @@ impl Engine {
         state: u32,
     ) -> zbus::fdo::Result<bool> {
         // 语音热键最先判：PTT 用的是修饰键，必须在下面的「忽略修饰键」之前拦下。
-        if let Some(voice) = &self.voice {
-            match voice.handle_key(&self.core, keyval, state).await {
-                KeyOutcome::Consumed => return Ok(true),
-                KeyOutcome::Forwarded => return Ok(false),
-                KeyOutcome::NotVoice => {}
-            }
+        match self
+            .voice
+            .handle_key(&self.core, &self.pending_voice_keys, keyval, state)
+            .await
+        {
+            KeyOutcome::Consumed => return Ok(true),
+            KeyOutcome::Forwarded => return Ok(false),
+            KeyOutcome::NotVoice => {}
         }
 
         // 从这里到 UI 刷新完成，组合状态和对应的 signal 必须属于同一个操作；
@@ -417,7 +424,7 @@ impl Engine {
     /// 这是隐私底线，也避免识别结果上屏到错误的应用里。
     async fn leave(&self) {
         let _operation_guard = self.core.lock_operations().await;
-        if let Some(voice) = &self.voice {
+        if let Some(voice) = self.voice.runtime() {
             voice.cancel().await;
         }
         self.core.lock_state().clear();

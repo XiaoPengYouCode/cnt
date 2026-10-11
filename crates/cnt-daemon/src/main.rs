@@ -15,7 +15,7 @@ use zbus::fdo::RequestNameFlags;
 use cnt_config::Config as AppConfig;
 use cnt_decode::Decoder;
 use cnt_dict::{DEFAULT_DICT_FILE, DEFAULT_USER_FILE, PinyinModel};
-use cnt_engine::{Factory, VoiceRuntime};
+use cnt_engine::{Factory, VoiceAvailability, VoiceRuntime};
 use cnt_lm::CntLm;
 use cnt_store::StoreError;
 
@@ -317,7 +317,12 @@ async fn run() -> Result<(), DaemonError> {
     // 独立 root 只量进程初始化到注册 IO 完成，不把整个常驻会话挂在它下面。
     let startup = Span::root("daemon_startup", SpanContext::random())
         .with_property(|| ("standalone", standalone.to_string()));
-    let (conn, decoder) = start(standalone).in_span(startup).await?;
+    let Started {
+        conn,
+        decoder,
+        voice,
+        voice_task,
+    } = start(standalone).in_span(startup).await?;
     fastrace::flush();
 
     log::info!("running (Ctrl-C to quit)");
@@ -333,16 +338,76 @@ async fn run() -> Result<(), DaemonError> {
         }
     });
 
-    tokio::signal::ctrl_c().await?;
+    let shutdown = tokio::signal::ctrl_c().await;
     log::info!("received Ctrl-C, flushing user data");
     flush_task.abort();
+    // 加载中退出：占住结果槽，防止后台完成后再发布；ONNX 初始化不可中断，等待回收。
+    voice.complete(None);
+    if let Some(runtime) = voice.runtime() {
+        runtime.cancel().await;
+    }
+    if let Some(task) = voice_task
+        && let Err(error) = task.await
+    {
+        log::error!("voice initialization task failed: {error}");
+    }
+    shutdown?;
     decoder.flush_user()?;
     // 保持连接直到用户数据已落盘；关闭连接会释放组件名称。
     drop(conn);
     Ok(())
 }
 
-async fn start(standalone: bool) -> Result<(zbus::Connection, Arc<Decoder>), DaemonError> {
+struct Started {
+    conn: zbus::Connection,
+    decoder: Arc<Decoder>,
+    voice: Arc<VoiceAvailability>,
+    voice_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// 模型 IO/ONNX 初始化运行在阻塞线程；完成后发布给包括旧上下文在内的所有引擎。
+fn start_voice_loading(
+    settings: cnt_config::VoiceSettings,
+    model: Arc<PinyinModel>,
+    lm: Option<Arc<CntLm>>,
+    availability: Arc<VoiceAvailability>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !settings.enabled {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            // 跨线程单独建 root，量到运行时发布完成，不与拼音就绪时间混在一起。
+            let root = Span::root("voice_startup", SpanContext::random());
+            let runtime = {
+                let _parent = root.set_local_parent();
+                let scorer = load_rescorer(lm.as_ref(), &model);
+                load_voice(&settings, scorer)
+            };
+            (runtime, root)
+        })
+        .await;
+        match result {
+            Ok((runtime, root)) => {
+                let ready = runtime.is_some();
+                root.add_property(|| ("ready", ready.to_string()));
+                if availability.complete(runtime) {
+                    log::info!("voice initialization published: ready={ready}");
+                } else {
+                    log::info!("voice initialization discarded during shutdown");
+                }
+                drop(root);
+            }
+            Err(error) => {
+                availability.complete(None);
+                log::error!("voice initialization failed: {error}");
+            }
+        }
+        fastrace::flush();
+    }))
+}
+
+async fn start(standalone: bool) -> Result<Started, DaemonError> {
     // 先加载配置，解码器与语音初始化均使用同一份设置。
     let config_path =
         std::env::var_os("CNT_CONFIG").map_or_else(AppConfig::default_path, PathBuf::from);
@@ -362,13 +427,11 @@ async fn start(standalone: bool) -> Result<(zbus::Connection, Arc<Decoder>), Dae
 
     let (decoder, model, lm) = load_decoder(&config)?;
 
-    // 语音输入（可选；模型加载在这里同步做一次，失败只是没有语音）
-    let rescorer = config
-        .voice
-        .enabled
-        .then(|| load_rescorer(lm.as_ref(), &model))
-        .flatten();
-    let voice = load_voice(&config.voice, rescorer);
+    let voice = Arc::new(VoiceAvailability::new(
+        config.voice.enabled,
+        &config.voice.ptt_key,
+        &config.voice.toggle_key,
+    ));
 
     // 1. 找到 IBus 私有总线地址并连接
     let addr = cnt_ibus::find_address()?;
@@ -385,7 +448,12 @@ async fn start(standalone: bool) -> Result<(zbus::Connection, Arc<Decoder>), Dae
     conn.object_server()
         .at(
             cnt_engine::FACTORY_OBJ_PATH,
-            Factory::new(conn.clone(), decoder.clone(), config.page_size, voice),
+            Factory::new(
+                conn.clone(),
+                decoder.clone(),
+                config.page_size,
+                voice.clone(),
+            ),
         )
         .in_span(Span::enter_with_local_parent("serve_factory"))
         .await?;
@@ -403,7 +471,13 @@ async fn start(standalone: bool) -> Result<(zbus::Connection, Arc<Decoder>), Dae
             .in_span(Span::enter_with_local_parent("register_standalone"))
             .await?;
     }
-    Ok((conn, decoder))
+    let voice_task = start_voice_loading(config.voice, model, lm, voice.clone());
+    Ok(Started {
+        conn,
+        decoder,
+        voice,
+        voice_task,
+    })
 }
 
 /// 显式开发模式：允许没有 XML 安装记录时手动启动。

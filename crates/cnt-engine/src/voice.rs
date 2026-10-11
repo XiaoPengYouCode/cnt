@@ -72,11 +72,11 @@ fn meter(db: f32) -> &'static str {
 }
 
 /// 热键兜底值（配置写错时用；与 `cnt-config` 的默认字符串一致）。
-const PTT_FALLBACK: Hotkey = Hotkey {
+pub(crate) const PTT_FALLBACK: Hotkey = Hotkey {
     keyval: 0xffea, // Alt_R
     mods: 0,
 };
-const TOGGLE_FALLBACK: Hotkey = Hotkey {
+pub(crate) const TOGGLE_FALLBACK: Hotkey = Hotkey {
     keyval: 0x20, // space
     mods: mask::CONTROL | mask::SHIFT,
 };

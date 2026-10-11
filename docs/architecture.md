@@ -30,8 +30,8 @@ crates/
 
 ## 启动与首次激活
 
-默认启动顺序：加载配置/拼音与语音资源 → 连接 **IBus 私有总线** → 导出
-`/org/freedesktop/IBus/Factory` → `RequestName(org.freedesktop.IBus.Cnt)`。
+默认启动顺序：加载配置/拼音资源 → 连接 **IBus 私有总线** → 导出
+`/org/freedesktop/IBus/Factory` → `RequestName(org.freedesktop.IBus.Cnt)` → 后台加载语音。
 名字必须与安装 XML 的 `<name>` 一致；必须先导出工厂，再申请名字，避免 IBus
 收到 `NameOwnerChanged` 后调用尚不存在的对象。使用 `DoNotQueue`，不抢占旧实例，
 也不让第二个进程排队等待后接管同一份用户数据。
@@ -80,17 +80,23 @@ gdbus call --address "$(ibus address)" --dest org.freedesktop.DBus \
 | [libime 本地对应版本](https://github.com/fcitx/libime/blob/65003b6020623affcdbda14ce9292f408fb7a3ad/src/libime/core/languagemodel.cpp) | 预测 trie 在首次 `predictionTrie()` 调用时加载 | 可选数据可以延迟加载；核心库不负责 IBus 注册 |
 | [Fcitx 拼音适配层](https://github.com/fcitx/fcitx5-chinese-addons/blob/master/im/pinyin/pinyin.cpp) | 基础词库同步加载，附加词库 `loadDict` 通过 worker 加载后发布 | 明确关键资源与可选资源，不必将所有加载都异步化 |
 
-本轮先修复协议并补测量：`daemon_startup` 覆盖初始化到最后一次注册 IO；
-子阶段包括 `load_decoder`、`load_voice_rescorer`、`load_voice`、`load_asr_model`、
-`load_punctuator`、`connect_ibus`、`serve_factory`、`request_component_name`。
+`daemon_startup` 覆盖拼音初始化到最后一次注册 IO 和后台任务提交；
+子阶段包括 `load_decoder`、`connect_ibus`、`serve_factory`、`request_component_name`。
+独立的 `voice_startup` root 从后台初始化量到共享运行时发布，包含
+`load_voice_rescorer`、`load_voice`、`load_asr_model`、`load_punctuator`。
 启动结束及失败返回时 flush；root 不持续到进程退出。这个 root 量的是本进程就绪，
 不冒充桌面完成激活的端到端时间。原有按键 root 继续量到候选 UI 刷新。
 
-语音当前仍同步加载；关闭语音时跳过重排器初始化。下一步应在获准的诊断环境中
-保留 stderr，开启 `fastrace/enable` 测量冷启动。如果语音占据关键路径，将它移到
-后台并以共享就绪状态接入已经创建的引擎，保证加载失败不影响拼音、未就绪时不会
-丢失语音热键状态。不能仅提前导出一个不能响应的工厂，或简单加长等待时间。
-本轮未启动/注册引擎、未运行 D-Bus 上屏测试，也未修改桌面输入源设置。
+语音使用 `spawn_blocking` 加载，关闭语音时不创建加载任务。工厂与所有引擎共享
+`VoiceAvailability`，通过 `OnceLock` 一次性发布成功或失败结果，因此已有输入上下文
+无需重建即可使用语音。按键路径只读结果、不等待模型；加载期间按语音热键会提示
+准备中，必须松开并重新按下才开始录音，不会在模型就绪时重放旧按键或响应其自动重复。
+失败时提示不可用，拼音照常工作；不同输入上下文各自保留被抑制按键的释放状态。
+
+加载期间退出会先封住结果槽，等不可中断的 ONNX 初始化返回，再丢弃结果并回收任务；
+已就绪的语音会取消当前会话。后台任务完成与进程退出均 flush trace。
+获准的交替测量及 D-Bus 拼音/虚拟音频上屏验证见
+[后台语音加载对照](performance.md#后台语音加载对照2026-10-11)。
 
 ## 数据流
 
