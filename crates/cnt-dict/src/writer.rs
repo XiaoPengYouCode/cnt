@@ -28,13 +28,39 @@ where
 /// # Errors
 /// 字符串池/词条数超出格式上限（`u32` 偏移 / `u16` 长度 / `MAX_*` 总量上限）时返回 IO 错误。
 pub fn build(pairs: &[(String, String, u32)]) -> io::Result<Vec<u8>> {
+    let entries: Vec<_> = pairs
+        .iter()
+        .map(|(k, w, f)| (k.clone(), w.clone(), *f, None))
+        .collect();
+    build_with_readings(&entries)
+}
+
+/// 编译带独立 log10 读音权重的词表；None 保持旧词频语义。
+///
+/// # Errors
+/// 权重非有限值或条目超出格式上限时返回 IO 错误。
+#[allow(clippy::too_many_lines)] // 顺序写入四个磁盘区域，保持布局计算相邻。
+pub fn build_with_readings(pairs: &[(String, String, u32, Option<f32>)]) -> io::Result<Vec<u8>> {
     // 1. 按拼音分组（BTreeMap 保证 key 有序），候选按频率降序、词升序
-    let mut table: BTreeMap<&str, Vec<(&str, u32)>> = BTreeMap::new();
-    for (pinyin, word, freq) in pairs {
+    type WeightedWord<'a> = (&'a str, u32, Option<f32>);
+    let mut table: BTreeMap<&str, Vec<WeightedWord<'_>>> = BTreeMap::new();
+    for (pinyin, word, freq, weight) in pairs {
+        if weight.is_some_and(|w| !w.is_finite()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-finite reading weight",
+            ));
+        }
         let list = table.entry(pinyin.as_str()).or_default();
-        match list.iter_mut().find(|(w, _)| *w == word.as_str()) {
-            Some((_, f)) => *f = (*f).max(*freq),
-            None => list.push((word.as_str(), *freq)),
+        match list.iter_mut().find(|(w, _, _)| *w == word.as_str()) {
+            Some((_, f, old_weight)) => {
+                *f = (*f).max(*freq);
+                // 旧三列领域词可补词频，但不能擦掉原始词库的读音信息。
+                if let Some(weight) = weight {
+                    *old_weight = Some(old_weight.map_or(*weight, |old| old.max(*weight)));
+                }
+            }
+            None => list.push((word.as_str(), *freq, *weight)),
         }
     }
     for list in table.values_mut() {
@@ -87,9 +113,10 @@ pub fn build(pairs: &[(String, String, u32)]) -> io::Result<Vec<u8>> {
             cand_count: narrow(list.len(), "candidate count")?,
         };
         e.write(&mut entries);
-        for (word, freq) in list {
+        for (word, freq, reading_weight) in list {
             let word_off = str_off(word, &mut strings)?;
             let ch = CandidateHeader {
+                reading_weight: *reading_weight,
                 word_off,
                 word_len: narrow(word.len(), "word")?,
                 freq: *freq,
@@ -112,6 +139,7 @@ pub fn build(pairs: &[(String, String, u32)]) -> io::Result<Vec<u8>> {
         ));
     }
     let header = Header {
+        version: crate::format::FORMAT_VERSION,
         entry_count: entry_count_u64,
         entries_offset,
         cand_offset,

@@ -14,6 +14,7 @@
 //! ```
 //!
 //! 标准词表格式（tsv，`#` 开头为注释，频率可省略默认 1000）：
+//! 可选第 4 列为独立的 log10 读音权重；缺省沿用旧词频语义。
 //! ```text
 //! nihao<TAB>你好<TAB>1000
 //! ```
@@ -45,14 +46,10 @@ fn is_libime_top_tier(w: f64) -> bool {
 const LM_SCALE: f64 = 10_000.0;
 /// 无 LM 路径（dict 权重）的频率换算常量。
 const WEIGHT_SCALE: f64 = 100_000.0;
-/// 「次读音」判定阈值：libime 主读音权重 ≈ 0（-0.0001 ~ 0），
-/// 次读音显著更负（-2.7 ~ -5.3）。次读音用按读音权重，避免多音字串频
-/// （的(de) vs 的(di)、和(he) vs 和(hu)）。
-const SECONDARY_READING_THRESHOLD: f64 = -0.1;
 /// LM 地板词的“常用词带”高度（0.5 个 log10 单位）。
 const FLOOR_BOOST: u32 = 5_000;
 
-/// 有 LM 时：词在 unigram 里 → 对数概率换算频率；否则长尾 `freq = 1`。
+/// 有 LM 时：unigram + 读音权重换算成排序频率；否则长尾 `freq = 1`。
 /// libime 顶层词（dict 权重 == 0）若是 LM 地板词（如 你好，LM 按 你+好
 /// 二元组建模所以 unigram 概率在地板），抬到“常用词带”，避免排到生僻词后。
 fn lm_freq(
@@ -62,35 +59,15 @@ fn lm_freq(
     dict_weight: Option<&str>,
 ) -> u32 {
     map.get(word).map_or(1, |p| {
-        let raw = freq_u32((p - p_min) * LM_SCALE);
-        let top_tier = dict_weight
-            .and_then(|w| w.trim().parse::<f64>().ok())
-            .is_some_and(is_libime_top_tier);
+        let weight = dict_weight.and_then(|w| w.trim().parse::<f64>().ok());
+        let raw = freq_u32((p - p_min + weight.unwrap_or(0.0)) * LM_SCALE);
+        let top_tier = weight.is_some_and(is_libime_top_tier);
         if top_tier && raw < FLOOR_BOOST {
             FLOOR_BOOST
         } else {
             raw
         }
     })
-}
-
-/// 混合频率（读音感知）：
-/// - **次读音**（权重 < `SECONDARY_READING_THRESHOLD`，如 的di=-3.5、和hu=-2.8）
-///   用 libime 按读音权重 —— 多音字的次读音频率显著低于主读音，不再串频；
-/// - **主读音**（权重 ≈ 0，如 的de、是/时/事）用 LM unigram —— 保留细粒度排序
-///   （是 与 时 不并列）。
-fn blend_freq(
-    map: &std::collections::HashMap<String, f64>,
-    p_min: f64,
-    word: &str,
-    dict_weight: Option<&str>,
-    _min_w: f64,
-) -> u32 {
-    match dict_weight.and_then(|w| w.trim().parse::<f64>().ok()) {
-        // 次读音（如 的di、和hu）：freq=1，与主读音的 LM 频率（≥1e4 量级）天然区分
-        Some(w) if w < SECONDARY_READING_THRESHOLD => 1,
-        _ => lm_freq(map, p_min, word, dict_weight),
-    }
 }
 
 /// 读取已编译的 `.cntl` 语言模型（替代解析 ARPA 文本）。
@@ -228,7 +205,9 @@ fn usage() {
     );
 }
 
-fn parse_wordlist(path: &str) -> io::Result<Vec<(String, String, u32)>> {
+type WordEntry = (String, String, u32, Option<f32>);
+
+fn parse_wordlist(path: &str) -> io::Result<Vec<WordEntry>> {
     let f = BufReader::new(File::open(path)?);
     let mut pairs = Vec::new();
     for (lineno, line) in f.lines().enumerate() {
@@ -239,20 +218,37 @@ fn parse_wordlist(path: &str) -> io::Result<Vec<(String, String, u32)>> {
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
         match fields.as_slice() {
-            [pinyin, word] => pairs.push((pinyin.to_string(), word.to_string(), 1000)),
-            [pinyin, word, freq] => {
+            [pinyin, word] => pairs.push((pinyin.to_string(), word.to_string(), 1000, None)),
+            [pinyin, word, freq] | [pinyin, word, freq, _] => {
                 let freq: u32 = freq.parse().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("line {}: bad freq {freq:?}", lineno + 1),
                     )
                 })?;
-                pairs.push((pinyin.to_string(), word.to_string(), freq));
+                let weight = fields
+                    .get(3)
+                    .map(|v| {
+                        v.parse::<f32>()
+                            .ok()
+                            .filter(|v| v.is_finite())
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("line {}: invalid reading weight", lineno + 1),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                pairs.push((pinyin.to_string(), word.to_string(), freq, weight));
             }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("line {}: expected 'pinyin word [freq]'", lineno + 1),
+                    format!(
+                        "line {}: expected 'pinyin word [freq [reading_weight]]'",
+                        lineno + 1
+                    ),
                 ));
             }
         }
@@ -262,7 +258,7 @@ fn parse_wordlist(path: &str) -> io::Result<Vec<(String, String, u32)>> {
 
 fn cmd_build(input: &str, output: &str) -> CliResult {
     let pairs = parse_wordlist(input)?;
-    writer::write_to_file(&pairs, Path::new(output))?;
+    std::fs::write(output, writer::build_with_readings(&pairs)?)?;
     println!("built {} entries -> {output}", pairs.len());
     Ok(())
 }
@@ -315,16 +311,14 @@ fn cmd_import_rime_table(input: &str, output: &str) -> CliResult {
 
 /// 把 `libime`（`fcitx5`）拼音词典转成标准词表。
 ///
-/// libime 格式：`词<TAB>拼音(音节用 ' 分隔)<TAB>权重`，权重可省略。
+/// libime 格式：词、拼音（音节用单引号分隔）、可选权重；空格和制表符均合法。
 ///
-/// 权重说明：dict.txt 里的权重并不可靠（0 是最常用基准，但多音字默认读音
-/// 会被给到正权重，如 螫+0.22 反而超过 是），真正决定候选顺序的是语言模型。
-/// 因此推荐传 `--lm lm.arpa`：用 ARPA 1-gram 的对数概率排序（是 -1.94，
-/// 时 -2.88，螫 -6.17），顺序完全正确。
+/// 权重是加到语言模型分数上的 log10 读音调整值，并非词本身的频率。
+/// 推荐传 `--lm` 提供排序词频；原始权重独立保存到第 4 列，解码时相加。
 ///
 /// 转换规则：
 /// - 去掉音节分隔符 `'`（ni'hao → nihao，与我们的 key 一致）
-/// - 有 `--lm`：`freq = round((p - p_min) * 1e4) + 1`，不在 `LM` 中的长尾词 `freq = 1`
+/// - 有 `--lm`：`freq = max(1, round((p + w - p_min) * 1e4))`，不在 `LM` 中的长尾词 `freq = 1`
 /// - 无 `--lm`：`freq = round((min(w,0) - min_w) * 1e5) + 1`，无权重条目 `freq = 1`
 fn cmd_import_libime(input: &str, output: &str, lm: Option<&str>) -> CliResult {
     // 语言模型 unigram（若提供）：.arpa 文本或已编译的 .cntl
@@ -336,7 +330,7 @@ fn cmd_import_libime(input: &str, output: &str, lm: Option<&str>) -> CliResult {
         None => None,
     };
 
-    // 先扫一遍找最小权重（次读音换算需要；多音字正权重按 0 封顶）。
+    // 无 LM 时需要最小权重来构造排序频率；原始权重另行完整保存。
     // 哨兵用 f64::MAX：NEG_INFINITY.min(x) 恒为 -inf（负无穷即最小值），是经典陷阱。
     let min_w = {
         let mut min_w = f64::MAX;
@@ -346,7 +340,7 @@ fn cmd_import_libime(input: &str, output: &str, lm: Option<&str>) -> CliResult {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let fields: Vec<&str> = line.split('\t').collect();
+            let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() < 2 || fields[1].is_empty() {
                 continue;
             }
@@ -369,7 +363,7 @@ fn cmd_import_libime(input: &str, output: &str, lm: Option<&str>) -> CliResult {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let fields: Vec<&str> = line.split('\t').collect();
+        let fields: Vec<&str> = line.split_whitespace().collect();
         let (Some(word), Some(pinyin)) = (fields.first(), fields.get(1)) else {
             skipped += 1;
             continue;
@@ -384,10 +378,17 @@ fn cmd_import_libime(input: &str, output: &str, lm: Option<&str>) -> CliResult {
             continue;
         }
         let freq = match &unigrams {
-            Some((map, p_min)) => blend_freq(map, *p_min, word, fields.get(2).copied(), min_w),
+            Some((map, p_min)) => lm_freq(map, *p_min, word, fields.get(2).copied()),
             None => weight_freq(fields.get(2).copied(), min_w),
         };
-        writeln!(out, "{key}\t{word}\t{freq}")?;
+        // libime 的词典值是加到 LM 分数上的 log10 读音权重，必须独立保存。
+        let weight = fields.get(2).map_or(Ok(0.0), |w| w.trim().parse::<f32>())?;
+        if !weight.is_finite() {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "non-finite reading weight").into(),
+            );
+        }
+        writeln!(out, "{key}\t{word}\t{freq}\t{weight}")?;
         imported += 1;
     }
     out.flush()?;
@@ -891,4 +892,114 @@ fn cmd_bench(dict_path: &str, lm_path: &str, user_path: Option<&str>, n: usize) 
 
     let _ = std::fs::remove_file(&tmp_user);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cnt_input::CandidateSource;
+
+    #[test]
+    fn import_build_decode_preserves_readings_before_pruning_and_after_context() {
+        use cnt_lm::writer::{Bigram, Unigram};
+        use std::fmt::Write as _;
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("cnt-reading-pipeline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.txt");
+        let tsv = dir.join("words.tsv");
+        let dict = dir.join("dict.cntd");
+        let lm = dir.join("lm.cntl");
+        // 混合空格/制表符、有无权重；同时覆盖多个常用读音和真正罕用读音。
+        let mut text = String::from(
+            "长 chang -0.21998673\n长\tzhang\t-0.4007481\n重 chong -0.38147393\n重 zhong -0.23318353\n行 hang -1.0850278\n行 xing -0.04201891\n的 di -3.482804\n低 di\n长城 chang'cheng\n我 wo\n",
+        );
+        let mut unigrams: Vec<_> = [
+            ("长", -3.0),
+            ("重", -3.0),
+            ("行", -3.0),
+            ("的", -1.0),
+            ("低", -3.5),
+            ("长城", -4.0),
+            ("我", -2.0),
+            ("地板", -8.0),
+        ]
+        .into_iter()
+        .map(|(word, logprob)| Unigram {
+            word: word.into(),
+            logprob,
+            backoff: 0.0,
+        })
+        .collect();
+        // 超过取词上限的高基础概率、罕用读音：若先按基础词频截断，长就会消失。
+        for i in 0..25 {
+            let word = format!("噪声{i}");
+            writeln!(text, "{word} chang -5").unwrap();
+            unigrams.push(Unigram {
+                word,
+                logprob: -1.0,
+                backoff: 0.0,
+            });
+        }
+        std::fs::write(&source, text).unwrap();
+        let bigrams = [Bigram {
+            w1: "我".into(),
+            w2: "长".into(),
+            logprob: -0.5,
+        }];
+        std::fs::write(&lm, cnt_lm::writer::build(&unigrams, &bigrams).unwrap()).unwrap();
+        cmd_import_libime(
+            source.to_str().unwrap(),
+            tsv.to_str().unwrap(),
+            Some(lm.to_str().unwrap()),
+        )
+        .unwrap();
+        let rows = parse_wordlist(tsv.to_str().unwrap()).unwrap();
+        assert_eq!(rows.len(), 35);
+        cmd_build(tsv.to_str().unwrap(), dict.to_str().unwrap()).unwrap();
+        let model = Arc::new(cnt_dict::PinyinModel::open(&dict, dir.join("user.dict")).unwrap());
+        let decoder = cnt_decode::Decoder::new(
+            model.clone(),
+            Some(Arc::new(cnt_lm::CntLm::open(&lm).unwrap())),
+            false,
+        );
+        for (key, word) in [
+            ("chang", "长"),
+            ("zhang", "长"),
+            ("chong", "重"),
+            ("zhong", "重"),
+            ("hang", "行"),
+            ("xing", "行"),
+            ("changcheng", "长城"),
+        ] {
+            assert_eq!(decoder.candidates(key)[0].text, word, "{key}");
+        }
+        assert_eq!(decoder.candidates("di")[0].text, "低");
+        let weight = model
+            .dict()
+            .exact("chang")
+            .into_iter()
+            .find(|c| c.word == "长")
+            .unwrap()
+            .reading_weight
+            .unwrap();
+        assert!((weight - (-0.219_986_73)).abs() < 1e-6);
+        let score = decoder.candidates_scored("chang")[0].1;
+        assert!((score - (-3.0 + weight)).abs() < 1e-5);
+        // 续接使用 bigram 仍须保留读音惩罚，且不能重复计入。
+        let sentence = decoder.candidates_scored("wochang");
+        let score = sentence.iter().find(|(c, _)| c.text == "我长").unwrap().1;
+        assert!((score - (-2.0 - 0.5 + weight)).abs() < 1e-5);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wordlist_rejects_nonfinite_reading_weight() {
+        let path = std::env::temp_dir().join(format!("cnt-bad-weight-{}.tsv", std::process::id()));
+        for weight in ["NaN", "inf", "-inf"] {
+            std::fs::write(&path, format!("chang\t长\t1000\t{weight}\n")).unwrap();
+            assert!(parse_wordlist(path.to_str().unwrap()).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

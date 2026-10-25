@@ -186,11 +186,27 @@ impl PinyinModel {
     /// 调用方通常要转成自己的表示（如 `Arc<str>`），少一次 `String` 中转。
     #[must_use]
     pub fn ranked_words<'a>(&'a self, key: &str, limit: usize) -> Vec<(Cow<'a, str>, u32)> {
+        self.ranked_words_by(key, limit, |_, freq, _, count| {
+            f64::from(count).mul_add(f64::from(USER_BOOST), f64::from(freq))
+        })
+        .into_iter()
+        .map(|(w, f, _)| (w, f))
+        .collect()
+    }
+
+    /// 先按调用方的读音感知分数排序，再裁剪，避免常用读音在 LM 评分前丢失。
+    /// 回调在用户库锁内执行，不得再次访问用户库。
+    pub fn ranked_words_by<'a>(
+        &'a self,
+        key: &str,
+        limit: usize,
+        score: impl Fn(&str, u32, Option<f32>, u32) -> f64,
+    ) -> Vec<(Cow<'a, str>, u32, Option<f32>)> {
         // 排序键先算好再排（Schwartzian transform）：此前比较器里调 user_count，
         // 每次比较都要抢一次用户库的锁 + 两次哈希查找 —— 20 个候选就是上百次加锁，
         // 而这是 beam 每个词键都会走的热路径。
-        let mut scored: Vec<(Cow<'a, str>, u32, u64)> = Vec::new();
-        let mut user_pushed: Vec<(Cow<'a, str>, u32, u64)> = Vec::new();
+        let mut scored: Vec<(Cow<'a, str>, u32, Option<f32>, f64)> = Vec::new();
+        let mut user_pushed: Vec<(Cow<'a, str>, u32, Option<f32>, f64)> = Vec::new();
         {
             let user = self
                 .user
@@ -198,30 +214,35 @@ impl PinyinModel {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // 外层键只查一次（counts_of），之后按词哈希查找
             let counts = user.counts_of(key);
-            let rank_of = |word: &str, freq: u32| {
-                u64::from(freq) + u64::from(counts.get(word)) * u64::from(USER_BOOST)
-            };
             for c in self.dict.exact(key) {
-                scored.push((Cow::Borrowed(c.word), c.freq, rank_of(c.word, c.freq)));
+                scored.push((
+                    Cow::Borrowed(c.word),
+                    c.freq,
+                    c.reading_weight,
+                    score(c.word, c.freq, c.reading_weight, counts.get(c.word)),
+                ));
             }
             for w in user.words_for_pinyin(key) {
-                if !scored.iter().any(|(x, _, _)| x.as_ref() == w.as_str()) {
-                    let rank = rank_of(&w, 0);
-                    scored.push((Cow::Owned(w.clone()), 0, rank));
-                    user_pushed.push((Cow::Owned(w), 0, rank));
+                if !scored.iter().any(|(x, _, _, _)| x.as_ref() == w.as_str()) {
+                    let rank = score(&w, 0, None, counts.get(&w));
+                    scored.push((Cow::Owned(w.clone()), 0, None, rank));
+                    user_pushed.push((Cow::Owned(w), 0, None, rank));
                 }
             }
         } // 锁只覆盖计数读取，排序不持锁
-        scored.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-        let mut out: Vec<(Cow<'a, str>, u32, u64)> = scored.into_iter().take(limit).collect();
+        scored.sort_by(|a, b| b.3.total_cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        let mut out: Vec<(Cow<'a, str>, u32, Option<f32>, f64)> =
+            scored.into_iter().take(limit).collect();
         // 用户词恒可见（对齐 librime：用户短语权重再低也出现在候选里，可被再次选择确认）：
         // 被截断掉的用户词补到末尾 —— 它们 rank 本就最低，补在末尾不破坏排序。
         for uw in &user_pushed {
-            if !out.iter().any(|(x, _, _)| *x == uw.0) {
+            if !out.iter().any(|(x, _, _, _)| *x == uw.0) {
                 out.push(uw.clone());
             }
         }
-        out.into_iter().map(|(w, freq, _)| (w, freq)).collect()
+        out.into_iter()
+            .map(|(w, freq, weight, _)| (w, freq, weight))
+            .collect()
     }
 
     /// 用户选中了候选 (pinyin, word)：记录调频。

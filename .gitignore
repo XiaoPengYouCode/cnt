@@ -1,4 +1,5 @@
 /target
+# 原始词库 data/raw/、转换词表、模型与编译数据均只在本地维护
 /data/
 
 # 性能采样产物（perf record / flamegraph），一律不入库

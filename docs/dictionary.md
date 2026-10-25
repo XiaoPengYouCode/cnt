@@ -4,16 +4,39 @@
 
 词库（`data/` 下的 tsv 与二进制）**不入库**，通过数据管线独立分发：
 
-1. **来源**：fcitx5 的 libime 数据（`dict_sc.txt`：简体拼音词典，约 30 万词条；
-   `lm_sc.arpa`：语言模型）。编译后 `data/cnt.dict` 实测 13 万词条 /
-   20 万候选（多音字合并去重后）。
+1. **来源**：fcitx5/libime 的 `dict_sc.txt`，原始文件长期保留在
+   `data/raw/libime/`，与转换产物一起由 `.gitignore` 的 `/data/` 忽略。
+   固定数据包为 `https://download.fcitx-im.org/data/dict-20260703.tar.zst`，
+   SHA-256：`c686cab6df8964c48d596f57d205bac31fc72870b06a83017e44503df8c09697`。
+   包内 `dict_extb.txt` 也保留，但默认不合入；本地领域词维护在
+   `data/wordlist-domain.tsv`，重建时追加。
 2. **转换**（`cnt-dict-tools import-libime --lm`）：
-   - 音节分隔符 `'` 去掉（`ni'hao` → `nihao`）
-   - 候选排序用语言模型 1-gram 对数概率（`是 -1.94` > `时 -2.88` > `螫 -6.17`），
-     dict.txt 自带的权重不可靠（多音字默认读音会被给到正权重）
-   - LM 地板词（如「你好」，LM 按 你+好 二元组建模）若 dict 权重为 0，
-     抬到常用词带，避免排到生僻字后面
-3. **编译**：`build` 生成 `.cntd`（定长小端整数 + 字节偏移，mmap 零拷贝二分查找）
+   - 原始文件的空格和制表符均是字段分隔符；无权重的词条默认读音权重为 0。
+   - 音节分隔符 `'` 去掉（`ni'hao` → `nihao`）。
+   - TSV 为 `拼音键、词、排序词频、log10 读音权重` 四列；旧的两列/三列仍可编译。
+   - 排序词频由 `unigram + 读音权重` 连续换算，用于无 LM 查询等路径；
+     权重为 0 的 LM 地板词保持原有词频提升。解码器直接使用 LM 分数和第 4 列，
+     不从排序词频反推权重，也不重复累加。
+   - **读音权重独立保存**，按 libime 的语义与 LM 分数相加，不按阈值归零。
+     候选裁剪使用合成分数；整句续接使用 bigram 分数再加该词的读音权重。
+3. **编译**：生成 v2 `.cntd`（每候选增加一个 f32 读音权重）。新程序兼容读 v1，
+   旧词库缺少权重时保留历史评分规则；旧程序不能读 v2，发布时需同步更新程序和词库。
+
+日常维护改 `data/raw/libime/dict_sc.txt` 或 `data/wordlist-domain.tsv`，不要只改
+会被重建覆盖的 `data/wordlist.tsv`。已有 `data/lm.cntl` 时运行：
+
+```bash
+bash scripts/rebuild-dict.sh
+```
+
+脚本只在原始主词库缺失时下载并校验固定数据包，通常离线使用本地原始文件；
+转换和编译成功后替换 `data/wordlist.tsv`、`data/cnt.dict`，不安装或启动输入法。
+2026-10-25 完整导入 300,234 条原始词条，追加 2,551 条领域词。
+旧导入器仅识别制表符，漏掉 95,175 条空格分隔记录；已一并修正。
+
+回归测试包含：空格/制表符导入、读音权重的二进制往返、v1 兼容、多个常用
+读音共存、候选裁剪前计入读音权重、bigram 续接只计入一次权重，以及非有限值拒绝。
+可用 `cargo test -p cnt-dict -p cnt-decode -p cnt-dict-tools` 运行，均为离线测试。
 
 语言模型 `.cntl`（`build-lm` 生成，格式自研）：270k unigram + 480 万 bigram，
 mmap 二分查找，trigram 留作扩展（Katz backoff 已预留）。

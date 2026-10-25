@@ -23,12 +23,12 @@
 ## 快速上手
 
 ```bash
-# 1. 准备数据（一次性）——词库/语言模型不入库，从 fcitx5 官方源下载转换
-#    dict_sc.txt（约 30 万词条）→ data/cnt.dict（编译后 13 万词条）
-#    lm_sc.arpa → data/lm.cntl
-cargo run -p cnt-dict-tools -- import-libime dict_sc.txt data/wordlist.tsv --lm lm_sc.arpa
-cargo run -p cnt-dict-tools -- build       data/wordlist.tsv data/cnt.dict
-cargo run -p cnt-dict-tools -- build-lm    lm_sc.arpa data/lm.cntl
+# 1. 准备数据（原始词库和产物都在 data/，不提交 Git）
+#    先准备语言模型；已有 data/lm.cntl 时跳过这一行
+cargo run -p cnt-dict-tools -- build-lm lm_sc.arpa data/lm.cntl
+#    原始词库长期保留在 data/raw/libime/；首次缺失才下载并校验
+#    合并本地领域词，重建 data/wordlist.tsv 和 data/cnt.dict
+bash scripts/rebuild-dict.sh
 
 # 2. 启动引擎（数据默认在 ~/.local/share/cnt/，可用环境变量覆盖）
 CNT_DICT=data/cnt.dict CNT_LM=data/lm.cntl cargo run -p cnt-daemon -- --standalone

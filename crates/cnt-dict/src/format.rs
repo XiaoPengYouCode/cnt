@@ -7,11 +7,11 @@
 //! 布局（所有整数小端）：
 //! ```text
 //! [0..8]    magic       b"CNTDICT1"
-//! [8..12]   version     u32 = 1
+//! [8..12]   version     u32 = 2 (兼容读取 v1)
 //! [12..16]  reserved    u32
 //! [16..24]  entry_count u64
 //! [24..32]  entries_offset        u64  ->  entry_count × Entry(16B)，按 key 字节序升序
-//! [32..40]  cand_offset           u64  ->  N × CandidateHeader(12B)
+//! [32..40]  cand_offset           u64  ->  N × CandidateHeader(16B; v1 为 12B)
 //! [40..48]  strings_offset        u64  ->  UTF-8 字节（key 与 word 共用）
 //! [48..56]  strings_len           u64
 //! [56..64]  reserved    u64
@@ -23,21 +23,23 @@
 //!   [8..12]  cand_off u32   CandidateHeader 表内的下标（第几个）
 //!   [12..16] cand_count u32
 //!
-//! CandidateHeader（12 字节）：
+//! CandidateHeader（v2 16 字节；v1 无 reading_weight）：
 //!   [0..4]   word_off u32   strings 内的偏移
 //!   [4..6]   word_len u16
 //!   [6..8]   pad      u16
 //!   [8..12]  freq     u32
+//!   [12..16] reading_weight f32，log10 读音权重；NaN 表示旧词频语义
 //! ```
 
 use cnt_store::{StoreError, read_u16, read_u32, read_u64};
 
 pub const MAGIC: &[u8; 8] = b"CNTDICT1";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 pub const HEADER_SIZE: usize = 64;
 pub const ENTRY_SIZE: usize = 16;
-pub const CAND_HEADER_SIZE: usize = 12;
+pub const CAND_HEADER_SIZE: usize = 16;
+pub const LEGACY_CAND_HEADER_SIZE: usize = 12;
 
 // ---- 格式上限（防恶意/损坏文件导致算术溢出）----
 // 参考：真实输入法词库规模，常见词 40~60 万条、全量（含专业词库）100~200 万条、
@@ -54,6 +56,7 @@ pub const MAX_STRINGS_LEN: usize = 512 * 1024 * 1024;
 /// 文件头（解析后）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
+    pub version: u32,
     pub entry_count: u64,
     pub entries_offset: u64,
     pub cand_offset: u64,
@@ -74,10 +77,11 @@ impl Header {
             return Err(StoreError::BadMagic);
         }
         let version = read_u32(&bytes[8..12]);
-        if version != FORMAT_VERSION {
+        if version != 1 && version != FORMAT_VERSION {
             return Err(StoreError::UnsupportedVersion(version));
         }
         Ok(Self {
+            version,
             entry_count: read_u64(&bytes[16..24]),
             entries_offset: read_u64(&bytes[24..32]),
             cand_offset: read_u64(&bytes[32..40]),
@@ -88,7 +92,7 @@ impl Header {
 
     pub fn write(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&self.entry_count.to_le_bytes());
         out.extend_from_slice(&self.entries_offset.to_le_bytes());
@@ -137,6 +141,7 @@ impl Entry {
 /// 候选头（见文件头注释）。
 #[derive(Debug, Clone, Copy)]
 pub struct CandidateHeader {
+    pub reading_weight: Option<f32>,
     pub word_off: u32,
     pub word_len: u16,
     pub freq: u32,
@@ -148,10 +153,22 @@ impl CandidateHeader {
     /// # Errors
     /// 字节不足时返回 [`StoreError::Truncated`]。
     pub fn read(b: &[u8]) -> Result<Self, StoreError> {
-        if b.len() < CAND_HEADER_SIZE {
+        if b.len() < LEGACY_CAND_HEADER_SIZE {
             return Err(StoreError::Truncated("candidate header"));
         }
         Ok(Self {
+            reading_weight: if b.len() >= CAND_HEADER_SIZE {
+                let weight = f32::from_bits(read_u32(&b[12..16]));
+                if weight.is_nan() {
+                    None
+                } else if weight.is_finite() {
+                    Some(weight)
+                } else {
+                    return Err(StoreError::Region("reading_weight"));
+                }
+            } else {
+                None
+            },
             word_off: read_u32(&b[0..4]),
             word_len: read_u16(&b[4..6]),
             freq: read_u32(&b[8..12]),
@@ -163,5 +180,6 @@ impl CandidateHeader {
         out.extend_from_slice(&self.word_len.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&self.freq.to_le_bytes());
+        out.extend_from_slice(&self.reading_weight.unwrap_or(f32::NAN).to_le_bytes());
     }
 }
