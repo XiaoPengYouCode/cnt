@@ -41,6 +41,10 @@ const KEY_SHIFT_L: u32 = 0xffe1;
 const KEY_SHIFT_R: u32 = 0xffe2;
 /// Delete 键 keysym（`XK_Delete`）
 const KEY_DELETE: u32 = 0xffff;
+
+const fn is_ctrl_delete_press(keyval: u32, state: u32) -> bool {
+    keyval == KEY_DELETE && state & CONTROL_MASK != 0 && state & RELEASE_MASK == 0
+}
 /// Shift「单击」判定窗口：按下后该时间内释放且期间未打其他键 → 切换中英
 const SHIFT_TAP_DURATION: std::time::Duration = std::time::Duration::from_millis(350);
 /// 「慢按键」阈值：超过这个时长的按键才上报 span 树（含 UI 刷新）。
@@ -136,6 +140,73 @@ impl Engine {
             pending_voice_keys: Mutex::new(PendingVoiceKeys::default()),
         }
     }
+
+    /// Ctrl+Delete：持久屏蔽光标处的完整候选。
+    ///
+    /// 修饰键只有引擎层知道（IBus state），所以在这里单独放行；
+    /// 状态机保持无 IO，只从这里取选中候选的 learned 段。
+    /// 非 Ctrl+Delete 返回 false（调用者继续按忽略处理）。
+    async fn handle_ctrl_delete(&self, keyval: u32, state: u32) -> bool {
+        if !is_ctrl_delete_press(keyval, state) {
+            log::debug!(
+                "ctrl_delete skipped: keyval=0x{keyval:x} state=0x{state:x} (requires Control + 0xffff press)"
+            );
+            return false;
+        }
+        let cand = {
+            let st = self.core.lock_state();
+            log::info!(
+                "ctrl_delete matched: release={} composing={} candidates={} cursor={} buffer={:?}",
+                state & RELEASE_MASK != 0,
+                st.is_composing(),
+                st.candidates().len(),
+                st.cursor_abs(),
+                st.buffer()
+            );
+            let Some(cand) = st.selected().cloned() else {
+                log::info!("block ignored: no selected candidate");
+                return false;
+            };
+            drop(st);
+            cand
+        };
+        log::info!(
+            "block: '{}' at cursor ({} learned segments)",
+            cand.text,
+            cand.learned.len()
+        );
+        if cand.learned.is_empty() {
+            log::warn!("block ignored: no learned segments");
+            return false;
+        }
+        for segment in &cand.learned {
+            log::debug!(
+                "block segment: pinyin={:?} word={:?}",
+                segment.pinyin,
+                segment.word
+            );
+        }
+        // Span 跨 await 覆盖屏蔽、持久化和 UI 信号发送，慢操作保留诊断树。
+        let root = Span::root("block_candidate", SpanContext::random());
+        self.core
+            .block_candidate(cand)
+            .in_span(Span::enter_with_parent("update_ui", &root))
+            .await;
+        if root.elapsed() < Some(SLOW_KEY_THRESHOLD) {
+            root.cancel();
+        }
+        log::info!("ctrl_delete finished: consumed=true");
+        true
+    }
+
+    fn log_received_key(&self, keyval: u32, keycode: u32, state: u32) {
+        log::debug!(
+            "key received: engine={} keyval=0x{keyval:x} keycode={keycode} state=0x{state:x} control={} release={}",
+            self.core.path(),
+            state & CONTROL_MASK != 0,
+            state & RELEASE_MASK != 0
+        );
+    }
 }
 
 #[zbus::interface(name = "org.freedesktop.IBus.Engine")]
@@ -164,20 +235,29 @@ impl Engine {
         _keycode: u32,
         state: u32,
     ) -> zbus::fdo::Result<bool> {
+        // 必须在语音/修饰键/release 的所有提前返回之前，才能判断原始按键是否到达。
+        self.log_received_key(keyval, _keycode, state);
         // 语音热键最先判：PTT 用的是修饰键，必须在下面的「忽略修饰键」之前拦下。
         match self
             .voice
             .handle_key(&self.core, &self.pending_voice_keys, keyval, state)
             .await
         {
-            KeyOutcome::Consumed => return Ok(true),
-            KeyOutcome::Forwarded => return Ok(false),
+            KeyOutcome::Consumed => {
+                log::debug!("key exit: voice consumed");
+                return Ok(true);
+            }
+            KeyOutcome::Forwarded => {
+                log::debug!("key exit: voice forwarded");
+                return Ok(false);
+            }
             KeyOutcome::NotVoice => {}
         }
 
         // 从这里到 UI 刷新完成，组合状态和对应的 signal 必须属于同一个操作；
         // 语音提交也使用同一把锁，避免 CommitText await 期间新组合被旧空 UI 覆盖。
         let _operation_guard = self.core.lock_operations().await;
+        log::debug!("key operation lock acquired");
 
         // Shift 键：必须先于通用 release 检查处理 ——
         // 通用检查会把所有 release 事件拦下（含 Shift 释放），导致释放分支永不执行。
@@ -203,27 +283,16 @@ impl Engine {
             if should_toggle {
                 self.core.toggle_input_mode().await;
             }
+            log::debug!("key exit: Shift forwarded, toggle={should_toggle}");
             return Ok(false); // Shift 本身转发给应用（无害）
         }
 
         // 忽略按键释放与组合键（Ctrl/Alt/Super 等；Shift 已在上面处理）
         if state & (RELEASE_MASK | IGNORED_MOD_MASK) != 0 {
-            // Ctrl+Delete 例外：组合中删除光标处候选（「忘记此词」的撤销入口）。
-            // 修饰键只有引擎层知道（IBus state），所以在这里单独放行；
-            // 状态机保持无 IO，只从这里取选中候选的 learned 段。
-            if state & CONTROL_MASK != 0 && keyval == KEY_DELETE {
-                let learned = self.core.lock_state().selected().map(|c| c.learned.clone());
-                if let Some(learned) = learned {
-                    let root = Span::root("forget_candidate", SpanContext::random());
-                    self.core
-                        .forget_candidate(learned)
-                        .in_span(Span::enter_with_parent("update_ui", &root))
-                        .await;
-                    root.cancel(); // 忘词是同步小操作，不留诊断 span
-                    return Ok(true);
-                }
-            }
-            return Ok(false);
+            // Ctrl+Delete 例外：组合中删除光标处候选，细节见 handle_ctrl_delete。
+            let consumed = self.handle_ctrl_delete(keyval, state).await;
+            log::debug!("key exit: modifier/release branch consumed={consumed}");
+            return Ok(consumed);
         }
 
         // 带 Shift 的字符键：标记 shift 被「借用」（避免松开时误判为单击切换）
@@ -436,3 +505,19 @@ impl Engine {
 
 /// 供 cnt-daemon 使用的常量
 pub const FACTORY_OBJ_PATH: &str = FACTORY_PATH;
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_delete_only_runs_on_press() {
+        assert!(is_ctrl_delete_press(KEY_DELETE, CONTROL_MASK));
+        assert!(!is_ctrl_delete_press(
+            KEY_DELETE,
+            CONTROL_MASK | RELEASE_MASK
+        ));
+        assert!(!is_ctrl_delete_press(KEY_DELETE, 0));
+        assert!(!is_ctrl_delete_press(0xff08, CONTROL_MASK));
+    }
+}

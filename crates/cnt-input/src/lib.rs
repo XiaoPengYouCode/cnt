@@ -378,6 +378,28 @@ impl EngineState {
         self.cursor = 0;
     }
 
+    /// 忘词后重查候选并保持光标（`Ctrl+Delete` 用）。
+    ///
+    /// 与 `refresh` 同一查询口径，只是**不复位翻页/光标**：删的是光标处候选，
+    /// 复位回 #1 会很跳；保持绝对位置（越界时 clamp 到末尾），用户留在原地
+    /// 就能看到新的排序。
+    pub fn requery_keep_cursor(&mut self, source: &dyn CandidateSource) {
+        let keep = self.page * self.page_size + self.cursor;
+        self.candidates = if self.buffer.is_empty() {
+            Vec::new()
+        } else {
+            source.candidates_with_context(&self.buffer, &self.confirmed)
+        };
+        if self.candidates.is_empty() {
+            self.page = 0;
+            self.cursor = 0;
+        } else {
+            let abs = keep.min(self.candidates.len() - 1);
+            self.page = abs / self.page_size;
+            self.cursor = abs % self.page_size;
+        }
+    }
+
     /// 当前输入模式。
     #[must_use]
     pub const fn mode(&self) -> InputMode {
@@ -1411,5 +1433,51 @@ mod tests {
         st.handle_key(0x69, &d, false);
         st.handle_key(keysym::ESCAPE, &d, false);
         assert!(!st.is_composing());
+    }
+
+    #[test]
+    fn requery_keep_cursor_refreshes_list_without_reset() {
+        // 模拟忘词：同一拼音，新来源的排序已变（删掉的词沉底/消失）。
+        let before = TestSource {
+            map: std::collections::HashMap::from([("ni", vec!["你", "尼", "泥"])]),
+        };
+        let after = TestSource {
+            map: std::collections::HashMap::from([("ni", vec!["尼", "泥"])]),
+        };
+        let mut st = EngineState::new();
+        st.handle_key(0x6e, &before, false);
+        st.handle_key(0x69, &before, false);
+        assert_eq!(st.candidates().len(), 3);
+        st.cursor_down(); // 光标从 #1 移到 #2
+        assert_eq!(st.cursor_abs(), 1);
+        // 之前 refresh_after_handled 只重发旧快照，这里必须真的变掉且光标不动
+        st.requery_keep_cursor(&after);
+        assert_eq!(
+            st.candidates()
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["尼", "泥"]
+        );
+        assert_eq!(st.cursor_abs(), 1);
+    }
+
+    #[test]
+    fn requery_keep_cursor_clamps_when_list_shrinks() {
+        let before = TestSource {
+            map: std::collections::HashMap::from([("ni", vec!["你", "尼", "泥"])]),
+        };
+        let after = TestSource {
+            map: std::collections::HashMap::from([("ni", vec!["尼"])]),
+        };
+        let mut st = EngineState::new();
+        st.handle_key(0x6e, &before, false);
+        st.handle_key(0x69, &before, false);
+        st.cursor_down();
+        st.cursor_down(); // 光标到 #3（abs=2）
+        assert_eq!(st.cursor_abs(), 2);
+        st.requery_keep_cursor(&after);
+        assert_eq!(st.candidates().len(), 1);
+        assert_eq!(st.cursor_abs(), 0);
     }
 }

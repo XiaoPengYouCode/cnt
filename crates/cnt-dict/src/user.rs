@@ -6,6 +6,7 @@
 //! ```
 //! 第 4 列为上次更新的 Unix 秒（jiff 时间戳）；第 5 列为 `confirmed` 标记（0/1）。
 //! 旧格式兼容：第 4 列缺失视为刚更新；第 5 列缺失视为已转正（旧数据满权重）。
+//! 屏蔽记录为 `#blocked<TAB>拼音<TAB>词`，不衰减、不受学习条目淘汰影响。
 //!
 //! **时间衰减**：计数按半衰期衰减，`effective = count × 0.5^(天数/半衰期)`，
 //! 让用户模型跟随当前习惯漂移，旧习惯逐渐淡出。
@@ -17,7 +18,7 @@
 //!
 //! 原子写盘：先写临时文件再 rename，避免中途崩溃写坏数据。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -63,6 +64,8 @@ pub struct UserDb {
     /// `words_for_pinyin_prefix`）走一次 `range` 而不是全表扫描 —— beam 的多音节链
     /// 剪枝要靠它判断「用户学过的复合词键是否存在」，那是热路径。
     counts: BTreeMap<String, HashMap<String, Entry>>,
+    /// 持久屏蔽独立于调频，不衰减、不参与学习条目淘汰。
+    blocked: BTreeMap<String, BTreeSet<String>>,
     dirty: bool,
 }
 
@@ -74,10 +77,29 @@ impl UserDb {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut counts: BTreeMap<String, HashMap<String, Entry>> = BTreeMap::new();
+        let mut blocked: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let now = now_secs();
-        if let Ok(content) = fs::read_to_string(&path) {
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        {
             for line in content.lines() {
                 let line = line.trim();
+                if let Some(rest) = line.strip_prefix("#blocked\t") {
+                    if let Some((pinyin, word)) = rest.split_once('\t')
+                        && !pinyin.is_empty()
+                        && !word.is_empty()
+                        && !word.contains('\t')
+                    {
+                        blocked
+                            .entry(pinyin.to_owned())
+                            .or_default()
+                            .insert(word.to_owned());
+                    }
+                    continue;
+                }
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
@@ -109,9 +131,14 @@ impl UserDb {
                 );
             }
         }
+        counts.retain(|pinyin, words| {
+            words.retain(|word, _| blocked.get(pinyin).is_none_or(|set| !set.contains(word)));
+            !words.is_empty()
+        });
         Ok(Self {
             path,
             counts,
+            blocked,
             dirty: false,
         })
     }
@@ -204,6 +231,10 @@ impl UserDb {
     /// 直接转正；不在词库的是自动造词（对齐 librime 新词前缀标记），首现
     /// `confirmed=false` 低权重，第 `CONFIRM_THRESHOLD` 次确认后转正。
     pub fn bump(&mut self, pinyin: &str, word: &str, known: bool) {
+        // 句子学习可能再次拼出被屏蔽的组合，不能因此自动解除屏蔽。
+        if self.is_blocked(pinyin, word) {
+            return;
+        }
         let now = now_secs();
         // 新词且已达上限：先淘汰（避免持内层借用时调用 evict）
         let is_new = self
@@ -257,6 +288,33 @@ impl UserDb {
         }
     }
 
+    /// 屏蔽一个拼音-词条对，同时撤销该词的学习记录。
+    /// 返回是否新增了屏蔽；不屏蔽组成它的单字或其他读音。
+    pub fn block(&mut self, pinyin: &str, word: &str) -> bool {
+        let inserted = self
+            .blocked
+            .entry(pinyin.to_owned())
+            .or_default()
+            .insert(word.to_owned());
+        self.delete(pinyin, word);
+        self.dirty |= inserted;
+        inserted
+    }
+
+    /// 此读音下的词是否被用户明确屏蔽。
+    #[must_use]
+    pub fn is_blocked(&self, pinyin: &str, word: &str) -> bool {
+        self.blocked
+            .get(pinyin)
+            .is_some_and(|set| set.contains(word))
+    }
+
+    /// 是否存在屏蔽记录；解码器无记录时可跳过整句屏蔽检查。
+    #[must_use]
+    pub fn has_blocked_words(&self) -> bool {
+        !self.blocked.is_empty()
+    }
+
     /// 淘汰有效计数最低的一条（保持上限）。
     fn evict_lowest(&mut self) {
         let mut best: Option<(String, String, f32)> = None;
@@ -302,6 +360,12 @@ impl UserDb {
                         e.updated_at,
                         u8::from(e.confirmed)
                     )?;
+                }
+            }
+            // 注释式记录与旧版学习数据格式兼容，且便于人工删除恢复。
+            for (pinyin, words) in &self.blocked {
+                for word in words {
+                    writeln!(w, "#blocked\t{pinyin}\t{word}")?;
                 }
             }
             w.flush()?;
@@ -366,6 +430,42 @@ fn effective_u32(e: &Entry) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_survives_restart_and_does_not_revive_on_learning() {
+        let dir = std::env::temp_dir().join(format!("cnt-user-block-{}", std::process::id()));
+        let path = dir.join("user.dict");
+        fs::create_dir_all(&dir).unwrap();
+        // 旧格式计数、屏蔽记录与冲突学习行混合，读入时屏蔽始终优先。
+        fs::write(&path, "ni\t拟\t3\n#blocked\tnihao\t拟好\nnihao\t拟好\t5\n").unwrap();
+        let mut db = UserDb::open(&path).unwrap();
+        assert!(db.is_blocked("nihao", "拟好"));
+        assert_eq!(db.count("nihao", "拟好"), 0);
+        db.bump("nihao", "拟好", true);
+        assert_eq!(db.words_for_pinyin("nihao"), Vec::<String>::new());
+        assert_eq!(
+            db.words_for_pinyin_prefix("nih"),
+            Vec::<(String, String)>::new()
+        );
+        assert!(!db.has_key_prefix("nih"));
+        assert!(!db.block("nihao", "拟好"));
+        db.bump("xing", "行", true);
+        assert!(db.block("xing", "行"));
+        assert!(!db.is_blocked("hang", "行"));
+        db.flush().unwrap();
+        let reopened = UserDb::open(&path).unwrap();
+        assert!(reopened.is_blocked("nihao", "拟好"));
+        assert!(reopened.is_blocked("xing", "行"));
+        assert_eq!(reopened.count("ni", "拟"), 3);
+        assert_eq!(reopened.len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_user_data_is_not_treated_as_an_empty_database() {
+        // 目录作为文件读取必定失败，不依赖当前用户是否绕过文件权限。
+        assert!(UserDb::open(std::env::temp_dir()).is_err());
+    }
 
     #[test]
     fn bump_and_count() {

@@ -69,6 +69,42 @@ gdbus call --address "$(ibus address)" --dest org.freedesktop.DBus \
   org.freedesktop.IBus.Cnt
 ```
 
+### 按键诊断日志
+
+daemon 现在将 `log` 日志同步写入文件，同时保留 stderr 输出，不依赖 IBus
+是否保存 stderr。默认文件是 `${XDG_STATE_HOME:-$HOME/.local/state}/cnt/cnt-daemon.log`；
+可用绝对路径 `CNT_LOG_DIR` 覆盖目录。单文件约 5 MiB 时轮转，最多保留 3 个文件。
+无法创建日志文件时启动会报错，避免悄悄退回不可见的 stderr。
+
+默认过滤为 `info,cnt_engine=debug`，无需开启 fastrace feature 就能看到按键诊断。
+显式设置的 `RUST_LOG` 会覆盖默认过滤，且必须由启动 daemon 的进程继承；在终端
+里修改环境变量不会改变已经运行的 IBus 子进程。fastrace 的 ConsoleReporter
+仍输出到 stderr，文件保存的是 `log` 日志。
+
+```bash
+tail -F "${CNT_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cnt}/cnt-daemon.log"
+```
+
+启动行 `observability:` 包含 PID、可执行文件路径和日志路径。编译完成不等于
+已运行新版本，应先检查新进程的启动行。诊断日志包含按键、拼音和候选文本；
+排查完成后可用 `RUST_LOG=info` 降低日志量。
+
+Ctrl+Delete 按以下顺序定位：
+
+- `key received`：在所有过滤前记录原始 `keyval/keycode/state` 和引擎对象路径。
+  Delete 应为 `0xffff`，Control 位为 `0x4`，释放事件另带 `0x40000000`。
+- `key exit: voice ...`：事件被语音热键逻辑提前消费或转发。
+- `ctrl_delete skipped/matched`：是否匹配组合键；匹配时记录组合状态、候选数和光标。
+- `block ignored` / `no learned segments`：无选中候选或无法确定其真实读音。
+- `candidate blocked` / `candidate block persisted`：内存屏蔽、写盘成功；
+  若出现 `block persistence failed` 则只在当前会话生效，后续 flush 会重试。
+- `block requery done`：记录重查前后数量及候选文本列表是否变化。
+- `UI refresh skipped` / `signals sent` / `signal failed`：区分相同快照去重、
+  信号发送成功和发送失败。发送成功只表示 D-Bus 发送完成，不证明面板已经显示。
+
+Ctrl+Delete 只在按下时屏蔽候选；释放应记录为 `ctrl_delete skipped`。
+`block_candidate` root 覆盖持久化、重查和 UI 发送，启用 trace 时保留 ≥5ms 的慢操作。
+
 ### 上游依据与后续优化
 
 | 参考 | 源码行为 | 对 cnt 的启示 |

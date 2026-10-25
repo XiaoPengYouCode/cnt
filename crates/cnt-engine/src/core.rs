@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use zbus::connection::Connection;
 
 use cnt_decode::Decoder;
-use cnt_input::{EngineState, LearnedWord, latin_before_cursor};
+use cnt_input::{Candidate, EngineState, LearnedWord, latin_before_cursor};
 
 /// `IBus` 引擎接口名。
 pub(crate) const ENGINE_IFACE: &str = "org.freedesktop.IBus.Engine";
@@ -93,6 +93,11 @@ impl EngineCore {
         self.operation_gate.lock().await
     }
 
+    /// 日志中用于区分不同输入上下文的引擎对象路径。
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
     /// 解码器（候选来源 + 用户学习）。
     pub(crate) const fn decoder(&self) -> &Arc<Decoder> {
         &self.decoder
@@ -160,8 +165,19 @@ impl EngineCore {
             .as_ref()
             == Some(ui)
         {
+            log::debug!(
+                "UI refresh skipped: snapshot unchanged engine={}",
+                self.path
+            );
             return;
         }
+
+        log::debug!(
+            "UI refresh sending: engine={} candidates={} cursor={}",
+            self.path,
+            ui.all_cands.len(),
+            ui.cursor_abs
+        );
 
         // 预编辑文本（拼音缓冲区 / 语音提示）
         let (preedit, cursor, visible) = if ui.preedit.is_empty() {
@@ -209,11 +225,12 @@ impl EngineCore {
             let mut cache = self.ui_cache.lock().unwrap_or_else(PoisonError::into_inner);
             if preedit_result.is_ok() && lookup_result.is_ok() {
                 cache.last_sent = Some(ui.clone());
+                log::debug!("UI refresh signals sent: engine={}", self.path);
             } else {
                 // 任一路失败都不记为成功，后续刷新必须重发两路，避免预编辑和候选表
                 // 只更新了一半后被缓存短路。
                 cache.last_sent = None;
-                log::debug!(
+                log::warn!(
                     "UI refresh signal failed: preedit={:?}, lookup={:?}",
                     preedit_result.as_ref().err(),
                     lookup_result.as_ref().err()
@@ -361,13 +378,38 @@ impl EngineCore {
         self.publish_current_ui().await;
     }
 
-    /// 忘记一组学习段（Ctrl+Delete：撤销误学），随后刷新候选窗。
-    pub(crate) async fn forget_candidate(&self, learned: Vec<LearnedWord>) {
-        if !learned.is_empty() {
-            log::debug!("forget: {} segments", learned.len());
-            self.decoder.forget(&learned);
+    /// 持久屏蔽整个候选，随后重查候选并刷新界面。
+    pub(crate) async fn block_candidate(&self, candidate: Candidate) {
+        if let Err(error) = self.decoder.block_candidate(&candidate) {
+            log::error!("block persistence failed: {error}; block remains active in memory");
         }
+        // decoder 侧已失效对应词键缓存，但 EngineState 里还是删之前的旧列表：
+        // 必须用同一口径（buffer + confirmed）重查一次并保持光标，否则快照
+        // 原样回放、去重缓存还会把 UI 信号吞掉，候选窗视觉上完全不动。
+        let (before, after) = {
+            let mut st = self.lock_state();
+            let before: Vec<_> = st.candidates().iter().map(|c| c.text.clone()).collect();
+            st.requery_keep_cursor(self.decoder.as_ref());
+            let after: Vec<_> = st.candidates().iter().map(|c| c.text.clone()).collect();
+            log::debug!(
+                "block requery: selected={:?} cursor={} top5_before={:?} top5_after={:?}",
+                st.selected().map(|c| &c.text),
+                st.cursor_abs(),
+                &before[..before.len().min(5)],
+                &after[..after.len().min(5)]
+            );
+            drop(st);
+            (before, after)
+        };
+        log::info!(
+            "block requery done: word={:?} candidates={} -> {} list_changed={}",
+            candidate.text,
+            before.len(),
+            after.len(),
+            before != after
+        );
         self.refresh_after_handled().await;
+        log::info!("block UI refresh finished");
     }
 
     /// 把用户学习数据写盘（`focus_out`/`disable` 时立即落盘，减少丢失窗口）。

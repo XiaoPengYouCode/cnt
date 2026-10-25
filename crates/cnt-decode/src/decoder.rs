@@ -452,6 +452,49 @@ impl<L: NgramLm> Decoder<L> {
         self.clear_repairs();
     }
 
+    /// 持久屏蔽当前候选的完整拼音-文本对，不连带屏蔽组成它的学习片段。
+    ///
+    /// # Errors
+    /// 空候选返回 `InvalidInput`；用户数据写盘失败时返回 IO 错误，
+    /// 此时本次会话的内存屏蔽仍然有效。
+    pub fn block_candidate(&self, candidate: &Candidate) -> std::io::Result<()> {
+        let _span = LocalSpan::enter_with_local_parent("block_dictionary_entry");
+        LocalSpan::add_property(|| ("segments", candidate.learned.len().to_string()));
+        let pinyin = candidate_pinyin(candidate);
+        if pinyin.is_empty() || candidate.text.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "candidate has no pinyin or text",
+            ));
+        }
+        let inserted = self.model.block(&pinyin, &candidate.text);
+        self.lock_keys().invalidate(&pinyin);
+        self.clear_repairs();
+        log::info!(
+            "candidate blocked: pinyin={pinyin:?} word={:?} new={inserted}",
+            candidate.text
+        );
+        let _persist = LocalSpan::enter_with_local_parent("persist_blocklist");
+        self.model.flush_user()?;
+        log::info!("candidate block persisted");
+        Ok(())
+    }
+
+    fn filter_blocked(&self, candidates: &mut Vec<Scored>) {
+        if !self.model.has_blocked_words() {
+            return;
+        }
+        let _span = LocalSpan::enter_with_local_parent("filter_blocked");
+        let before = candidates.len();
+        candidates.retain(|s| {
+            !self
+                .model
+                .is_blocked(&candidate_pinyin(&s.cand), &s.cand.text)
+        });
+        LocalSpan::add_property(|| ("candidates", before.to_string()));
+        LocalSpan::add_property(|| ("removed", (before - candidates.len()).to_string()));
+    }
+
     /// 把拼音串按标准音节切开，供预编辑显示（`nihaoshijie` → `ni hao shi jie`）。
     ///
     /// 只用精确音节表（不含模糊变体）：预编辑要如实反映**用户打的**内容，
@@ -540,6 +583,9 @@ impl<L: NgramLm> Decoder<L> {
         if !has_word_coverage && let Some(lm) = &self.lm {
             scored.extend(self.completions(pinyin, lm));
         }
+        // 词键层已经过滤静态/用户词；这里再拦住 beam 用其他分段拼出的相同文本。
+        // 在去重、裁剪与重排前过滤，避免被屏蔽候选挤占最终名额。
+        self.filter_blocked(&mut scored);
         // 排序分四组（组间是硬顺序，组内按分数）：
         // 0 整词覆盖输入的候选（整键词/beam 单段）——你已经打完的读音优先；
         // 1 有可靠精确整词时的模糊整词回退；不生成多段 beam；
@@ -1339,6 +1385,15 @@ fn oov_score(freq: u32) -> f32 {
     OOV_BASE + adjust
 }
 
+/// 用候选的真实读音记录身份，补全、纠错和部分候选不能用原始输入代替。
+fn candidate_pinyin(candidate: &Candidate) -> String {
+    candidate
+        .learned
+        .iter()
+        .map(|segment| segment.pinyin.as_str())
+        .collect()
+}
+
 /// 从一次提交构造出 `learn` 与 `forget` 完全对称的用户复合词集合。
 ///
 /// 相邻二段词是即时可用的增量学习；整句词让较长的用户短语也能作为一个整体
@@ -1890,6 +1945,134 @@ mod tests {
             }),
             "Ctrl+Delete must remove the learned compound too"
         );
+    }
+
+    #[test]
+    fn block_static_candidate_filters_cached_completion_and_correction_after_restart() {
+        let d = decoder_with(
+            "block_static",
+            &[("nihao", "拟好", 900), ("nihao", "你好", 800)],
+            &[("拟好", -2.0, 0.0), ("你好", -1.0, 0.0)],
+            &[],
+            false,
+        );
+        // 同时预热词键、补全和纠错缓存。
+        assert!(
+            d.words_of("nihao", 20)
+                .iter()
+                .any(|word| &*word.word == "拟好")
+        );
+        for input in ["nihao", "nih", "nihaoo"] {
+            assert!(
+                d.candidates(input).iter().any(|c| c.text == "拟好"),
+                "{input}"
+            );
+        }
+        let candidate = d
+            .candidates("nihao")
+            .into_iter()
+            .find(|c| c.text == "拟好")
+            .unwrap();
+        d.block_candidate(&candidate).unwrap();
+        assert!(
+            !d.words_of("nihao", 20)
+                .iter()
+                .any(|word| &*word.word == "拟好")
+        );
+        let dir =
+            std::env::temp_dir().join(format!("cnt-decode-{}-block_static", std::process::id()));
+        let reopened = Decoder::new(
+            Arc::new(PinyinModel::open(dir.join("dict.cntd"), dir.join("user.dict")).unwrap()),
+            d.lm.clone(),
+            false,
+        );
+        for decoder in [&d, &reopened] {
+            for input in ["nihao", "nih", "nihaoo"] {
+                let candidates = decoder.candidates(input);
+                assert!(!candidates.iter().any(|c| c.text == "拟好"), "{input}");
+                assert!(candidates.iter().any(|c| c.text == "你好"), "{input}");
+            }
+        }
+    }
+
+    #[test]
+    fn block_composite_does_not_block_components_or_allow_reassembled_text() {
+        let d = decoder_with(
+            "block_composite",
+            &[("zheng", "郑", 900), ("shuang", "爽", 900)],
+            &[("郑", -3.0, 0.0), ("爽", -3.0, 0.0)],
+            &[],
+            false,
+        );
+        // 未学习过的整句也能屏蔽；不要求词库原本有这个整词。
+        let candidate = d
+            .candidates("zhengshuang")
+            .into_iter()
+            .find(|c| c.text == "郑爽")
+            .unwrap();
+        assert_eq!(candidate.learned.len(), 2);
+        d.block_candidate(&candidate).unwrap();
+        // 句子提交再次拼出相同复合词，也不能悄悄恢复屏蔽词。
+        d.learn(&candidate.learned);
+        assert!(!d.candidates("zhengshuang").iter().any(|c| c.text == "郑爽"));
+        assert!(
+            !d.candidates_with_context("zhengshuang", &[LearnedWord::new("wo", "我")])
+                .iter()
+                .any(|c| c.text == "郑爽")
+        );
+        assert!(d.candidates("zheng").iter().any(|c| c.text == "郑"));
+        assert!(d.candidates("shuang").iter().any(|c| c.text == "爽"));
+        assert!(d.model.is_blocked("zhengshuang", "郑爽"));
+    }
+
+    #[test]
+    fn blocking_a_completion_uses_its_full_reading() {
+        let d = decoder_with(
+            "block_completion",
+            &[("nihao", "拟好", 900), ("nihao", "你好", 800)],
+            &[("拟好", -2.0, 0.0), ("你好", -1.0, 0.0)],
+            &[],
+            false,
+        );
+        let candidate = d
+            .candidates("nih")
+            .into_iter()
+            .find(|c| c.text == "拟好")
+            .unwrap();
+        assert_eq!(candidate.consumed, 3);
+        d.block_candidate(&candidate).unwrap();
+        assert!(d.model.is_blocked("nihao", "拟好"));
+        assert!(!d.model.is_blocked("nih", "拟好"));
+        assert!(!d.candidates("nihao").iter().any(|c| c.text == "拟好"));
+    }
+
+    #[test]
+    fn failed_block_persistence_keeps_memory_block_and_can_be_retried() {
+        let d = decoder_with(
+            "block_io_failure",
+            &[("nihao", "拟好", 900)],
+            &[("拟好", -2.0, 0.0)],
+            &[],
+            false,
+        );
+        let candidate = d
+            .candidates("nihao")
+            .into_iter()
+            .find(|c| c.text == "拟好")
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cnt-decode-{}-block_io_failure",
+            std::process::id()
+        ));
+        let path = dir.join("user.dict");
+        // 用目录阻止原子替换用户数据文件，不依赖权限或系统输入法。
+        std::fs::create_dir(&path).unwrap();
+        assert!(d.block_candidate(&candidate).is_err());
+        assert!(!d.candidates("nihao").iter().any(|c| c.text == "拟好"));
+        std::fs::remove_dir(&path).unwrap();
+        d.flush_user().unwrap();
+        let reopened = PinyinModel::open(dir.join("dict.cntd"), path).unwrap();
+        assert!(reopened.is_blocked("nihao", "拟好"));
     }
 
     #[test]
