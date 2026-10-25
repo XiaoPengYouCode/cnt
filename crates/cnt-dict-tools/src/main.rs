@@ -464,7 +464,7 @@ fn cmd_query(path: &str, pinyins: &[String]) -> CliResult {
     Ok(())
 }
 
-/// 从用户词库删除一条 (拼音, 词)：撤销误学（对应 Ctrl+Delete 的 CLI 形式）。
+/// 从用户词库删除一条 (拼音, 词)：仅撤销误学，不添加或解除候选屏蔽。
 fn cmd_delete_user(path: &str, pinyin: &str, word: &str) -> CliResult {
     let mut db = cnt_dict::UserDb::open(path)?;
     if db.delete(pinyin, word) {

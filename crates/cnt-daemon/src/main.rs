@@ -1,12 +1,13 @@
 //! cnt —— 一个用 Rust 写的简单简体中文拼音输入法（IBus 引擎）主程序。
 
+mod observability;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use fastrace::Span;
 use fastrace::collector::SpanContext;
-use fastrace::collector::{Config, ConsoleReporter};
 use fastrace::future::FutureExt;
 use fastrace::local::LocalSpan;
 use zbus::connection::Builder;
@@ -33,6 +34,8 @@ const DEFAULT_PUNCT_DIR: &str = "punct";
 /// 主程序错误（显式，thiserror）。
 #[derive(Debug, thiserror::Error)]
 enum DaemonError {
+    #[error("observability: {0}")]
+    Observability(#[from] observability::ObservabilityError),
     #[error("usage: cnt-daemon [--standalone] (dynamic registration for development only)")]
     Arguments,
     #[error("ibus: {0}")]
@@ -45,24 +48,6 @@ enum DaemonError {
     Store(#[from] StoreError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-}
-
-/// 初始化可观测性：fastrace reporter + logforth（stderr 日志 + 日志挂进 span）。
-fn init_observability() {
-    fastrace::set_reporter(ConsoleReporter, Config::default());
-
-    logforth::starter_log::builder()
-        .dispatch(|d| {
-            d.diagnostic(logforth::diagnostic::FastraceDiagnostic::default())
-                .append(
-                    logforth::append::Stderr::default()
-                        .with_layout(logforth::layout::TextLayout::default()),
-                )
-        })
-        .dispatch(|d| d.append(logforth::append::FastraceEvent::default()))
-        .apply();
-
-    log::info!("observability: log + fastrace + logforth");
 }
 
 /// 用户数据目录：`$XDG_DATA_HOME/cnt`（默认 `~/.local/share/cnt`）。
@@ -300,10 +285,14 @@ fn load_voice(
 
 #[tokio::main]
 async fn main() -> Result<(), DaemonError> {
-    init_observability();
+    observability::init()?;
     let result = run().await;
+    if let Err(error) = &result {
+        log::error!("daemon stopped: {error}");
+    }
     // 启动失败也要排空：名称冲突/连接失败的 trace 同样是诊断证据。
     fastrace::flush();
+    log::logger().flush();
     result
 }
 

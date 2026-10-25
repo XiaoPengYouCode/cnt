@@ -98,16 +98,32 @@ impl PinyinModel {
             std::collections::HashMap::new();
 
         for c in self.dict.exact(pinyin) {
+            if user.is_blocked(pinyin, c.word) {
+                continue;
+            }
             let cnt = user.count(pinyin, c.word);
             let score = u64::from(c.freq) + u64::from(cnt) * u64::from(USER_BOOST);
             push(&mut scored, c.word, score, true);
         }
         for h in self.dict.prefix(pinyin) {
-            let cnt = user.count(h.key, h.word);
+            // mmap 前缀接口每键只返回首词；首词被屏蔽时补取下一个可用词。
+            let (word, freq) = if user.is_blocked(h.key, h.word) {
+                let Some(next) = self
+                    .dict
+                    .exact(h.key)
+                    .into_iter()
+                    .find(|candidate| !user.is_blocked(h.key, candidate.word))
+                else {
+                    continue;
+                };
+                (next.word, next.freq)
+            } else {
+                (h.word, h.freq)
+            };
+            let cnt = user.count(h.key, word);
             // 前缀词打折：精确读音的词优先（见 PREFIX_DISCOUNT）
-            let score =
-                u64::from(h.freq) / PREFIX_DISCOUNT + u64::from(cnt) * u64::from(USER_BOOST);
-            push(&mut scored, h.word, score, false);
+            let score = u64::from(freq) / PREFIX_DISCOUNT + u64::from(cnt) * u64::from(USER_BOOST);
+            push(&mut scored, word, score, false);
         }
         // 用户词：精确 + 前缀（学过的复合词/新词；词典里没有的也参与）
         for w in user.words_for_pinyin(pinyin) {
@@ -215,6 +231,9 @@ impl PinyinModel {
             // 外层键只查一次（counts_of），之后按词哈希查找
             let counts = user.counts_of(key);
             for c in self.dict.exact(key) {
+                if user.is_blocked(key, c.word) {
+                    continue;
+                }
                 scored.push((
                     Cow::Borrowed(c.word),
                     c.freq,
@@ -265,6 +284,32 @@ impl PinyinModel {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .delete(pinyin, word);
+    }
+
+    /// 屏蔽此读音下的词（包含静态词），并移除对应学习记录。
+    pub fn block(&self, pinyin: &str, word: &str) -> bool {
+        self.user
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .block(pinyin, word)
+    }
+
+    /// 候选完整文本是否被屏蔽（也用于拦截单字拼接产生的相同文本）。
+    #[must_use]
+    pub fn is_blocked(&self, pinyin: &str, word: &str) -> bool {
+        self.user
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_blocked(pinyin, word)
+    }
+
+    /// 是否需要检查整句屏蔽。
+    #[must_use]
+    pub fn has_blocked_words(&self) -> bool {
+        self.user
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_blocked_words()
     }
 
     /// 持久化用户数据（由定时任务/退出时调用）。
@@ -321,6 +366,29 @@ mod tests {
         let user_path = dir.join("user.dict");
         std::fs::write(&dict_path, &bytes).unwrap();
         PinyinModel::open(&dict_path, &user_path).unwrap()
+    }
+
+    #[test]
+    fn blocked_static_words_are_removed_before_ranking_and_prefix_completion() {
+        let m = model_with(
+            "block_static",
+            &[
+                ("nihao", "拟好", 900),
+                ("nihao", "你好", 800),
+                ("xing", "行", 900),
+                ("hang", "行", 900),
+            ],
+        );
+        m.bump("nihao", "拟好");
+        assert_eq!(m.query("nihao")[0], "拟好");
+        assert!(m.block("nihao", "拟好"));
+        assert_eq!(m.query("nihao"), vec!["你好"]);
+        assert_eq!(m.query("nih"), vec!["你好"]);
+        assert_eq!(m.ranked_words("nihao", 1)[0].0, "你好");
+        assert!(!m.user_words().iter().any(|(word, _)| word == "拟好"));
+        m.block("xing", "行");
+        assert_eq!(m.query("xing"), Vec::<String>::new());
+        assert_eq!(m.query("hang"), vec!["行"]);
     }
 
     #[test]
