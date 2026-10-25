@@ -410,7 +410,10 @@ mod tests {
         }
         let greedy = greedy_decode(&logits, vocab, 0);
         let beam = super::prefix_beam_search(&logits, vocab, 0, 8);
-        assert!(!beam.is_empty());
+        assert!(
+            !beam.is_empty(),
+            "CTC beam must contain a decoded hypothesis"
+        );
         assert_eq!(beam[0].ids, greedy, "尖锐输出上 beam 的 #1 必须等于贪心");
     }
 
@@ -448,14 +451,14 @@ mod tests {
 
     #[test]
     fn prefix_beam_handles_degenerate_input() {
-        assert!(super::prefix_beam_search(&[], 5, 0, 8).is_empty());
-        assert!(super::prefix_beam_search(&[1.0, 2.0], 0, 0, 8).is_empty());
+        assert_eq!(super::prefix_beam_search(&[], 5, 0, 8).len(), 0);
+        assert_eq!(super::prefix_beam_search(&[1.0, 2.0], 0, 0, 8).len(), 0);
     }
 
     #[test]
     fn empty_logits_decode_to_nothing() {
-        assert!(greedy_decode(&[], 5, 0).is_empty());
-        assert!(greedy_decode(&[1.0, 2.0], 0, 0).is_empty());
+        assert_eq!(greedy_decode(&[], 5, 0).len(), 0);
+        assert_eq!(greedy_decode(&[1.0, 2.0], 0, 0).len(), 0);
     }
 
     #[test]

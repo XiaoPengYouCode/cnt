@@ -780,7 +780,7 @@ mod tests {
         match act {
             Action::Commit { text, learned } => {
                 assert_eq!(text, "‘");
-                assert!(learned.is_empty());
+                assert_eq!(learned, [] as [LearnedWord; 0]);
             }
             other => panic!("未组合时 `'` 应输出智能引号，got {other:?}"),
         }
@@ -817,7 +817,7 @@ mod tests {
         match st.handle_key(keysym::RETURN, &d, false) {
             Action::Commit { text, learned } => {
                 assert_eq!(text, "ni");
-                assert!(learned.is_empty());
+                assert_eq!(learned, [] as [LearnedWord; 0]);
             }
             other => panic!("expected commit, got {other:?}"),
         }
@@ -832,7 +832,7 @@ mod tests {
         match st.handle_key(keysym::RETURN, &d, false) {
             Action::Commit { text, learned } => {
                 assert_eq!(text, "n");
-                assert!(learned.is_empty());
+                assert_eq!(learned, [] as [LearnedWord; 0]);
             }
             other => panic!("expected commit, got {other:?}"),
         }
@@ -975,7 +975,7 @@ mod tests {
         match st.handle_key(keysym::SPACE, &d, false) {
             Action::Commit { text, learned } => {
                 assert_eq!(text, "xy");
-                assert!(learned.is_empty());
+                assert_eq!(learned, [] as [LearnedWord; 0]);
             }
             other => panic!("expected commit, got {other:?}"),
         }
@@ -989,7 +989,7 @@ mod tests {
             // ',' 未组合 → 直接上屏 ，
             Action::Commit { text, learned } => {
                 assert_eq!(text, "，");
-                assert!(learned.is_empty());
+                assert_eq!(learned, [] as [LearnedWord; 0]);
             }
             other => panic!("expected commit, got {other:?}"),
         }

@@ -2264,7 +2264,7 @@ mod tests {
             );
         }
         // 空输入仍然没有候选（别把空窗变成全词库）
-        assert!(d.candidates("").is_empty());
+        assert_eq!(d.candidates(""), [] as [Candidate; 0]);
     }
 
     /// 回归：词库长尾字形（LM 不认识、词频 ≤ CAP）不得凭「精确覆盖全输入」
@@ -2650,7 +2650,7 @@ mod tests {
     fn syllables_table_lattice_works() {
         let t = SyllableTable::new();
         let lattice = t.lattice("nihao");
-        assert!(!lattice[0].is_empty());
+        assert_ne!(lattice[0], [] as [SyllableEdge; 0]);
         assert!(lattice[0].iter().any(|e| e.syl == "ni"));
         assert!(lattice[2].iter().any(|e| e.syl == "hao"));
     }

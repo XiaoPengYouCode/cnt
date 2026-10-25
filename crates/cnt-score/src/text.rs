@@ -182,7 +182,7 @@ mod tests {
     fn empty_text_scores_zero() {
         let s = score_text(&FakeLm::new(), "");
         assert!((s.logp - 0.0).abs() < f32::EPSILON);
-        assert!(s.words.is_empty());
+        assert_eq!(s.words, [] as [std::string::String; 0]);
     }
 
     #[test]

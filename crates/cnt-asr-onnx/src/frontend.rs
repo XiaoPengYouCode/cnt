@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn lfr_empty_input_is_empty() {
-        assert!(Lfr::default().apply(&[], 80).is_empty());
+        assert_eq!(Lfr::default().apply(&[], 80).len(), 0);
     }
 
     #[test]
