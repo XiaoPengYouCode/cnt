@@ -139,6 +139,7 @@ struct WordCand {
     lm_id: Option<u32>,
     /// 作为句首词的基础分（用户词/次读音/OOV/LM unigram）
     first_base: f32,
+    reading_weight: f32,
     /// 有效用户计数（未转正新词计 0）：逐步打分时与 LM 分做 log-linear 混合
     /// （`cnt_score::policy::user::mixture`）—— 用户分是概率尺度，逐步 lift 有界。
     count: u32,
@@ -720,17 +721,16 @@ impl<L: NgramLm> Decoder<L> {
     }
 
     fn lookup_whole_key(&self, pinyin: &str) -> Vec<Scored> {
-        self.model
-            .ranked_words(pinyin, WHOLE_KEY_WORDS)
+        self.ranked_words(pinyin, WHOLE_KEY_WORDS)
             .into_iter()
             .enumerate()
-            .map(|(rank, (word, freq))| {
+            .map(|(rank, (word, freq, weight))| {
                 // 无 LM 时退化为按词库排名给分（保持词频顺序，仍是有限值可参与排序）
                 #[allow(clippy::cast_precision_loss)] // rank < WHOLE_KEY_WORDS
                 let (score, dict_tail) = self.lm.as_ref().map_or_else(
                     || (-(rank as f32), false),
                     |lm| {
-                        let (base, tail) = reading_base(&word, freq, lm.as_ref());
+                        let (base, tail) = weighted_reading_base(&word, freq, weight, lm.as_ref());
                         (
                             cnt_score::policy::user::mixture(
                                 base,
@@ -814,8 +814,8 @@ impl<L: NgramLm> Decoder<L> {
         let mut out: Vec<Scored> = Vec::new();
         for (base, ext) in completions {
             let key = format!("{base}{ext}");
-            for (word, freq) in self.model.ranked_words(&key, 4) {
-                let base = reading_base(&word, freq, lm).0;
+            for (word, freq, weight) in self.ranked_words(&key, 4) {
+                let base = weighted_reading_base(&word, freq, weight, lm).0;
                 // 用户调频是 log-linear 混合（与 beam 逐步同一口径）
                 let mut score =
                     cnt_score::policy::user::mixture(base, self.model.user_count(&key, &word));
@@ -1055,6 +1055,25 @@ impl<L: NgramLm> Decoder<L> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn ranked_words<'a>(
+        &'a self,
+        key: &str,
+        limit: usize,
+    ) -> Vec<(std::borrow::Cow<'a, str>, u32, Option<f32>)> {
+        self.model
+            .ranked_words_by(key, limit, |word, freq, weight, count| {
+                self.lm.as_ref().map_or_else(
+                    || f64::from(count).mul_add(f64::from(cnt_dict::USER_BOOST), f64::from(freq)),
+                    |lm| {
+                        f64::from(cnt_score::policy::user::mixture(
+                            weighted_reading_base(word, freq, weight, lm.as_ref()).0,
+                            count,
+                        ))
+                    },
+                )
+            })
+    }
+
     /// 词键的候选词（缓存命中则零查询零分配）。
     fn words_of(&self, key: &str, limit: usize) -> Arc<[WordCand]> {
         if let Some((cached_limit, hit)) = self.lock_keys().words.get(key)
@@ -1063,15 +1082,21 @@ impl<L: NgramLm> Decoder<L> {
             return hit.clone(); // 够宽，或词库本身就没那么多词
         }
         let words: Arc<[WordCand]> = self
-            .model
             .ranked_words(key, limit)
             .into_iter()
-            .map(|(word, freq)| {
+            .map(|(word, freq, weight)| {
                 let lm_id = self.lm.as_ref().and_then(|lm| lm.word_index(&word));
                 let (first_base, dict_tail) = self.lm.as_ref().map_or((OOV_BASE, false), |lm| {
-                    first_word_base(freq, lm_id, lm.as_ref())
+                    weight.map_or_else(
+                        || first_word_base(freq, lm_id, lm.as_ref()),
+                        |weight| {
+                            let (base, tail) = first_word_base_uncapped(freq, lm_id, lm.as_ref());
+                            (base + weight, tail)
+                        },
+                    )
                 });
                 WordCand {
+                    reading_weight: weight.unwrap_or(0.0),
                     first_base,
                     dict_tail,
                     count: self.model.user_count(key, &word),
@@ -1229,6 +1254,39 @@ impl<L: NgramLm> Decoder<L> {
         }
         out
     }
+}
+
+/// 新词库独立保存读音权重；旧词库缺失时才使用历史次读音封顶规则。
+fn weighted_reading_base<L: NgramLm>(
+    word: &str,
+    freq: u32,
+    weight: Option<f32>,
+    lm: &L,
+) -> (f32, bool) {
+    weight.map_or_else(
+        || reading_base(word, freq, lm),
+        |weight| {
+            let (base, tail) = if freq == 0 {
+                (USER_WORD_BASE, false)
+            } else {
+                lm.unigram(word).map_or_else(
+                    || (oov_score(freq), is_dict_tail(freq)),
+                    |(p, _)| (p, false),
+                )
+            };
+            (base + weight, tail)
+        },
+    )
+}
+
+fn first_word_base_uncapped<L: NgramLm>(freq: u32, lm_id: Option<u32>, lm: &L) -> (f32, bool) {
+    if freq == 0 {
+        return (USER_WORD_BASE, false);
+    }
+    lm_id.and_then(|i| lm.unigram_by_id(i)).map_or_else(
+        || (oov_score(freq), is_dict_tail(freq)),
+        |(p, _)| (p, false),
+    )
 }
 
 /// 读音感知的基础分（首词用），返回 `(基础分, 是否词库长尾)`：
@@ -1428,7 +1486,10 @@ fn expand<L: NgramLm>(
             // 不在 LM 词表的词（用户新词、词库长尾）用它的句首基础分当伪 unigram，
             // 而不是一律 UNK(-12)：否则学过的复合词只能出现在句首，句子中间一定
             // 输给逐字拼接（-12 的悬崖比任何拼接都差）。
-            Prev::Word(prev_id) => lm.conditional_in_row(row, prev_id, w.lm_id, w.first_base),
+            Prev::Word(prev_id) => {
+                lm.conditional_in_row(row, prev_id, w.lm_id, w.first_base - w.reading_weight)
+                    + w.reading_weight
+            }
             Prev::Start => w.first_base,
         };
         let step = cnt_score::policy::user::mixture(step, w.count) + penalty;
@@ -2203,7 +2264,7 @@ mod tests {
             );
         }
         // 空输入仍然没有候选（别把空窗变成全词库）
-        assert!(d.candidates("").is_empty());
+        assert_eq!(d.candidates(""), [] as [Candidate; 0]);
     }
 
     /// 回归：词库长尾字形（LM 不认识、词频 ≤ CAP）不得凭「精确覆盖全输入」
@@ -2589,7 +2650,7 @@ mod tests {
     fn syllables_table_lattice_works() {
         let t = SyllableTable::new();
         let lattice = t.lattice("nihao");
-        assert!(!lattice[0].is_empty());
+        assert_ne!(lattice[0], [] as [SyllableEdge; 0]);
         assert!(lattice[0].iter().any(|e| e.syl == "ni"));
         assert!(lattice[2].iter().any(|e| e.syl == "hao"));
     }

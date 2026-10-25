@@ -113,6 +113,6 @@ mod tests {
         let keys = fuzzy_keys("sihou", &table);
         assert!(keys.contains(&("shihou".to_string(), 1)));
         assert!(!keys.iter().any(|(key, _)| key == "shifou"));
-        assert!(fuzzy_keys("xi'an", &table).is_empty());
+        assert_eq!(fuzzy_keys("xi'an", &table), [] as [(String, u8); 0]);
     }
 }

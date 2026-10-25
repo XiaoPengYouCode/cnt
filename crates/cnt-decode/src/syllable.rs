@@ -461,7 +461,7 @@ mod tests {
         let (clean, pos_map, boundaries) = strip_separators("xian");
         assert_eq!(clean, "xian");
         assert_eq!(pos_map, vec![0, 1, 2, 3]);
-        assert!(boundaries.is_empty());
+        assert_eq!(boundaries, [] as [usize; 0]);
     }
 
     #[test]

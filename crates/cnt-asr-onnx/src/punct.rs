@@ -439,8 +439,8 @@ mod tests {
 
     #[test]
     fn ignores_whitespace_and_empty() {
-        assert!(split_words("").is_empty());
-        assert!(split_words("   ").is_empty());
+        assert_eq!(split_words("").len(), 0);
+        assert_eq!(split_words("   ").len(), 0);
         assert_eq!(texts(&split_words(" 你  好 ")), vec!["你", "好"]);
     }
 

@@ -47,6 +47,26 @@ ok()   { printf "  ${_C_GRN}✔${_C_RST} %s\n" "$*"; }
 warn() { printf "  ${_C_YEL}⚠${_C_RST} %s\n" "$*"; }
 err()  { printf "  ${_C_RED}✘${_C_RST} %s\n" "$*" >&2; }
 
+# 同目录临时文件 + rename：不能原地截断仍可能被 mmap 的词库/语言模型。
+atomic_install() {
+    local source_file="$1" destination_file="$2" file_mode="$3" staged_file
+    staged_file=$(mktemp "${destination_file}.tmp.XXXXXX")
+    if ! install -m "${file_mode}" "${source_file}" "${staged_file}"; then
+        rm -f "${staged_file}"
+        return 1
+    fi
+    if ! mv -f "${staged_file}" "${destination_file}"; then
+        rm -f "${staged_file}"
+        return 1
+    fi
+}
+
+# 在停止用户正在使用的引擎之前检查必需数据。
+if [ ! -f data/cnt.dict ] || [ ! -f data/lm.cntl ]; then
+    err "缺少词库文件（data/cnt.dict / data/lm.cntl），请先运行 bash scripts/rebuild-dict.sh。"
+    exit 1
+fi
+
 # ── 1. 构建依赖 ───────────────────────────────────────────────
 # 语音输入的麦克风采集走 ALSA（cpal → alsa-sys → libasound）。
 # 系统默认只装运行时库，编译需要 dev 包里的头文件与 alsa.pc。
@@ -83,33 +103,39 @@ activate_cnt() {
 # ── 3. 主程序 ─────────────────────────────────────────────────
 step "安装主程序"
 mkdir -p "${BIN_DIR}"
-# 升级时平滑替换：先切走（若正在使用）→ 停旧版 → 删旧文件 → 放新版 → 切回。
+# 升级：先切走并停旧版；程序、数据、配置全部就绪后才激活。
 CUR=$(ibus engine 2>/dev/null || true)
 if [ "${CUR}" = "cnt" ]; then
     info "正在切换到英文输入法（几秒后自动切回）..."
     ibus engine xkb:us::eng || true
     sleep 1
 fi
-OLD=$(pgrep -f "${BIN_DIR}/cnt-daemon" | head -1 || true)
-if [ -n "${OLD}" ]; then
+# 只处理当前用户、安装路径下的进程；等待实际退出，避免固定 sleep 的竞态。
+for OLD in $(pgrep -u "$(id -u)" -x cnt-daemon || true); do
+    OLD_EXE=$(readlink "/proc/${OLD}/exe" || true)
+    case "${OLD_EXE}" in
+        "${BIN_DIR}/cnt-daemon"|"${BIN_DIR}/cnt-daemon (deleted)") ;;
+        *) continue ;;
+    esac
     info "正在退出旧版本（输入习惯不会丢失）..."
-    kill -INT "${OLD}"
-    sleep 2
-fi
-rm -f "${BIN_DIR}/cnt-daemon"
-cp target/release/cnt-daemon "${BIN_DIR}/cnt-daemon"
+    kill -INT "${OLD}" 2>/dev/null || true
+    for _ in {1..100}; do
+        kill -0 "${OLD}" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "${OLD}" 2>/dev/null; then
+        err "cnt-daemon（PID ${OLD}）未退出，停止升级，避免新旧数据混用。"
+        exit 1
+    fi
+done
+atomic_install target/release/cnt-daemon "${BIN_DIR}/cnt-daemon" 755
 ok "cnt-daemon → ${BIN_DIR}"
-activate_cnt || true
 
 # ── 4. 词库与语言模型 ─────────────────────────────────────────
 step "安装词库和语言模型数据"
 mkdir -p "${DATA_DIR}"
-if [ ! -f data/cnt.dict ] || [ ! -f data/lm.cntl ]; then
-    err "缺少词库文件（data/cnt.dict / data/lm.cntl），请先按 README 生成。"
-    exit 1
-fi
-cp data/cnt.dict "${DATA_DIR}/dict.cntd"
-cp data/lm.cntl "${DATA_DIR}/lm.cntl"
+atomic_install data/cnt.dict "${DATA_DIR}/dict.cntd" 644
+atomic_install data/lm.cntl "${DATA_DIR}/lm.cntl" 644
 ok "词库 + 语言模型已安装"
 
 # ── 5. 语音模型（声学 + 标点）──────────────────────────────────
@@ -233,9 +259,9 @@ else
 fi
 
 step "确认输入法可用"
-# 升级场景已激活；首次安装需重启输入法服务让新组件生效。
-if ibus engine 2>/dev/null | grep -q "cnt"; then
-    ok "cnt 输入法已激活，无需重启输入法服务"
+# 必须在所有数据及配置安装完成后激活，避免引擎加载旧词库的 header/缓存。
+if activate_cnt; then
+    ok "新版程序与数据已加载，无需重启输入法服务"
 else
     info "首次安装：正在重启输入法服务（几秒后自动恢复）..."
     ibus restart

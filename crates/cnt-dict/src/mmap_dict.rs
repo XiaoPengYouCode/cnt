@@ -16,6 +16,7 @@ use cnt_store::{MmapFile, StoreError, validate_regions};
 pub struct Candidate<'a> {
     pub word: &'a str,
     pub freq: u32,
+    pub reading_weight: Option<f32>,
 }
 
 /// 前缀匹配命中：附带了完整 key（供用户模型按 (完整拼音, 词) 查调频）。
@@ -24,6 +25,7 @@ pub struct PrefixHit<'a> {
     pub key: &'a str,
     pub word: &'a str,
     pub freq: u32,
+    pub reading_weight: Option<f32>,
 }
 
 pub struct MmapDict {
@@ -31,6 +33,7 @@ pub struct MmapDict {
     entry_count: usize,
     entries_start: usize,
     cand_start: usize,
+    cand_stride: usize,
     strings_start: usize,
     strings_len: usize,
 }
@@ -44,6 +47,11 @@ impl MmapDict {
         let mmap = MmapFile::open(path)?;
         let header = Header::parse(&mmap)?;
         let dict = Self {
+            cand_stride: if header.version == 1 {
+                crate::format::LEGACY_CAND_HEADER_SIZE
+            } else {
+                CAND_HEADER_SIZE
+            },
             mmap,
             entry_count: usize::try_from(header.entry_count)
                 .map_err(|_| StoreError::Region("entry_count"))?,
@@ -81,7 +89,7 @@ impl MmapDict {
             len,
             &[
                 (self.entries_start, self.entry_count * ENTRY_SIZE, "entries"),
-                (self.cand_start, cand_total * CAND_HEADER_SIZE, "candidates"),
+                (self.cand_start, cand_total * self.cand_stride, "candidates"),
                 (self.strings_start, self.strings_len, "strings"),
             ],
         )
@@ -126,8 +134,8 @@ impl MmapDict {
 
     fn cand_header(&self, index: u32) -> crate::format::CandidateHeader {
         #[allow(clippy::cast_possible_truncation)] // 格式字段 u32→usize，仅支持 ≥32 位目标
-        let off = self.cand_start + index as usize * CAND_HEADER_SIZE;
-        let b = &self.mmap[off..off + CAND_HEADER_SIZE];
+        let off = self.cand_start + index as usize * self.cand_stride;
+        let b = &self.mmap[off..off + self.cand_stride];
         crate::format::CandidateHeader::read(b).expect("cand range validated at open")
     }
 
@@ -150,7 +158,11 @@ impl MmapDict {
         for i in 0..e.cand_count {
             let h = self.cand_header(e.cand_off + i);
             if let Some(word) = self.str_at(h.word_off, h.word_len) {
-                out.push(Candidate { word, freq: h.freq });
+                out.push(Candidate {
+                    word,
+                    freq: h.freq,
+                    reading_weight: h.reading_weight,
+                });
             }
         }
         out
@@ -226,6 +238,7 @@ impl MmapDict {
                     key,
                     word: c.word,
                     freq: c.freq,
+                    reading_weight: c.reading_weight,
                 });
             }
             i += 1;
@@ -303,5 +316,73 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].word, "你");
         assert_eq!(c[0].freq, 300); // 保留最高频率
+    }
+    #[test]
+    fn reads_legacy_v1_without_inventing_reading_weights() {
+        // 从一个 v2 条目构造真实 v1 布局：候选只有 12 字节，没有权重。
+        let mut bytes = build(&[("chang".into(), "长".into(), 1)]).unwrap();
+        let header = Header::parse(&bytes).unwrap();
+        let candidate = usize::try_from(header.cand_offset).unwrap();
+        bytes.drain(candidate + 12..candidate + 16);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&(header.strings_offset - 4).to_le_bytes());
+        let path = std::env::temp_dir().join(format!("cnt-legacy-{}.dict", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let dict = MmapDict::open(&path).unwrap();
+        let candidates = dict.exact("chang");
+        assert_eq!(candidates[0].word, "长");
+        assert_eq!(candidates[0].freq, 1);
+        assert_eq!(candidates[0].reading_weight, None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reading_weights_roundtrip_without_thresholds() {
+        let entries: Vec<_> = [-5.0, -1.0, -0.4, -0.22, 0.0, 0.22]
+            .into_iter()
+            .enumerate()
+            .map(|(i, w)| (format!("key{i}"), "字".into(), 1000, Some(w)))
+            .collect();
+        let path = std::env::temp_dir().join(format!("cnt-weights-{}.dict", std::process::id()));
+        std::fs::write(&path, crate::writer::build_with_readings(&entries).unwrap()).unwrap();
+        let dict = MmapDict::open(&path).unwrap();
+        for (key, _, _, weight) in &entries {
+            assert_eq!(
+                dict.exact(key)[0].reading_weight.map(f32::to_bits),
+                weight.map(f32::to_bits)
+            );
+        }
+        let prefix = dict.prefix("key");
+        assert_eq!(prefix.len(), entries.len());
+        assert!(prefix.iter().all(|c| c.reading_weight.is_some()));
+        std::fs::remove_file(path).unwrap();
+        for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                crate::writer::build_with_readings(&[(
+                    "key".into(),
+                    "字".into(),
+                    1000,
+                    Some(weight)
+                )])
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn domain_frequency_does_not_erase_source_reading_weight() {
+        let entries = [
+            ("hang".into(), "行".into(), 1000, Some(-1.085)),
+            ("hang".into(), "行".into(), 5000, None),
+        ];
+        let bytes = crate::writer::build_with_readings(&entries).unwrap();
+        let header = Header::parse(&bytes).unwrap();
+        let start = usize::try_from(header.cand_offset).unwrap();
+        let candidate =
+            crate::format::CandidateHeader::read(&bytes[start..start + CAND_HEADER_SIZE]).unwrap();
+        assert_eq!(candidate.freq, 5000);
+        assert_eq!(
+            candidate.reading_weight.map(f32::to_bits),
+            Some((-1.085_f32).to_bits())
+        );
     }
 }
